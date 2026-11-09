@@ -1,0 +1,140 @@
+# Formula protection and continuation design
+
+## Scope and evidence
+
+This design is based on the staged parser, job manager, cache, renderer, and local
+synthetic fixtures. The user's PDF is not included in the repository or used as a
+test fixture.
+
+The parser classifies independent equations in
+`backend/pdf/adapters/native_preserving_adapter.py`, then masks inline math with
+`mask_inline_protected_elements`. The translator and cache operate on individual
+`Block` objects. Typesetting restores placeholders and redraws each translated
+block inside its original bounding box. Existing `reading_order` and
+`column_index` values describe per-page order; they do not form cross-column or
+cross-page translation units.
+
+Independent formula blocks may be protected, but that does not identify the
+specific mis-translated formula. The exact affected PDF region still requires a
+user-provided page/box image.
+
+## Safe first implementation
+
+Keep physical blocks, IDs, page indexes, reading order, and bounding boxes
+unchanged. Do not concatenate translated text or create a cross-page bounding
+box. Detect only boundary pairs between eligible body paragraphs:
+
+- last body paragraph in the left column to first body paragraph in the right
+  column on the same two-column page;
+- last body paragraph in the right column to first body paragraph in the left
+  column on the next selected two-column page; and
+- last to first body paragraph across selected adjacent one-column pages when
+  both pages are clearly one-column.
+
+Both blocks must be ordinary body paragraphs, adjacent in their respective
+reading-flow boundary, and not separated by a heading, reference, caption,
+figure, table, isolated protected formula, or intervening full-width content.
+Layout must be consistent for page-boundary candidates. Textual evidence is combined with
+structure and style: punctuation after closing quotes/brackets, likely
+abbreviation-aware sentence termination, a lower-case/continuation-word start,
+and compatible font size and indentation. A period or its absence alone never
+creates a match.
+
+High-confidence pairs supply bounded, masked neighboring text as PFML3 context
+only. This is not a joined translation: each source block is translated,
+validated, cached, edited, and rendered independently. Low-confidence
+structural candidates are recorded with their partner, confidence, and reasons,
+but do not alter prompts. Context uses only blocks in the requested page range;
+protected formulas are represented by a neutral marker, not copied into context.
+The parser has no dedicated general-footnote category; a pair of similarly
+formatted footnotes could still be considered.
+The existing cache key already includes context, so a changed context invalidates
+the prior result. No new UI control is introduced; candidate metadata is exposed
+through the existing block API for inspection. A future UI may add explicit
+accept/reject controls before true logical units are attempted.
+
+This scope avoids translating outside the selected pages, avoids assigning a
+Japanese sentence to multiple original regions, and leaves manual block edits,
+protection overrides, and existing single-block cache entries intact when no
+continuation context is selected.
+
+The focused continuation tests require an open grammatical construction before
+lowercase or variable/acronym starts can receive high confidence. They cover
+unpunctuated independent paragraphs and list markers, smaller-font body-misclassified
+footnotes, indented paragraph starts, CSI/RSSI/variable starts, and full-width
+figures/equations. These remain heuristics, not semantic paragraph recovery.
+
+## Formula safety
+
+The added equation-reference regular expression protects only labels such as
+`Eq. (7)` or `Equation (7)` as reference placeholders. It does not repair,
+classify, preserve, or change the equation body; that body remains subject to
+the existing inline-math detection and rendering path.
+
+The reported defect concerns the English equation body, not its `(7)` label.
+Read-only inspection of the provided dual PDF found the matching equation on
+physical PDF page 4 of 5 (zero-based index 3), in the original panel's left
+column. Its extracted text region is `[61.9, 499.2, 284.6, 522.7]` pt, with a
+horizontal fraction bar at y=510.9 pt from x=175.7 to 260.9 pt. A printed paper
+page number was not detectable in the extracted page-edge text.
+
+The read-only parser previously emitted the equation as two ordinary pending
+paragraphs: `readonly-formula-check:page-4:block-11` held the left label and
+numerator, while `...block-12` held the denominator and `(7)`. The first
+paragraph's inline mask protected only `Ratio = Detected`; the remaining
+equation words stayed translatable, and the denominator-plus-number block had
+no protected items. The number was not an isolated equation-number block, so
+the equation-reference pattern did not protect it. These IDs are generated by
+this read-only parse, not persisted IDs from the historical job. The observed
+failure is therefore at block classification/masking: the whole equation was
+not classified as protected, and its text was admitted to translation. The
+final dual PDF contains the reported mixed-language result; no historical job
+log was available to attribute any additional change to model output or
+rendering.
+
+The parser now groups span rows only when a horizontal vector line has nearby
+English text above and below it, a left-side expression ending in `=`, and a
+nearby equation-number marker. This handles cases where a text block combines
+the lower left-hand label and raised numerator on one extracted line, or where
+the denominator and equation number share a line. The matching dual-PDF source
+panel now parses as one `RULE_SPATIAL_FRACTION_EQUATION` protected block whose
+bounds include the label, numerator, denominator, number, and fraction bar. A
+deterministic synthetic integration test confirms that the whole equation area
+is pixel-identical after mock translation while two adjacent ordinary English
+paragraphs are translated. No real-model retranslation or edit of the dual PDF
+was performed.
+
+The equation-reference regular expression remains limited to reference labels.
+It is not the fraction-body fix. The local parser and synthetic visual test
+confirm the extraction/classification/masking behavior for this dual PDF and
+the generated fixture, respectively; the historical job's model response and
+rendering path cannot be reconstructed without its original job record/log.
+
+If future code combines blocks, placeholders must first be mapped to unique
+translation-unit IDs and retain owner-block/item identity. The unit output must
+then be validated against that mapping and split only by an explicit,
+deterministic boundary map; character-ratio splitting is unsafe for Japanese.
+Until such mapping and multi-region layout are implemented, context-only
+behavior is the supported boundary.
+
+## Progress and warning accounting
+
+`total_blocks` and `processed_blocks` remain counts of physical blocks, not
+translation units. Progress is recomputed from completed physical-block states
+instead of incrementing a persisted counter during resume. Validation issues
+are deduplicated by stable issue identity and content before persistence, so
+re-running visual checks does not append identical warnings indefinitely.
+
+No database migration is planned: existing blocks and issues are stored as JSON
+payloads, and new optional candidate metadata defaults to an empty list.
+
+## Synthetic acceptance coverage
+
+Synthetic PDFs cover left-to-right continuation, right-column-to-next-page
+continuation, one-column page continuation, formula placeholders in neighboring
+text, and same-named per-block placeholders. Negative cases include sentence
+terminators, abbreviations, decimal points, headings, captions, references,
+full-width blocks, layout changes, page-range boundaries, protected blocks,
+manual edits, and RSSI/CSI prose. Tests must verify unchanged physical IDs and
+boxes, no formula placeholder loss or duplication, stable cache behavior,
+bounded progress, and warning deduplication. No model or user PDF is needed.

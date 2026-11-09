@@ -1,0 +1,49 @@
+# Python / uv
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node / Frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/tsconfig.tsbuildinfo
+
+# Runtime & User Data (NEVER commit user papers, models, caches, or logs)
+runtime_data/
+tools/
+models/
+*.db
+*.sqlite
+*.sqlite3
+*.gguf
+*.onnx
+*.bin
+*.pt
+*.safetensors
+*.log
+*.zip
+*.exe
+*.dll
+
+# Private or generated PDFs / artifacts outside test fixtures generation
+uploads/
+outputs/
+cache/
+temp/
+working/
+tests/fixtures/generated/
+tests/visual/diff_outputs/
+
+# Secrets & Environment
+.env
+.env.local
+*.key
+*.pem
