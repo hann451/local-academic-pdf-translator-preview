@@ -186,6 +186,15 @@ describe("Screen 1: Home, Preflight & Job Configuration (Section 5)", () => {
     expect(notice).toHaveTextContent("Preferred Networks（PFN）の公式製品ではありません");
     expect(notice).toHaveTextContent("AGPL-3.0-only");
     expect(notice).toHaveTextContent("同梱せず別途取得");
+    expect(notice).toHaveTextContent("契約条件を確認・遵守");
+    expect(notice).toHaveTextContent("2026年11月9日改定ライセンスに関してPFNから受領した回答に基づく");
+    expect(notice).toHaveTextContent("書籍・論文などの独立した長文公表物に関する場合を除き");
+    expect(notice).toHaveTextContent(
+      "ただし書籍・論文などの独立した長文公表物の全部または実質的部分として公表する場合は、PLaMoを翻訳に利用した旨をPDF内に含めて明示する必要があります"
+    );
+    expect(notice).toHaveTextContent("PDF末尾の説明ページでも対応可能");
+    expect(notice).toHaveTextContent("説明ページを自動追加しません");
+    expect(notice).toHaveTextContent("原著作物の翻訳・配布・公表の許諾まで与えるものではありません");
     expect(screen.getByTestId("screen1-link-plamo-model")).toHaveAttribute(
       "href",
       "https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF"
@@ -647,7 +656,15 @@ describe("Screen 4: Glossary CRUD, TSV Import Preview & Dynamic Diagnostics (Sec
     expect(licensePanel).toHaveTextContent("Preferred Networks（PFN）の公式製品ではありません");
     expect(licensePanel).toHaveTextContent("AGPL-3.0-only");
     expect(licensePanel).toHaveTextContent("同梱しておらず、利用者が別途取得");
-    expect(licensePanel).toHaveTextContent("全条件への対応が完了するものではありません");
+    expect(licensePanel).toHaveTextContent("PLaMo 3 Translate の適用条件（2026年11月9日改定に関するPFN回答に基づく案内）");
+    expect(licensePanel).toHaveTextContent("契約条件を確認・遵守");
+    expect(licensePanel).toHaveTextContent("書籍・論文などの独立した長文公表物に関する場合を除き");
+    expect(licensePanel).toHaveTextContent(
+      "ただし書籍・論文などの独立した長文公表物の全部または実質的部分として公表する場合は、PLaMoを翻訳に利用した旨をPDF内に含めて明示する必要があります"
+    );
+    expect(licensePanel).toHaveTextContent("PDF末尾の説明ページでも対応可能");
+    expect(licensePanel).toHaveTextContent("説明ページを自動追加しません");
+    expect(licensePanel).toHaveTextContent("原著作物の翻訳・配布・公表の許諾まで与えるものではありません");
     expect(screen.getByTestId("link-plamo-model-repo")).toHaveAttribute(
       "href",
       "https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF"
