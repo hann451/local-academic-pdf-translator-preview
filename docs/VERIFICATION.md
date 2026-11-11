@@ -1,5 +1,26 @@
 # Verification status
 
+## Experimental Windows one-click setup & source-ZIP check — 2026-11-12
+
+> Notice: Past historical verification records below (2026-11-08 and earlier) are preserved as originally recorded. This section covers only the experimental source-ZIP one-click setup additions on branch `feat/one-click-setup` (code baseline `af572ac7f29f6c350e1b4e9b8219ad7767a23600`, README update `667b65e22d9b60fff36a7b73a507e5af7669ed93`).
+
+- **Archive packaging, encoding, and syntax checks (post-`667b65e` and `af572ac`):**
+  - Exported clean ZIP archives with `git archive --format=zip --prefix=local-academic-pdf-translator-preview/` (`556,637` bytes for `af572ac`, `557,260` bytes for `667b65e`) and verified extraction into paths containing Japanese characters and spaces using both Windows `Shell.Application` (`CopyHere`) and `.NET ZipFile::ExtractToDirectory` (for `af572ac`, and `.NET ZipFile` for `667b65e`).
+  - Confirmed all five root `.bat` wrappers (`NonASCII=0`, `BareLF=0`, CRLF), `scripts/run_silent.vbs` (`NonASCII=0`, `BareLF=0`, CRLF), and all four `.ps1` scripts (`UTF-8 BOM=True`, `BareLF=0`, `ParseErrors=0` under Windows PowerShell `5.1` `[System.Management.Automation.Language.Parser]::ParseFile`).
+- **Same-PC `PATH`-restricted CLI checks on `af572ac` `git archive` extraction (2026-11-11/12):**
+  - With `PATH` restricted to the four default Windows system folders (`System32`, Windows root, `Wbem`, `WindowsPowerShell\v1.0`) and isolated `UserDataDir` inside a Japanese+space path, unattended `初回セットアップ.bat -AcceptAgreements -ModelMode Local -PreselectedModelPath <existing GGUF> -UserDataDir <isolated> -ShortcutName "PaperBridge FinalCheck" -SkipShortcut` exited `0`: fetched SHA-256-verified `uv 0.11.15`, installed isolated CPython `3.13.13` (`--no-bin --no-registry`), synced `.venv` (`24` packages), extracted `Node.js v22.20.0` with `tar.exe` into `.runtime_tools\node22` (resolving a `MAX_PATH` 260 extraction error observed in an earlier run), built `frontend/dist/index.html` (`1.62s`), installed `llama.cpp b12167` Vulkan GPU + CPU binaries, validated/copied the local GGUF model, and wrote `.runtime_tools\runtime_profile.json`.
+  - Unattended `起動する.bat` (`-NoBrowser`, isolated ports `8084`/`8004`, reading `runtime_profile.json` without `-UserDataDir`) exited `0`: launched Vulkan `llama-server` (`n_gpu_layers=99`) and FastAPI backend, returned `llama_connection_status=connected` and `japanese_font_available=True` (`NotoSerifJP-VF.ttf`) on `/api/diagnostics?probe_llama=true`, completed non-mock real translation of a synthetic 1-page English PDF via `/api/documents/upload` and `/api/documents/{id}/jobs` (`state=completed`, `is_mock_run=False`) generating `['mono_ja_pdf', 'validation_report_json', 'dual_bilingual_pdf']`, verified `scripts/check_active_jobs.py` exited `0`, and verified clean `CTRL_BREAK_EVENT` shutdown with ports `8004`/`8084` released (`PORTS_AFTER_STOP=0`).
+  - Unattended `デスクトップにショートカットを作成.bat` (default and `-CpuMode` targeting an isolated temp directory) exited `0`, creating both `.lnk` shortcuts. `CPUモードで起動.bat` (`-NoBrowser`, isolated ports `8084`/`8004`) exited `0`, started `CPU専用 (b12167-cpu-x64, -ngl 0)`, and stopped cleanly via `CTRL_BREAK_EVENT`.
+  - Existing production runtime directory (`%LOCALAPPDATA%\PaperBridgeLocal`) and desktop shortcut timestamps remained unchanged after the tests, and temporary extraction/data directories were removed.
+  - Earlier workspace checks prior to `af572ac` (not individually re-run on `af572ac` ZIP) also observed idempotent setup re-run (`6.59s`), corrupted `.downloading` file recovery (`RECOVERY_TEST=PASSED`), and `check_active_jobs.py` exit codes (`0`, `1`, `2`, `3`).
+- **Author manual test note:**
+  - The repository author additionally reported normal operation during manual testing on their environment. Because individual GUI dialogs/screens, live full-model download, and separate machines were not enumerated via automated step-by-step records, this does not certify all GUI items or external environments.
+- **Unverified / remaining out-of-scope items:**
+  - Comprehensive interactive mouse/GUI testing across all wizard dialogs, Edge `--app=` window rendering/closing, and interactive unfinished-job close confirmation prompts
+  - Full ~1.81 GB `plamo-3-translate-2b-Q4_K_M.gguf` live network download completion from Hugging Face (CLI E2E used SHA-256-verified copy of an existing local GGUF)
+  - Automatic CPU fallback triggered by an actual Vulkan server startup failure on hardware lacking Vulkan support (explicit CPU launch via `CPUモードで起動.bat` was tested on the GPU-equipped host)
+  - Clean Windows 10/11 PCs with no developer tools installed, SmartScreen prompts, corporate TLS inspection/proxies, or other GPU/CPU configurations
+
 ## Current handoff baseline — 2026-11-08
 
 - The verification starting point is commit
