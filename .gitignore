@@ -17,6 +17,7 @@ frontend/.vite/
 frontend/tsconfig.tsbuildinfo
 
 # Runtime & User Data (NEVER commit user papers, models, caches, or logs)
+.runtime_tools/
 runtime_data/
 tools/
 models/

@@ -2,9 +2,39 @@
 
 本公開プレビュー版リポジトリの名称は `local-academic-pdf-translator-preview`（基本プロジェクト名: `local-academic-pdf-translator`）です。UI表示、パッケージ名（`paperbridge-local`）、環境変数（`PAPERBRIDGE_*`）、ローカル保存先（`%LOCALAPPDATA%\PaperBridgeLocal`）、認証ヘッダー（`X-PaperBridge-Token`）に残る `PaperBridge Local` / `PaperBridge` は開発中の内部仮称であり、同名の他プロジェクトとは無関係です。
 
-本初版は **Windows向け・ソース導入型の限定プレビュー版** です。ワンクリックインストーラーは用意されておらず、翻訳モデル（PLaMo 3 Translate GGUF）、推論サーバー（`llama.cpp`）、利用者文書（PDF）、およびローカルSQLiteデータベースは同梱していません。**実際の翻訳には、本アプリ（FastAPI + UI）と推論サーバー（`llama-server`）の両方を起動する必要があります。** また、スキャンPDFのOCR、ブロックをまたぐ連結翻訳、別PC・他GPU・クリーンWindows環境での動作保証は未対応または未検証です（詳細は[公開向け制約](PUBLIC_LIMITATIONS.md)および[公開向け検証状況](VERIFICATION.md)を参照）。公開用プレビューリポジトリURLは `https://github.com/hann451/local-academic-pdf-translator-preview` です（Private期間中は読み取り権限を持つGitHubアカウントが必要です）。
+本初版は **Windows向け・ソース導入型の限定プレビュー版** です。従来の手動導入手順に加え、`feat/one-click-setup` 系統の更新として**ソース ZIP ＋ 初回自動セットアップ／ダブルクリック起動スクリプト群（試験導入）**を追加しています（`v0.1.0-preview.2` 以前の古い ZIP には含まれません）。翻訳モデル（PLaMo 3 Translate GGUF）、推論サーバー（`llama.cpp`）、利用者文書（PDF）、およびローカルSQLiteデータベースはリポジトリに同梱していません。**実際の翻訳には、本アプリ（FastAPI + UI）と推論サーバー（`llama-server`）の両方を起動する必要があります。** また、スキャンPDFのOCR、ブロックをまたぐ連結翻訳、別PC・他GPU・クリーンWindows環境での動作保証は未対応または未検証です（詳細は[公開向け制約](PUBLIC_LIMITATIONS.md)および[公開向け検証状況](VERIFICATION.md)を参照）。公開用プレビューリポジトリURLは `https://github.com/hann451/local-academic-pdf-translator-preview` です。
 
-## 1. 検証済み構成と要件の範囲
+## 0. 初回自動セットアップ・ダブルクリック起動（試験導入）
+
+> [!WARNING]
+> 本節の手順は **試験導入** であり、「すべての環境で動作する」ものではありません。同一開発PC上の `PATH` 制限環境における無人 CLI 引数検証は実施済みですが、**GUI 画面での実際のマウス操作確認、`plamo-3-translate-2b-Q4_K_M.gguf`（約 1.81 GB）の公式配布元からの実ネットワークダウンロード完走、Vulkan 非対応機での自動 CPU 切り替え実機到達、および開発ツール未導入の別 Windows PC 環境**は未検証です。環境依存の問題が発生した場合は、第 1 節以降の手動セットアップ手順を参照してください。
+
+### 0.1 概要と利用手順
+
+1. 本機能を含む対象ブランチ／リリースのソース ZIP を展開します（日本語や空白を含むパスに配置可能）。
+2. **`初回セットアップ.bat`** をダブルクリックします。
+3. 確認ダイアログで以下を確認し、同意チェック後に「同意して開始」をクリックします。
+   - **自動取得するツール（SHA-256 検証付き・プロジェクト内 `.runtime_tools\` / `tools\` へ分離配置）:**
+     - `uv 0.11.15`（`.runtime_tools\uv\`）
+     - `Python 3.13`（`uv python install 3.13 --no-bin --no-registry` によりレジストリや `%USERPROFILE%\.local\bin` を変更せず分離配置し、`uv.lock` に厳密一致させて `.venv` を構築）
+     - `Node.js v22.20.0`（`.runtime_tools\node22\` へ配置し `frontend\dist` をビルド）
+     - `llama.cpp b12167`（Vulkan GPU版 `tools\llama.cpp\b12167-vulkan-x64\` と CPU専用版 `tools\llama.cpp\b12167-cpu-x64\` の両方）
+   - **必要な通信・容量・権限:** 外部ツール＋Python/npm 依存で約 250〜350 MB、モデル（約 1.81 GB）を含め合計約 2.1〜2.2 GB のダウンロード通信と **5 GB 以上の空き容量** が必要です。管理者権限や PC 全体の `PATH` 変更は行いません。
+   - **モデルの扱い:** 確認画面では「公式 Hugging Face からダウンロード（PLaMoコミュニティライセンス同意が必要）」「手元の既存 GGUF を SHA-256 検証して配置」「今はスキップ（初回起動時に再設定可能）」を選べます。保存先フォルダー（既定 `%LOCALAPPDATA%\PaperBridgeLocal`）やデスクトップショートカット名（既定 `PaperBridge Local`）を既存環境と分けたい場合は、確認画面上で別名を指定できます。
+   - **自動対応できない環境:** オフライン環境、プロキシや企業 TLS 検査により `github.com` / `nodejs.org` / `pypi.org` / `huggingface.co` が遮断される環境、SmartScreen や WSH (`wscript.exe`) が禁止されたポリシー環境、GPU ドライバ不具合や日本語フォント欠如は自動解決できません。
+4. 完了後はデスクトップアイコン、またはルートフォルダーの各バッチから起動します。
+
+| ファイル | 用途 | 備考 |
+|---|---|---|
+| `初回セットアップ.bat` | 環境構築・モデル準備・アイコン作成 GUI を起動 | エラー時はウィンドウを閉じず理由とログ先を表示 |
+| `起動する.bat` | 通常起動（Vulkan GPU 優先、失敗時は CPU 版へ切替試行） | 専用 Microsoft Edge ウィンドウ（`--app=`）を起動 |
+| `CPUモードで起動.bat` | 最初から CPU 専用バイナリ（`-ngl 0`）で起動 | GPU 不調時・非対応機向け |
+| `デスクトップにショートカットを作成.bat` | デスクトップアイコンを個別に作成・再作成 | `wscript.exe` ＋ `scripts\run_silent.vbs` を参照 |
+| `起動診断用コンソール.bat` | コンソール画面にログを出したまま起動 | `wscript.exe` 無効環境や起動失敗時の原因調査用 |
+
+終了時は専用 Edge ウィンドウを閉じます。DB に未完了または確認待ちジョブ（`created` / `preflight` / `parsing` / `awaiting_review` / `translating` / `validating` / `typesetting`）がある場合や DB 読み取りに失敗した場合は警告ダイアログを表示し、続行（ウィンドウ再表示）かサーバー停止かを選択できます。停止時は自分が起動したバックエンド・推論プロセスを PID・起動時刻・パス照合の上で `CTRL_BREAK_EVENT` により終了します（設定された保存先の `logs\setup.log` および `logs\launcher.log` を確認できます）。
+
+## 1. 検証済み構成と要件の範囲（従来の手動手順基準）
 
 記録上の実機検証例（最低要件ではありません）:
 
