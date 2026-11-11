@@ -848,16 +848,18 @@ if ($script:IsInteractive) {
 }
 
 $savedEnv = @{
-    PATH                   = $env:PATH
-    UV_PYTHON_INSTALL_DIR  = $env:UV_PYTHON_INSTALL_DIR
-    UV_PYTHON_PREFERENCE   = $env:UV_PYTHON_PREFERENCE
-    UV_MANAGED_PYTHON      = $env:UV_MANAGED_PYTHON
-    UV_PYTHON_BIN_DIR      = $env:UV_PYTHON_BIN_DIR
-    UV_CACHE_DIR           = $env:UV_CACHE_DIR
-    UV_LINK_MODE           = $env:UV_LINK_MODE
-    npm_config_cache       = $env:npm_config_cache
-    PYTHONUTF8             = $env:PYTHONUTF8
-    PYTHONIOENCODING       = $env:PYTHONIOENCODING
+    PATH                    = $env:PATH
+    UV_PYTHON_INSTALL_DIR   = $env:UV_PYTHON_INSTALL_DIR
+    UV_PYTHON_PREFERENCE    = $env:UV_PYTHON_PREFERENCE
+    UV_MANAGED_PYTHON       = $env:UV_MANAGED_PYTHON
+    UV_PYTHON_BIN_DIR       = $env:UV_PYTHON_BIN_DIR
+    UV_CACHE_DIR            = $env:UV_CACHE_DIR
+    UV_LINK_MODE            = $env:UV_LINK_MODE
+    UV_PROJECT_ENVIRONMENT  = $env:UV_PROJECT_ENVIRONMENT
+    PAPERBRIDGE_RUNTIME_DIR = $env:PAPERBRIDGE_RUNTIME_DIR
+    npm_config_cache        = $env:npm_config_cache
+    PYTHONUTF8              = $env:PYTHONUTF8
+    PYTHONIOENCODING        = $env:PYTHONIOENCODING
 }
 
 try {
@@ -881,6 +883,7 @@ try {
     $env:UV_PYTHON_BIN_DIR = Join-Path $RuntimeToolsDir "bin"
     $env:UV_CACHE_DIR = Join-Path $RuntimeToolsDir "uv-cache"
     $env:UV_LINK_MODE = "copy"
+    $env:UV_PROJECT_ENVIRONMENT = Join-Path $ProjectRoot ".venv"
     $env:npm_config_cache = Join-Path $RuntimeToolsDir "npm-cache"
     $env:PYTHONUTF8 = "1"
     $env:PYTHONIOENCODING = "utf-8"
@@ -896,6 +899,8 @@ try {
     if (-not (Test-Path -LiteralPath $venvPython)) {
         throw ".venv\Scripts\python.exe が見つかりません。Python 環境構築に失敗しました。"
     }
+    # Pin PAPERBRIDGE_RUNTIME_DIR before importing backend.api.app (create_app() runs on import)
+    $env:PAPERBRIDGE_RUNTIME_DIR = $UserDataDir
     Update-SetupUiProgress -Percent 42 -StatusText "バックエンドの読み込み動作を確認中..."
     Invoke-LoggedExternalCommand -StepLabel "backend import check" -FilePath $venvPython -ArgumentList @("-c", "import backend.api.app; print('BACKEND_IMPORT_OK')") -WorkingDirectory $ProjectRoot
 
