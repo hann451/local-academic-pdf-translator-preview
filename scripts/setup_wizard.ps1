@@ -79,7 +79,7 @@ $PINNED_TOOLS = @{
         Url         = "https://nodejs.org/dist/v22.20.0/node-v22.20.0-win-x64.zip"
         Size        = 35500968L
         Sha256      = "bb819d6eb8f5bfda294bbc83a7e4ec6539da67c4233d54b0d655b9248b15e29d"
-        InstallDir  = (Join-Path $RuntimeToolsDir "node\node-v22.20.0-win-x64")
+        InstallDir  = (Join-Path $RuntimeToolsDir "node22")
         ExeName     = "node.exe"
     }
     llama_vulkan = @{
@@ -321,16 +321,56 @@ function Install-PinnedZipTool {
     Update-SetupUiProgress -Percent ($BaseProgress + [int]($SpanProgress * 0.8)) -StatusText "$($Spec.Name) を展開中..."
     Write-SetupLog "$($Spec.Name) を展開しています..."
 
-    $extractTmp = Join-Path $RuntimeToolsDir "extract_tmp_$([guid]::NewGuid().ToString('N'))"
+    $extractTmp = Join-Path $RuntimeToolsDir "xt_$([guid]::NewGuid().ToString('N').Substring(0, 6))"
     try {
-        [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $extractTmp)
-        $foundExe = Get-ChildItem -LiteralPath $extractTmp -Filter $Spec.ExeName -Recurse | Select-Object -First 1
+        New-Item -ItemType Directory -Path $extractTmp -Force | Out-Null
+        $tarExe = Join-Path $env:WINDIR "System32\tar.exe"
+        if (Test-Path -LiteralPath $tarExe) {
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            try {
+                $tarOut = (& $tarExe -xf $zipPath -C $extractTmp 2>&1) -join "`n"
+                $tarRc = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $prevEap
+            }
+            if ($tarRc -ne 0) {
+                throw "$($Spec.Name) の展開 (tar.exe) が終了コード $tarRc で失敗しました: $tarOut"
+            }
+        } else {
+            [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $extractTmp)
+        }
+
+        $candidateDirs = New-Object System.Collections.Generic.List[string]
+        $candidateDirs.Add($extractTmp)
+        foreach ($d1 in (Get-ChildItem -LiteralPath $extractTmp -Directory -ErrorAction SilentlyContinue)) {
+            $candidateDirs.Add($d1.FullName)
+            if ($d1.Name -ne "node_modules") {
+                foreach ($d2 in (Get-ChildItem -LiteralPath $d1.FullName -Directory -ErrorAction SilentlyContinue)) {
+                    if ($d2.Name -ne "node_modules") {
+                        $candidateDirs.Add($d2.FullName)
+                    }
+                }
+            }
+        }
+        $foundExe = $null
+        foreach ($candDir in $candidateDirs) {
+            $candFile = Join-Path $candDir $Spec.ExeName
+            if (Test-Path -LiteralPath $candFile) {
+                $foundExe = Get-Item -LiteralPath $candFile
+                break
+            }
+        }
         if (-not $foundExe) {
             throw "$($Spec.Name) のアーカイブ内に $($Spec.ExeName) が見つかりませんでした。"
         }
         $sourceRoot = Split-Path -Parent $foundExe.FullName
         if (Test-Path -LiteralPath $Spec.InstallDir) {
-            Remove-Item -LiteralPath $Spec.InstallDir -Recurse -Force
+            try {
+                Remove-Item -LiteralPath $Spec.InstallDir -Recurse -Force -ErrorAction Stop
+            } catch {
+                cmd.exe /c "rd /s /q `"$($Spec.InstallDir)`"" | Out-Null
+            }
         }
         $parentDir = Split-Path -Parent $Spec.InstallDir
         if (-not (Test-Path -LiteralPath $parentDir)) {
@@ -341,7 +381,11 @@ function Install-PinnedZipTool {
         Write-SetupLog "$($Spec.Name) の配置が完了しました: $($Spec.InstallDir)"
     } finally {
         if (Test-Path -LiteralPath $extractTmp) {
-            Remove-Item -LiteralPath $extractTmp -Recurse -Force -ErrorAction SilentlyContinue
+            try {
+                Remove-Item -LiteralPath $extractTmp -Recurse -Force -ErrorAction Stop
+            } catch {
+                cmd.exe /c "rd /s /q `"$extractTmp`"" | Out-Null
+            }
         }
     }
 }

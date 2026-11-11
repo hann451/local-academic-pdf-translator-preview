@@ -17,7 +17,7 @@
    - **自動取得するツール（SHA-256 検証付き・プロジェクト内 `.runtime_tools\` / `tools\` へ分離配置）:**
      - `uv 0.11.15`（`.runtime_tools\uv\`）
      - `Python 3.13`（`uv python install 3.13 --no-bin --no-registry` によりレジストリや `%USERPROFILE%\.local\bin` を変更せず分離配置し、`uv.lock` に厳密一致させて `.venv` を構築）
-     - `Node.js v22.20.0`（`.runtime_tools\node\` へ配置し `frontend\dist` をビルド）
+     - `Node.js v22.20.0`（`.runtime_tools\node22\` へ配置し `frontend\dist` をビルド）
      - `llama.cpp b12167`（Vulkan GPU版 `tools\llama.cpp\b12167-vulkan-x64\` と CPU専用版 `tools\llama.cpp\b12167-cpu-x64\` の両方）
    - **必要な通信・容量・権限:** 外部ツール＋Python/npm 依存で約 250〜350 MB、モデル（約 1.81 GB）を含め合計約 2.1〜2.2 GB のダウンロード通信と **5 GB 以上の空き容量** が必要です。管理者権限や PC 全体の `PATH` 変更は行いません。
    - **モデルの扱い:** 確認画面では「公式 Hugging Face からダウンロード（PLaMoコミュニティライセンス同意が必要）」「手元の既存 GGUF を SHA-256 検証して配置」「今はスキップ（初回起動時に再設定可能）」を選べます。保存先フォルダー（既定 `%LOCALAPPDATA%\PaperBridgeLocal`）やデスクトップショートカット名（既定 `PaperBridge Local`）を既存環境と分けたい場合は、確認画面上で別名を指定できます。
