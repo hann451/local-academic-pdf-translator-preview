@@ -564,18 +564,19 @@ def extract_inline_math_spans(
                                 )
                             )
 
-    # Detect any super/sub InlineMathSpan whose (context_text, target_text) appears multiple
-    # times in the same block with conflicting roles (e.g. both super and sub, or sub/super and normal).
+    # Detect any super/sub InlineMathSpan whose `context_text` appears multiple times
+    # in the same block with conflicting structures (e.g. both super and sub, sub/super and
+    # normal plain text, or different split target_text like `a1^2` vs `a_{12}`).
     # Instead of silently dropping spans into flat plain text, mark conflicting spans `ambiguous=True`
     # so `typeset_and_export` safely falls back to original PDF with an explicit warning before redaction.
     if spans_out:
-        roles_by_ctx: dict[tuple[str, str], set[str]] = {}
+        variants_by_ctx: dict[str, set[tuple[str, str]]] = {}
         for item in spans_out:
             if item.role in ("super", "sub"):
-                roles_by_ctx.setdefault((item.context_text, item.target_text), set()).add(
-                    item.role
+                variants_by_ctx.setdefault(item.context_text, set()).add(
+                    (item.role, item.target_text)
                 )
-        if roles_by_ctx:
+        if variants_by_ctx:
             normal_chunks: list[str] = []
             for line in lines:
                 spans = line["spans"]
@@ -636,7 +637,7 @@ def extract_inline_math_spans(
                     normal_chunks.append("".join(cur_normal))
 
             _WORD_MATH_CH_RE = re.compile(r"[A-Za-z0-9\U0001d400-\U0001d7ff]")
-            for (ctx, tgt), rset in roles_by_ctx.items():
+            for ctx, vset in variants_by_ctx.items():
                 left_guard = (
                     r"(?<![A-Za-z0-9\U0001d400-\U0001d7ff])"
                     if ctx and _WORD_MATH_CH_RE.match(ctx[0])
@@ -650,15 +651,15 @@ def extract_inline_math_spans(
                 pat = re.compile(left_guard + re.escape(ctx) + right_guard)
                 for chunk in normal_chunks:
                     if pat.search(chunk):
-                        rset.add("normal")
+                        vset.add(("normal", ctx))
                         break
 
             final_spans: list[InlineMathSpan] = []
             seen_ambiguous: set[tuple[str, str]] = set()
             for item in spans_out:
                 if item.role in ("super", "sub"):
-                    key = (item.context_text, item.target_text)
-                    if len(roles_by_ctx.get(key, set())) > 1:
+                    if len(variants_by_ctx.get(item.context_text, set())) > 1:
+                        key = (item.context_text, item.target_text)
                         if key not in seen_ambiguous:
                             seen_ambiguous.add(key)
                             final_spans.append(item.model_copy(update={"ambiguous": True}))
@@ -3217,14 +3218,30 @@ def wrap_japanese_kinsoku(
             inline_math_spans=inline_math_spans,
         )
 
-    # Tokenize so URLs, `{vN}`, radical expressions `√(...)`, or inline math sequences stay together
-    tokens = re.findall(
+    # Tokenize so URLs, space-containing inline math spans (e.g. `𝑃abc i`), radical
+    # expressions `√(...)`, or contiguous math sequences stay together without splitting.
+    span_ctx_alts: list[str] = []
+    if inline_math_spans:
+        ws_ctx_set = sorted(
+            {
+                normalize_for_pdf_rendering(m.context_text)
+                for m in inline_math_spans
+                if not m.ambiguous
+                and m.context_text
+                and " " in normalize_for_pdf_rendering(m.context_text)
+            },
+            key=len,
+            reverse=True,
+        )
+        span_ctx_alts = [re.escape(c) for c in ws_ctx_set]
+    base_token_pattern = (
         r"https?://[^\s\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff\uff00-\uffef]+"
         r"|[A-Za-z0-9\U0001d400-\U0001d7ff\u0370-\u03ff\u02c6=+\-−∗]*√\([^()\n]+\)[.,;:]?"
-        r"|[A-Za-z0-9\U0001d400-\U0001d7ff\u0370-\u03ff\u2070-\u209f\u02c6_^\(\)\[\]{}=<>≤≥≈≠±+\-−∗√∑∏∫*/.,:;′″']+"
-        r"|\s+|.",
-        norm_text,
+        r"|[A-Za-z0-9\U0001d400-\U0001d7ff\u0370-\u03ff\u2070-\u209f\u2190-\u21ff\u2200-\u22ff\u00b7\u00d7\u00f7\u27e8\u27e9\u02c6_^\(\)\[\]{}=<>≤≥≈≠±+\-−∗√∑∏∫*/.,:;′″']+"
+        r"|\s+|."
     )
+    token_pattern = "|".join(span_ctx_alts + [base_token_pattern]) if span_ctx_alts else base_token_pattern
+    tokens = re.findall(token_pattern, norm_text)
     cur_tokens: list[str] = []
 
     for tok in tokens:

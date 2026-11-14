@@ -1250,9 +1250,14 @@ def test_item6_case4_repeated_identical_math_string_with_conflicting_roles() -> 
                 {"text": "𝑎", "size": 10.0, "origin": [81.0, 18.0], "bbox": [81.0, 10.0, 87.0, 20.0]},
                 {"text": "1", "size": 7.0, "origin": [87.2, 20.5], "bbox": [87.2, 14.0, 91.0, 22.0]},
                 {"text": " vs 𝑎1", "size": 10.0, "origin": [92.0, 18.0], "bbox": [92.0, 10.0, 125.0, 20.0]},
+                # Fourth occurrence: split-target collision b1^2 vs b_{12} (same context "𝑏12", different targets)
+                {"text": " 𝑏1", "size": 10.0, "origin": [126.0, 18.0], "bbox": [126.0, 10.0, 138.0, 20.0]},
+                {"text": "2", "size": 7.0, "origin": [138.2, 15.0], "bbox": [138.2, 9.0, 142.0, 16.0]},
+                {"text": " 𝑏", "size": 10.0, "origin": [143.0, 18.0], "bbox": [143.0, 10.0, 149.0, 20.0]},
+                {"text": "12", "size": 7.0, "origin": [149.2, 20.5], "bbox": [149.2, 14.0, 157.0, 22.0]},
                 # Unambiguous control: y^3 (only appears as superscript)
-                {"text": " 𝑦", "size": 10.0, "origin": [126.0, 18.0], "bbox": [126.0, 10.0, 134.0, 20.0]},
-                {"text": "3", "size": 7.0, "origin": [134.2, 15.0], "bbox": [134.2, 9.0, 138.0, 16.0]},
+                {"text": " 𝑦", "size": 10.0, "origin": [158.0, 18.0], "bbox": [158.0, 10.0, 166.0, 20.0]},
+                {"text": "3", "size": 7.0, "origin": [166.2, 15.0], "bbox": [166.2, 9.0, 170.0, 16.0]},
             ],
         }
     ]
@@ -1260,12 +1265,14 @@ def test_item6_case4_repeated_identical_math_string_with_conflicting_roles() -> 
     non_ambiguous_spans = [s for s in spans if not s.ambiguous]
     ambiguous_spans = [s for s in spans if s.ambiguous]
     ctx_set = {(s.context_text, s.target_text, s.role) for s in non_ambiguous_spans}
-    # Conflicting "𝑥2" (super vs sub) and "𝑎1" (sub vs normal) must not be kept as unambiguous,
-    # and must instead be propagated explicitly with ambiguous=True.
+    # Conflicting "𝑥2" (super vs sub), "𝑎1" (sub vs normal), and "𝑏12" (different targets)
+    # must not be kept as unambiguous, and must instead be propagated with ambiguous=True.
     assert not any(s.context_text == "𝑥2" for s in non_ambiguous_spans)
     assert not any(s.context_text == "𝑎1" for s in non_ambiguous_spans)
+    assert not any(s.context_text == "𝑏12" for s in non_ambiguous_spans)
     assert any(s.context_text == "𝑥2" and s.ambiguous for s in ambiguous_spans)
     assert any(s.context_text == "𝑎1" and s.ambiguous for s in ambiguous_spans)
+    assert any(s.context_text == "𝑏12" and s.ambiguous for s in ambiguous_spans)
     # Unambiguous "𝑦3" (super) is preserved
     assert ("𝑦3", "3", "super") in ctx_set
 
@@ -1723,6 +1730,22 @@ def test_review_item2_fit_checks_horizontal_width_including_long_tokens_and_kins
     assert frac_fits is True
     assert frac_sz == 8.0
     assert len(frac_lines) == 1
+
+    # Space-containing stacked math context & Unicode operator formulas must never be split across wrap lines
+    stacked_spans = [
+        InlineMathSpan(context_text="𝑃abc", target_text="abc", role="super", scale=0.78, dy_em=-0.29),
+        InlineMathSpan(context_text="𝑃abc i", target_text="i", role="sub", scale=0.78, dy_em=0.18),
+    ]
+    stk_wrapped = wrap_japanese_kinsoku(
+        "ここでは係数 𝑃abc i および 𝐴×𝐵=𝐶∈ℝ を使う。",
+        max_width_pt=105.0,
+        font_size_pt=10.0,
+        ja_font=ja_font,
+        math_font=math_font,
+        inline_math_spans=stacked_spans,
+    )
+    assert any("𝑃abc i" in ln for ln in stk_wrapped)
+    assert any("𝐴×𝐵=𝐶∈ℝ" in ln for ln in stk_wrapped)
 
     # Also verify end-to-end typeset triggers TYPESETTING_OVERFLOW_FALLBACK on long URL
     pdf_path = tmp_path / "item2_overflow.pdf"
