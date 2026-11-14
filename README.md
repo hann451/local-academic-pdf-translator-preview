@@ -14,7 +14,7 @@ Windows向けのローカル学術論文PDF翻訳アプリ（**Windows向け・�
   - **本文中のインライン数式・数学用記号の扱い（改善範囲と残存制限）:**
     - 数学用イタリック・ギリシャ文字・演算子等を含むインライン数式をプレースホルダ（`{v1}` 等）で保護し、計測・描画・埋め込み時のフォールバックフォント（例: Windows の `Cambria` / `Segoe UI Symbol`）と `ToUnicode` 補正により、非ASCII数学記号や補助平面文字（`U+10000`〜`U+10FFFF`、数学用英数字記号 `U+1D400`〜`U+1D7FF` を含む）の文字欠落・文字化け（`.notdef` / 空白化 / サロゲートペア未変換）を軽減しています。
     - 構造化された上付き・下付き添字、合成アクセント（ハット等）、および根号上線ベクトルなど、検証済みパターンのインライン要素を保持して日本語文と混在組版できます。
-    - 一方で、縦積み分数、数式の途中で複数ブロックに分割され深く重複している段落（`TRANSLATED_BLOCK_OVERLAP_FALLBACK`）、最小フォントサイズ（`8.0pt`）でも元の枠に収まらない狭小・高密度段落（`TYPESETTING_OVERFLOW_FALLBACK`）、独立した数式ブロックや式番号周辺の一部（`PROTECTED_SKIP` / `PROTECTED_REGION_OVERLAP_FALLBACK`）、および複雑な多段数式や環境依存の特殊グリフは日本語へ再組版できず、元の英語表記を安全に保持（原文フォールバック＋警告記録）するか翻訳対象外となります。すべての数式表現やレイアウトが維持されるわけではありません。
+    - 一方で、縦積み分数、数式の途中で複数ブロックに分割され深く重複している段落（`TRANSLATED_BLOCK_OVERLAP_FALLBACK`）、最小フォントサイズ（`8.0pt`）でも元の枠に収まらない狭小・高密度段落（`TYPESETTING_OVERFLOW_FALLBACK`）、同一ブロック内で同一変数表記に上付き・下付き・通常表記等の競合や分割曖昧性がある段落（`AMBIGUOUS_INLINE_MATH_FALLBACK`）、独立した数式ブロックや式番号周辺の一部（`PROTECTED_SKIP` / `PROTECTED_REGION_OVERLAP_FALLBACK`）、および複雑な多段数式や環境依存の特殊グリフは日本語へ再組版できず、元の英語表記を安全に保持（原文フォールバック＋警告記録）するか翻訳対象外となります。すべての数式表現やレイアウトが維持されるわけではありません。
   - 記録された従来の手動検証例（Windows 11 x64、CPython 3.13.13、uv 0.11.15、Node.js 22.20.0 / npm 10.9.3、AMD Radeon RX 7600、llama.cpp Vulkan版）も 1 つの実機確認例であり、最低ハードウェア要件の確定は未検証です（Python許容範囲は `pyproject.toml` 上 `>=3.12,<3.14`）。詳細は[Windowsセットアップガイド](docs/SETUP_WINDOWS.md)、[公開向け制約](docs/PUBLIC_LIMITATIONS.md)、[公開向け検証状況](docs/VERIFICATION.md)を参照してください。
 
 ## 初回自動セットアップについて

@@ -33,6 +33,26 @@
   - 本13ページ論文の全ページ（13ページ全体）を通した実モデル新規翻訳E2E、別ブロックや他論文での網羅評価
   - `初回セットアップ.bat` によるクリーンな別Windows PC環境での再セットアップ、フロントエンド `npm test` / `npm run build` の再実行、および他CPU/GPU構成・GPU失敗時CPU自動フォールバックの再試験
 
+### PR #3 レビュー指摘5項目の修正・追加検証（ローカル再検証 — 2026-11-14 追記）
+
+> 注記：上記 `2026-11-14` 初版記録（`98 passed` / `28 passed` / 初期の実モデル推論検証記録）および下記の過去履歴は当時の記録のまま保持しています。本節は PR #3 の実差分レビュー指摘5項目に対する追加コミット（`05f08c45b50fd7eab95bd438111d4be827e76228` および `0ac3a5f1e7db24a0cce21275b5f35b9d9a2e455e`）時点のローカル修正・検証結果のみを記録します。
+
+- **追加修正した5項目と主な内容:**
+  1. **曖昧な添字の平文化防止（`AMBIGUOUS_INLINE_MATH_FALLBACK`）**: `extract_inline_math_spans()` において同一 `context_text` 内に上付き・下付き・通常表記等の競合構造や分割上の曖昧性がある場合に、対象スパンを除外して平文出力（例: `x^2` と `x_2` がどちらも `x2` になる問題）せず、`AMBIGUOUS_INLINE_MATH_FALLBACK` で元の英語ブロックを安全に原文保持＋警告記録するように修正（`test_item6_case4_repeated_identical_math_string_with_conflicting_roles` 更新および E2E 再現テスト `test_review_item1_conflicting_math_roles_e2e_fallback_and_warning` で検証）。
+  2. **水平フィット判定と最小フォントサイズ候補・原子トークン保護の修正**: `fit_japanese_text_in_bbox()` で高さだけでなく `_measure_rendered_line_width()` による実描画幅・禁則ぶら下げ余白を含めて水平収まりを判定し、最小フォントサイズ（`8.0pt`）候補を含めた探索とスペース・Unicode 演算子を含む数式トークンの途中分割防止を修正。
+  3. **複数文字の上付き・下付き配置とカーソル進行の修正**: `_build_styled_line_plan()` において複数文字の上付き・下付き（`P^{abc}_{i}`, `P^{*}_{index}`, `P^{ab}_{cd}` 等）の開始 x 座標整合とグループ幅に基づくカーソル進行を修正。
+  4. **保護領域に対する処理順非依存化**: フェーズ1・フェーズ2の不動点収束処理を導入し、ページ内ブロックの並び順に依存せず同一の結果へ収束するように修正。
+  5. **根号上線（overbar）白塗りによる保護対象消去の防止**: `orig_overbar_bbox` の白塗り領域から保護領域を差し引く `_subtract_protected_boxes` および重なりチェックを導入し、隣接する保護線画・図表の誤消去を防止。
+- **最新ローカルテスト結果（コミット `0ac3a5f1`・分離ランタイム `PAPERBRIDGE_RUNTIME_DIR` 使用・本番データ非接続）:**
+  - ローカル全 `pytest`: `103 passed, 7 skipped, 1 warning`（スキップ7件は実モデル推論・認証を要する `tests/integration/test_real_plamo_phase2.py` のオプトイン統合テスト）
+  - CI 環境 `YuGothR.ttc` フォールバック模擬（`test_inline_math_preservation.py` + `test_visual_preservation.py`）: `33 passed`
+- **実論文影響確認（対象: DensePose 論文の以前の実モデル出力21ブロック）:**
+  - **実施性質の明記**: 本確認は**「以前の実モデル出力21ブロックを最新コード（`0ac3a5f1`）で再組版した影響確認」であり、最新コードによる新規実モデル推論や全13ページの新規翻訳E2Eではありません。**
+  - **結果**: `translated` 14ブロック / `fallback_original` 7ブロック、曖昧添字フォールバック検出（`ambiguous_blocks`）0件、処理順依存差分（`order_independence_diffs`）0件、置換文字・NUL 文字混入（`has_replacement_or_null`）`False`。5ページ目 block-17 は `8.0pt` で bbox 内に収まり右方向はみ出しが解消され、3ページ目の上付き `2`（2箇所）も保持されました。
+- **今回未実施・残存範囲:**
+  - 最新コード上での新規実モデル推論（`page-7:block-27` のような実推論出力に対する数値検証の再評価を含む）および全13ページの新規翻訳E2E
+  - `初回セットアップ.bat` によるクリーンな別 Windows PC 環境での再セットアップ
+
 ## Experimental Windows one-click setup & source-ZIP check — 2026-11-12
 
 > Notice: Past historical verification records below (2026-11-08 and earlier) are preserved as originally recorded. This section covers only the experimental source-ZIP one-click setup additions on branch `feat/one-click-setup`. The archive/CLI tests described below were run on pre-push local verification commits prior to rebuilding those unpushed commits with GitHub noreply commit metadata (`285997610+hann451@users.noreply.github.com`), and the runtime tests were not re-run solely for the rebuilt commit SHAs; subsequent `docs/VERIFICATION.md` SHA-alignment edits sit cleanly on top without altering functional code.
