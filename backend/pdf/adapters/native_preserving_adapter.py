@@ -96,6 +96,44 @@ _INLINE_MATH_EXPR_RE = re.compile(
     r")"
 )
 _EQUATION_NUM_ONLY_RE = re.compile(r"^\s*\(\d+(?:\.\d+)*[a-z]?\)\s*$")
+_UNRESOLVED_PH_CHECK_RE = re.compile(r"\{\s*v\s*\d+\s*\}|［v\d+］|｛v\d+｝", re.IGNORECASE)
+
+
+def _find_unresolved_placeholders(restored_text: str, source_text: str) -> list[str]:
+    """Return any placeholder-like tokens remaining in restored_text that were not
+    literally present in the original source_text.
+    """
+    found = _UNRESOLVED_PH_CHECK_RE.findall(restored_text)
+    if not found:
+        return []
+    src_tokens = _UNRESOLVED_PH_CHECK_RE.findall(source_text or "")
+    unresolved: list[str] = []
+    remaining_src = list(src_tokens)
+    for tok in found:
+        if tok in remaining_src:
+            remaining_src.remove(tok)
+        else:
+            unresolved.append(tok)
+    return unresolved
+
+
+def _find_unrenderable_chars(text: str, fonts: list[pymupdf.Font]) -> list[str]:
+    """Return a list of unique characters (formatted as 'ch(U+XXXX)') in `text` that
+    have no glyph (`has_glyph == 0`) in any of the provided `fonts`.
+    """
+    if not fonts:
+        return []
+    missing: list[str] = []
+    seen: set[int] = set()
+    for ch in text:
+        cp = ord(ch)
+        if cp <= 0x20 or ch.isspace() or cp in seen:
+            continue
+        if not any(f.has_glyph(cp) != 0 for f in fonts):
+            seen.add(cp)
+            missing.append(f"{ch}(U+{cp:04X})")
+    return missing
+
 _ISOLATED_FORMULA_LINE_RE = re.compile(
     r"^\s*(?:[A-Za-zα-ωΑ-Ω0-9_^\(\)\[\]{}+*/.,\s|′″'-]*[=<>≤≥≈≠±∑∏∫∂∇∞∈]+\s*[A-Za-zα-ωΑ-Ω0-9_^\(\)\[\]{}+*/.,\s|′″'-]+)\s*(?:\(\d+(?:\.\d+)*\))?\s*$"
 )
@@ -1416,6 +1454,12 @@ class NativePreservingAdapter(PdfEngineAdapter):
             return blocks, issues
 
         font_path = self.config.font_serif_path or self.config.font_sans_path
+        active_fonts: list[pymupdf.Font] = []
+        if font_path and font_path.exists():
+            active_fonts.append(pymupdf.Font(fontfile=str(font_path)))
+        else:
+            active_fonts.append(pymupdf.Font("japan-s"))
+
         blocks_by_page: dict[int, list[Block]] = {}
         for b in blocks:
             blocks_by_page.setdefault(b.page_index, []).append(b)
@@ -1466,6 +1510,60 @@ class NativePreservingAdapter(PdfEngineAdapter):
                     restored_text = unmask_inline_protected_elements(
                         effective_txt, blk.protected_items
                     )
+
+                    # Pre-redaction check 1: Never allow unresolved placeholders into final PDF
+                    unresolved_phs = _find_unresolved_placeholders(restored_text, blk.source_text)
+                    if unresolved_phs:
+                        blk.status = BlockStatus.FALLBACK_ORIGINAL
+                        blk.translation_provenance = "fallback_original"
+                        blk.warnings.append("UNRESOLVED_PLACEHOLDER_FALLBACK")
+                        protected_boxes.append(blk.bbox)
+                        issues.append(
+                            ValidationIssue(
+                                id=f"iss-{uuid.uuid4().hex[:10]}",
+                                job_id=job_id,
+                                document_id=document.id,
+                                page_index=p_idx,
+                                block_id=blk.id,
+                                bbox=blk.bbox,
+                                code="UNRESOLVED_PLACEHOLDER_FALLBACK",
+                                severity=IssueSeverity.WARNING,
+                                message=(
+                                    f"未解決の保護プレースホルダー（{unresolved_phs}）が残存しているため、"
+                                    "不完全な出力を避けて原文要素を保持しました。"
+                                ),
+                                details={"unresolved_placeholders": unresolved_phs},
+                                fallback_applied=True,
+                            )
+                        )
+                        continue
+
+                    # Pre-redaction check 2: Verify all characters have glyphs in active rendering fonts
+                    missing_glyphs = _find_unrenderable_chars(restored_text, active_fonts)
+                    if missing_glyphs:
+                        blk.status = BlockStatus.FALLBACK_ORIGINAL
+                        blk.translation_provenance = "fallback_original"
+                        blk.warnings.append("UNRENDERABLE_GLYPH_FALLBACK")
+                        protected_boxes.append(blk.bbox)
+                        issues.append(
+                            ValidationIssue(
+                                id=f"iss-{uuid.uuid4().hex[:10]}",
+                                job_id=job_id,
+                                document_id=document.id,
+                                page_index=p_idx,
+                                block_id=blk.id,
+                                bbox=blk.bbox,
+                                code="UNRENDERABLE_GLYPH_FALLBACK",
+                                severity=IssueSeverity.WARNING,
+                                message=(
+                                    f"利用可能なフォントにグリフが存在しない文字（{missing_glyphs}）が含まれるため、"
+                                    "文字欠け（.notdef）を防ぎ原文要素を保持しました。"
+                                ),
+                                details={"missing_glyphs": missing_glyphs},
+                                fallback_applied=True,
+                            )
+                        )
+                        continue
 
                     # Check overlap with protected boxes (both IoU and sub-box containment ratio)
                     overlapping_prot = [
