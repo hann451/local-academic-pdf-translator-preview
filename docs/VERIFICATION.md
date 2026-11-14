@@ -1,5 +1,99 @@
 # Verification status
 
+## インライン数式保持・フォント統一・安全フォールバックの検証記録 — 2026-11-14
+
+> 注記：以下の過去履歴（`2026-11-12` およびそれ以前）は当時の記録のまま保持しています。本節はブランチ `fix/inline-math-preservation`（起点：`origin/main` `06b3fafbd684e5876a157e18dd11452f570897b9`）におけるローカル実装・CI環境フォールバック修正・再検証の範囲のみを記録します。
+
+- **ロックファイル準拠の分離検証環境（再検証環境）:**
+  - 作業ディレクトリ：リポジトリルート（`uv sync --locked --extra dev` で新規作成した専用 `.venv`）
+  - Python / PyMuPDF：`CPython 3.13.13`（`<repo>\.venv\Scripts\python.exe`）、`PyMuPDF 1.28.2`
+  - 使用したシステムフォント：`C:\Windows\Fonts\NotoSerifJP-VF.ttf`（`NotoSerifJP-ExtraLight`）、`C:\Windows\Fonts\NotoSansJP-VF.ttf`（`NotoSansJP-Thin`）、`C:\Windows\Fonts\cambria.ttc`（`Cambria`）、および `NotoSerifJP-VF.ttf` 不在時フォールバック再現用の `C:\Windows\Fonts\YuGothR.ttc`
+  - ランタイムデータ：`PAPERBRIDGE_RUNTIME_DIR` により既存の既定データ領域から分離したディレクトリを使用
+- **自動テスト結果（オフライン／モック・合成PDF中心の回帰テスト）:**
+  - 実行コマンド：`& '.\.venv\Scripts\python.exe' -m pytest tests -q -rs`（`PYTHONPATH=""`、分離済み `PAPERBRIDGE_RUNTIME_DIR`）
+  - 結果：**`98 passed, 7 skipped, 1 warning`**（新規追加・拡充した `tests/unit/test_inline_math_preservation.py` の **25件すべて PASS** を含む。あわせて `NotoSerifJP-VF.ttf` 不在・`YuGothR.ttc` フォールバック再現環境でも `test_inline_math_preservation.py` 25件＋`test_visual_preservation.py` 3件の計 **28 passed** を確認）
+  - skip 7件の理由：`tests/integration/test_real_plamo_phase2.py`（L51, L70, L100, L183, L224, L309, L384）は `--run-real-llm` / `-m real_llm` 明示時のみ実行される既定スキップ対象テストであり、pytest 実行内では実モデル推論を行っていないため。
+- **改善・検証した内容と残存制限の区別（別途実施した検証の基盤仕様）:**
+  - **数学用文字のグリフ欠落・文字化け改善:** 計測・描画・埋め込み時のフォールバックフォント選択を統一し、`_select_char_font()` において SMP 数学用英数字記号（`U+1D400`〜`U+1D7FF`）に加え、数学演算子（`−` 等）・ギリシャ文字・矢印・修飾記号（`ˆ` 等）でも `F_MATH`（`Cambria` / `Segoe UI Symbol`）を優先するよう調整した（`NotoSerifJP-VF.ttf` 不在環境の `YuGothR.ttc` が `U+2212`/`U+FF0D` や `U+02C6`/`U+0302` で同一グリフIDを共有し `/ToUnicode` 抽出が `－`/`\u0302` へ化ける事象の回避）。また、`ToUnicode` CMap において MuPDF が補助平面文字（`U+10000`〜`U+10FFFF`、今回の数学用英数字記号 `U+1D400`〜`U+1D7FF` を含む）を UTF-16BE サロゲートペアへ変換せず 5〜6 桁の 16 進トークン（例：`𝑎` [`U+1D44E`] を `<1d44e>`、`𝑃` [`U+1D443`] を `<1d443>`）のまま出力するため再読込・コピー時に別文字へ化ける事象に対し、元PDFの既存 `ToUnicode` CMap（事前収集した xref）を除外して新規埋め込みの `F_JA` / `F_MATH` フォントに限定し、8桁サロゲートペア（例：`<D835DC4E>`）へ変換する `_fix_embedded_tounicode_smp()` を実装。`beginbfchar` / `beginbfrange` への適用、正常 8 桁サロゲートペア・4桁 BMP・8桁合字や `begincidchar` / `begincidrange` の非変更、べき等性、BMP+補助平面文字混在、および `mono` / `dual` 保存再読込後の抽出を単体テストで確認。
+  - **検証した上付き・下付き・ハット・根号上線の保持:** 構造化 `InlineMathSpan` により、検証対象ブロックにおける上付き・下付き添字（例：`𝑎2 + 𝑏2`, `𝐿𝑐𝑙𝑠`, `𝐿𝑘𝑝`, `𝑃𝑗`, `𝑖𝑝`, `𝐸1`, `𝑅1`）、合成アクセント付き記号（例：`ˆ𝑖𝑝`, `ˆ𝑀`）、および根号上線ベクトル（例：`𝐴=√(𝑎2+𝑏2)`）の保持と、スパン間空白復元・NUL（`U+0000`）/ TeX演算子由来異体字セレクタ（`U+FE00` / `U+FE01`）混入防止・異常系8項目（プレースホルダ削除/複製/未知/改変、PUA衝突、同一変数の通常文字・添字混在、`MANUALLY_EDITED` 再組版、`FALLBACK_ORIGINAL` 周辺4方向の赤枠保護）を単体テストで確認。
+  - **組版できず原文保持（`FALLBACK_ORIGINAL` / `PROTECTED_SKIP`）になった箇所:** 最小フォントサイズ `8.0pt` でも元の英語枠に収まらない狭小・高密度ブロックは `TYPESETTING_OVERFLOW_FALLBACK` で赤枠消去前に原文保持し、1つの段落が数式途中（上付き添字や縦分数）で2ブロックへ分割され深く重複している組は `TRANSLATED_BLOCK_OVERLAP_FALLBACK` で文字衝突を防いで原文保持し、表示数式内の孤立記号は `PROTECTED_SKIP` / `PROTECTED_REGION_OVERLAP_FALLBACK` として保護する動作を確認。
+  - **残存制限:** 縦積み分数（`\frac{1}{10}` 等）を含む分割段落、1〜2行相当の極端に狭い枠に長い日本語訳が入る箇所、複雑な多段数式、およびブロックをまたぐ連結再配分には未対応であり、日本語組版ではなく安全な原文保持へフォールバックする場合がある（すべての数式やレイアウトを維持するものではない）。
+- **別途実施した実論文PDF（13ページ構成の英語論文の Pages 3–7）での検証（上記 pytest 98件とは別実施）:**
+  - **補助テスト（前回の固定訳文・短縮訳による描画確認）との区別:** 初期の組版確認スクリプトでは、新規解析したプレースホルダ構造に対する描画確認としてスクリプト内の固定訳文および Page 4 狭小枠向けの短縮訳を使用していたため、これは**実モデルによる新規翻訳E2Eではない補助的な描画確認**として区別する。
+  - **保存済み訳文を変更しない再組版（`retypeset`）の確認結果:** 既存の保存済みDBスナップショットの訳文を1文字も編集せず再組版を実行し、主要15ブロック（対象14箇所＋分割対1箇所）を確認：
+    - `translated`（警告なし、`Cambria` + `NotoSerifJP-ExtraLight`、NUL [`U+0000`] および `U+FE00` / `U+FE01` 残存 `0`）：`page-3:block-14`, `page-3:block-16`, `page-3:block-20`, `page-5:block-19`, `page-7:block-12`（保存済みDB上の `"∑"` 描画）, `page-7:block-16`, `page-7:block-23`（計7ブロック）
+    - `fallback_original`（安全な原文保持＋警告）：`page-3:block-27`（`PROTECTED_REGION_OVERLAP_FALLBACK`）、`page-4:block-17`, `page-4:block-18`, `page-6:block-5`（`TYPESETTING_OVERFLOW_FALLBACK`）、`page-5:block-13`, `page-5:block-14`, `page-7:block-26`, `page-7:block-27`（`TRANSLATED_BLOCK_OVERLAP_FALLBACK`、うち `block-27` は保存時既存の `NUMERIC_VALUE_MISMATCH` を併記）（計8ブロック）
+  - **実モデル（`plamo-3-translate-2b-Q4_K_M.gguf` + `llama-server.exe`）による新規翻訳の確認結果（選定23ブロック／推論21ブロック限定）:** Pages 3–7 の全抽出 `115` ブロックの中から、主要対象15ブロック＋視覚確認用の周辺文脈8ブロックの **計 `23` ブロック** を検証対象として選定した（全13ページ通しの新規翻訳E2Eではない）。内訳は、**保護によりLLMを未呼出 `2` ブロック**（`page-3:block-27`, `page-7:block-12`、抽出時に `protected_skip`、呼出回数 `0`）、**実際にモデル推論を実施 `21` ブロック**（主要対象内 `13` 件＋周辺文脈 `8` 件）、**再試行を含めた実際の呼出回数合計 `21` 回**（推論実施 `21` ブロックすべてが初回 `calls=1` でプレースホルダ検証を通過し再試行 `0` 回）であった。主要15ブロックの最終組版状態は以下の通りとなった（推論21ブロック全体では `translated` 14件 / `fallback_original` 7件）：
+    - `translated`（警告なし、`Cambria` + `NotoSerifJP-ExtraLight`、NUL [`U+0000`] および `U+FE00` / `U+FE01` 残存 `0`、`mono`/`dual` とも正常抽出）：`page-3:block-14`, `page-3:block-16`, `page-3:block-20`, `page-5:block-19`, `page-7:block-16`, `page-7:block-23`（計6ブロック）
+    - `protected_skip`（抽出時に独立数式内記号として自動保護、LLM未呼出）：`page-3:block-27`, `page-7:block-12`（計2ブロック）
+    - `fallback_original`（正規の安全フォールバック＋警告）：`page-4:block-16`（旧 `block-17` 相当）, `page-4:block-17`（旧 `block-18` 相当）, `page-6:block-5`（`TYPESETTING_OVERFLOW_FALLBACK`）、および分割重複の `page-5:block-13`, `page-5:block-14`, `page-7:block-26`, `page-7:block-27`（`TRANSLATED_BLOCK_OVERLAP_FALLBACK`）（計7ブロック）
+- **既定データ領域（本番環境側）の取り扱いに関する補足と訂正:**
+  - 調査初期の読み取り専用URI接続（`?mode=ro`, `uri=True`）および分離スナップショット取得後の照合において、永続ファイル全 `2,119` 件（DB本体ファイルを含む）のサイズ・更新時刻・SHA-256 は一致していた一方、開始時点で `0` bytes だった空の `-wal` ファイルと `32,768` bytes の `-shm` 一時ファイルが作業後に消失していた。これが読み取り専用接続クローズ時の SQLite の解放挙動によるものか別プロセスによるものかは未確定であるため、**ディレクトリ全体の完全不変は主張しない**。その後は既定データ領域へ再接続せず、すべて分離ディレクトリ上で検証を実施した。
+- **今回未再実施・範囲外の項目（過去の検証結果を流用しない）:**
+  - 本13ページ論文の全ページ（13ページ全体）を通した実モデル新規翻訳E2E、別ブロックや他論文での網羅評価
+  - `初回セットアップ.bat` によるクリーンな別Windows PC環境での再セットアップ、フロントエンド `npm test` / `npm run build` の再実行、および他CPU/GPU構成・GPU失敗時CPU自動フォールバックの再試験
+
+### PR #3 レビュー指摘5項目の修正・追加検証（ローカル再検証 — 2026-11-14 追記）
+
+> 注記：上記 `2026-11-14` 初版記録（`98 passed` / `28 passed` / 初期の実モデル推論検証記録）および下記の過去履歴は当時の記録のまま保持しています。本節は PR #3 の実差分レビュー指摘5項目に対する追加コミット（`05f08c45b50fd7eab95bd438111d4be827e76228` および `0ac3a5f1e7db24a0cce21275b5f35b9d9a2e455e`）時点のローカル修正・検証結果のみを記録します。
+
+- **追加修正した5項目と主な内容:**
+  1. **曖昧な添字の平文化防止（`AMBIGUOUS_INLINE_MATH_FALLBACK`）**: `extract_inline_math_spans()` において同一 `context_text` 内に上付き・下付き・通常表記等の競合構造や分割上の曖昧性がある場合に、対象スパンを除外して平文出力（例: `x^2` と `x_2` がどちらも `x2` になる問題）せず、`AMBIGUOUS_INLINE_MATH_FALLBACK` で元の英語ブロックを安全に原文保持＋警告記録するように修正（`test_item6_case4_repeated_identical_math_string_with_conflicting_roles` 更新および E2E 再現テスト `test_review_item1_conflicting_math_roles_e2e_fallback_and_warning` で検証）。
+  2. **水平フィット判定と最小フォントサイズ候補・原子トークン保護の修正**: `fit_japanese_text_in_bbox()` で高さだけでなく `_measure_rendered_line_width()` による実描画幅・禁則ぶら下げ余白を含めて水平収まりを判定し、最小フォントサイズ（`8.0pt`）候補を含めた探索とスペース・Unicode 演算子を含む数式トークンの途中分割防止を修正。
+  3. **複数文字の上付き・下付き配置とカーソル進行の修正**: `_build_styled_line_plan()` において複数文字の上付き・下付き（`P^{abc}_{i}`, `P^{*}_{index}`, `P^{ab}_{cd}` 等）の開始 x 座標整合とグループ幅に基づくカーソル進行を修正。
+  4. **保護領域に対する処理順非依存化**: フェーズ1・フェーズ2の不動点収束処理を導入し、ページ内ブロックの並び順に依存せず同一の結果へ収束するように修正。
+  5. **根号上線（overbar）白塗りによる保護対象消去の防止**: `orig_overbar_bbox` の白塗り領域から保護領域を差し引く `_subtract_protected_boxes` および重なりチェックを導入し、隣接する保護線画・図表の誤消去を防止。
+- **最新ローカルテスト結果（コミット `0ac3a5f1`・分離ランタイム `PAPERBRIDGE_RUNTIME_DIR` 使用・本番データ非接続）:**
+  - ローカル全 `pytest`: `103 passed, 7 skipped, 1 warning`（スキップ7件は実モデル推論・認証を要する `tests/integration/test_real_plamo_phase2.py` のオプトイン統合テスト）
+  - CI 環境 `YuGothR.ttc` フォールバック模擬（`test_inline_math_preservation.py` + `test_visual_preservation.py`）: `33 passed`
+- **実論文影響確認（対象: DensePose 論文の以前の実モデル出力21ブロック）:**
+  - **実施性質の明記**: 本確認は**「以前の実モデル出力21ブロックを最新コード（`0ac3a5f1`）で再組版した影響確認」であり、最新コードによる新規実モデル推論や全13ページの新規翻訳E2Eではありません。**
+  - **結果**: `translated` 14ブロック / `fallback_original` 7ブロック、曖昧添字フォールバック検出（`ambiguous_blocks`）0件、処理順依存差分（`order_independence_diffs`）0件、置換文字・NUL 文字混入（`has_replacement_or_null`）`False`。5ページ目 block-17 は `8.0pt` で bbox 内に収まり右方向はみ出しが解消され、3ページ目の上付き `2`（2箇所）も保持されました。
+- **今回未実施・残存範囲:**
+  - 最新コード上での新規実モデル推論（`page-7:block-27` のような実推論出力に対する数値検証の再評価を含む）および全13ページの新規翻訳E2E
+  - `初回セットアップ.bat` によるクリーンな別 Windows PC 環境での再セットアップ
+
+### 日本語直後の添字抑止・狭小bbox下限クランプ修正の検証（コミット `c71acf9` — 2026-11-14 追記）
+
+> 注記：本節はコミット `1589f6f` を起点とするローカル追加修正（コミット `c71acf9`、ブランチ `fix/inline-math-preservation`）における限定修正 2 点および再組版検証の結果のみを記録します。本番データ領域へは接続せず、分離ランタイム上で実施しています。
+
+- **今回修正した 2 点（スコープ限定修正）:**
+  1. **日本語助詞等が直後に続く場合のインライン数式添字抑止の修正**: [`_build_styled_line_plan()`](backend/pdf/adapters/native_preserving_adapter.py) の末尾境界ガードにおいて Unicode 全般の `str.isalnum()` を用いていた箇所を [`_is_math_ident_continuation_char()`](backend/pdf/adapters/native_preserving_adapter.py) に置換し、ASCII 英数字・ラテン拡張・ギリシャ文字・文字様記号・上付き下付き・数学用英数字記号のみを数式識別子の継続文字として判定するよう限定しました（ひらがな・カタカナ・漢字等の直前では添字抑止を解除し、先頭側境界ガード・Unicode 非 ASCII 化・`MANUALLY_EDITED`・`AMBIGUOUS_INLINE_MATH_FALLBACK` の既存挙動は維持）。
+  2. **狭小 bbox の幅・高さ下限クランプ撤去**: [`fit_japanese_text_in_bbox()`](backend/pdf/adapters/native_preserving_adapter.py) の `box_w = max(10.0, ...)` / `box_h = max(8.0, ...)` を撤去し、元ブロックの実際の幅・高さで収まり判定を行うよう修正しました（`raw_w <= 0.0` または `raw_h <= 0.0` の場合は `False` を返却、`min_font_size_pt = 8.0` は不変）。
+- **最新ローカル自動テスト結果（コミット `c71acf9`・分離 `PAPERBRIDGE_RUNTIME_DIR` 使用）:**
+  - ローカル全 `pytest`: **`105 passed, 7 skipped, 1 warning`**（回帰テスト `test_fix_a_japanese_following_subscript_and_superscript_not_suppressed` および `test_fix_b_narrow_bbox_subcaptions_fallback_without_overhang` を追加、修正前 `1589f6f` 上での FAIL 確認後に PASS を確認。スキップ 7 件は `--run-real-llm` 指定時のみ実行される `tests/integration/test_real_plamo_phase2.py`）。
+  - CI 環境 `YuGothR.ttc` フォールバック模擬（`NotoSerifJP-VF.ttf` 不在模擬下での `test_inline_math_preservation.py` + `test_visual_preservation.py`）: **`35 passed`**。
+- **保存済み 13 ページ訳文を使った再組版確認（新規推論ではないことを明記）:**
+  - **実施性質の明記**: 本確認は 13 ページ全編の保存済み実モデル訳文（Stage 1 出力スナップショットの分離複製）を最新コード（`c71acf9`）の組版器で再組版（`retypeset_job` / `POST /api/jobs/{job_id}/retypeset`）した確認であり、**新規の LLM 推論は実施していません（`llm_calls_made = 0`、`last_retypeset_llm_calls_made = 0`）**。
+  - **対象 5 箇所の下付き文字の再現（`mono` / `dual` 両PDF確認）**: `page-5:block-19` の `𝐿𝑡𝑟は`・`分類損失𝐿𝑐𝑙𝑠および`（`6.341pt`、ベースライン比 `+1.46pt`）および `page-7:block-16` の `𝑃𝑗は`・`𝑖𝑝および`・`ˆ𝑖𝑝は`（`6.825pt`、ベースライン比 `+1.57pt`、ハット `ˆ` は `-1.61pt` 上移動）について、修正前 `mono` では平文大のままだった 5 箇所すべてが修正後 `mono` / `dual` 双方で縮小下付き（+ハット）として描画されることを座標・レンダリング画像で確認しました。
+  - **p.10 サブキャプションと全 239 ブロックへの影響**: 全 239 ブロックのうちステータス変化が生じたのは **p.10 の 2 ブロック（`page-10:block-2` `(a)` および `page-10:block-6` `(c)`）のみ**であり、いずれも `translated` から原文保持（`fallback_original`、`TYPESETTING_OVERFLOW_FALLBACK`）へ遷移しました（`translated: 117 -> 115`、`fallback_original: 25 -> 27`、`protected_skip: 97 -> 97`）。p.10 `(a)`–`(d)` 全 4 枠で元英語 `LinLibertineTB 6.974pt` が枠内に収まり、13 ページ全 `115` 翻訳ブロックのブロック内横超過 `0` 件・保護領域視覚保全全ページ通過を確認しました。
+- **別問題として確認された再組版時の既存警告消失事象（A・B の改善とは区別）:**
+  - `POST /api/jobs/{job_id}/retypeset` 経路において、`retypeset_job()` が処理冒頭で全ブロックの `warnings` を初期化し、`TRANSLATED` / `MANUALLY_EDITED` のみを再検証・再組版して `replace_validation_issues_for_job()` でジョブの issue テーブルを全置換するため、修正前の翻訳時に既に `fallback_original` へ遷移していた 25 ブロック（`NUMERIC_VALUE_MISMATCH` や `UNTRANSLATED_SOURCE_RETURNED` などの翻訳検証警告、および既存の `TRANSLATED_BLOCK_OVERLAP_FALLBACK` / `TYPESETTING_OVERFLOW_FALLBACK` を含む）が再評価対象から外れて `warnings` から消失し、再組版で新たに組版評価された 2 件の `TYPESETTING_OVERFLOW_FALLBACK` のみが残る現象（`validation_issues_count: 26 -> 2`、`warning_count: 26 -> 2`、ジョブ状態は `has_fallbacks=True` により `completed_with_warnings` 維持）を確認しました。本事象は未修正の未解決事項として別途切り分け管理します。
+- **公開用の既知制限（本修正スコープ外）:**
+  - **分割キャプションの日英混在**: 1 つのキャプションが複数ブロックへ分割抽出された場合（例：`page-3:block-9` と `block-10` の `(a) Layout of WiFi devices` / `and human bodies`）、片方のブロックのみが `TYPESETTING_OVERFLOW_FALLBACK` 等で原文保持になると訳文と原文の日英混在が残ります。
+  - **`translate_tables=False` 時の表段落誤検出**: レイアウト解析で表領域が `table` ではなく `paragraph` として抽出された場合（今回の 13 ページ論文 239 ブロックでは `kind='table'` が `0` 件で、`page-8:block-1`, `block-5` 等が `paragraph` 扱い）、`translate_tables=False` 設定であっても段落翻訳の対象となり表セル・列配置の整列が失われる場合があります。
+
+### 再組版（retypeset）時の既存警告・ValidationIssue 保持修正の検証（2026-11-14 追記）
+
+> 注記：上記（コミット `c71acf9` 時点）の「再組版時の既存警告消失事象」を含む過去履歴は当時の記録のまま保持しています。本節はブランチ `fix/inline-math-preservation` 上で実施した再組版（`retypeset`）時の既存警告・`ValidationIssue` 保持／再評価／集計整合性修正に対する検証結果のみを記録します。本番データ領域へは接続せず、分離ランタイム上で実施しています。
+
+- **修正範囲と整合性ルール（スコープ限定修正）:**
+  - `backend/translation/validation/validator.py`（`TRANSLATION_VALIDATION_ISSUE_CODES`）および `backend/pdf/adapters/native_preserving_adapter.py`（`TYPESETTING_ISSUE_CODES`）に検査カテゴリ別の公式コード集合を定義し、`backend/jobs/manager.py` に `_issue_check_scope()`（`message` 文字列ではなく `code` のみで `translation_validation` / `typesetting` / `protection_change` / `visual_preservation` / `other` へ分類）、`_issue_matches_block()`（`block_id`・`page_index`・`bbox_iou >= 0.45` で再解析時のずれ・孤立 Issue 混入を防止）、および `_reconcile_retypeset_issues_and_warnings()` を追加しました。
+  - 変更や再評価対象とならない `FALLBACK_ORIGINAL` ブロックの既存警告・`ValidationIssue`・原文保持理由は保持し、再評価対象ブロックでは**再評価した検査カテゴリの Issue のみ**を最新結果で置き換えるようにしました（他ブロックの保護変更時にも既存 `FALLBACK_ORIGINAL` ブロックが `UNTRANSLATED_AFTER_PROTECTION_CHANGE` で上書きされないようガード）。
+  - 手動修正や `PROTECTED_SKIP` 化等で解消・再検証通過した Issue は除去しつつ、未解消 Issue や非再評価対象チェック（`block_id=None` のページ／文書単位通知やカスタム `"other"` 通知、視覚検証未実行ページの `VISUAL_PRESERVATION_DIFF_DETECTED`）は保持し、`VISUAL_PRESERVATION_DIFF_DETECTED` は従来通り `block.warnings` へは混入させないよう制御しています。統合後のリストは `_deduplicate_validation_issues()` および `(page_index, id)` 順で正規化し、`blocks[].warnings`、`GET /api/jobs/{job_id}/issues`、`job.warning_count`、`job.state`、`RetypesetJobResponse.issues`、`validation_report_json` 間で完全一致させました。
+- **自動テスト結果（分離 `PAPERBRIDGE_RUNTIME_DIR` 使用・本番データ非接続）:**
+  - **修正前 TDD 再現確認**（ベース `6b303f3` 上での新規 HTTP 統合テスト 3 件実行）: **`3 failed`**（既存 7 件消失で `assert 1 == 8`、未解消 Issue 消失で `assert 1 == 2`、無関係 `FALLBACK_ORIGINAL` 上書きで `assert ['UNTRANSLATED_AFTER_PROTECTION_CHANGE'] == ['UNTRANSLATED_SOURCE_RETURNED']`）。
+  - **修正後フォーカス回帰確認**（`tests/unit/test_job_accounting.py` 4件＋`tests/integration/test_phase3_api_and_retypeset.py` 9件）: **`13 passed, 1 warning`**。
+  - **修正後ローカル全 `pytest`**: **`111 passed, 7 skipped, 1 warning`**（skip 7件は `--run-real-llm` 指定時のみ実行される `tests/integration/test_real_plamo_phase2.py`）。
+  - **CI 環境 `YuGothR.ttc` フォールバック模擬**（`NotoSerifJP-VF.ttf` 等不在模擬で `YuGothR.ttc` + `cambria.ttc` を用いる環境での `tests/unit/test_inline_math_preservation.py` 32件＋`tests/visual/test_visual_preservation.py` 3件）: **`35 passed`**。
+  - 本修正ではフロントエンドコードを変更していないため、フロントエンド単体テスト・ビルド（`npm test` / `npm run build`）は今回未再実行です。
+- **Stage 1 保存済み 13 ページ訳文（分離複製）での HTTP `retypeset` 連続検証（新規推論なし）:**
+  - **実施性質の明記**: 保存済み 13 ページ訳文（Stage 1 スナップショットの新規分離複製）に対して HTTP `POST /api/jobs/job-837518917322/retypeset` を 2 回連続実行した検証であり、新規の LLM 推論は実施していません（`rev 1`・`rev 2` とも `llm_calls_made = 0`、本番 `%LOCALAPPDATA%\PaperBridgeLocal` および元 Stage 1 スナップショットはいずれも不変）。
+  - **修正前（`rev 0`）**: `state = completed_with_warnings`、`job.warning_count = 26`、`GET /issues` = `26` 件、`validation_report_json` = `26` 件（`TYPESETTING_OVERFLOW_FALLBACK`: 20、`TRANSLATED_BLOCK_OVERLAP_FALLBACK`: 4、`UNTRANSLATED_SOURCE_RETURNED`: 1 [`error`]、`NUMERIC_VALUE_MISMATCH`: 1）、`warnings` 保持ブロック数 `25`（`translated`: 117、`fallback_original`: 25、`protected_skip`: 97）。
+  - **1 回目再組版（`rev 1`）**: 既存 26 件すべての Issue が元 ID のまま完全保持された上で、p.10 狭小サブキャプション 2 ブロック（`page-10:block-2`, `page-10:block-6`）のみが `translated -> fallback_original` へ遷移し新規 `TYPESETTING_OVERFLOW_FALLBACK` 2 件が追加され、`state = completed_with_warnings`、`job.warning_count = 28`、`GET /issues` = `28` 件、`validation_report_json` = `28` 件、`warnings` 保持ブロック数 `27`（`translated`: 115、`fallback_original`: 27、`protected_skip`: 97）で全経路一致を確認。
+  - **2 回目連続再組版（`rev 2`・無編集）**: `rev 1` と同一の **28 件の Issue ID**・件数（`28` 件）・状態（`completed_with_warnings`）・ブロック統計（`translated`: 115、`fallback_original`: 27、`protected_skip`: 97）・`llm_calls_made = 0` を維持し、再組版反復による警告消失も重複増殖も起きないことを確認しました。
+  - なお、前項に記載した公開用の既知制限 2 点（分割キャプションの日英混在、`translate_tables=False` 時の表段落誤検出）は本修正の対象外として引き続き残存します。
+
 ## Experimental Windows one-click setup & source-ZIP check — 2026-11-12
 
 > Notice: Past historical verification records below (2026-11-08 and earlier) are preserved as originally recorded. This section covers only the experimental source-ZIP one-click setup additions on branch `feat/one-click-setup`. The archive/CLI tests described below were run on pre-push local verification commits prior to rebuilding those unpushed commits with GitHub noreply commit metadata (`285997610+hann451@users.noreply.github.com`), and the runtime tests were not re-run solely for the rebuilt commit SHAs; subsequent `docs/VERIFICATION.md` SHA-alignment edits sit cleanly on top without altering functional code.
