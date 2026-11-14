@@ -97,6 +97,98 @@ _INLINE_MATH_EXPR_RE = re.compile(
 )
 _EQUATION_NUM_ONLY_RE = re.compile(r"^\s*\(\d+(?:\.\d+)*[a-z]?\)\s*$")
 _UNRESOLVED_PH_CHECK_RE = re.compile(r"\{\s*v\s*\d+\s*\}|［v\d+］|｛v\d+｝", re.IGNORECASE)
+# Known TeX extension font (e.g. txexs) operator + Variation Selector-1/2 pairs where
+# U+FE00/U+FE01 selects operator display/text size in TeX but has no standalone PDF glyph.
+_KNOWN_TEX_OPERATOR_VS_RE = re.compile(r"([√∑∏∐∫∬∭∮⋀⋁⋂⋃])[\ufe00\ufe01]")
+_SMP_TOUNICODE_HEX_RE = re.compile(rb"<([0-9a-fA-F]{5,6})>")
+
+
+def normalize_for_pdf_rendering(text: str) -> str:
+    """Normalize text strictly for PDF glyph measurement and rendering by stripping
+    only known TeX operator variation selectors (e.g. √+U+FE01, ∑+U+FE01), while
+    keeping any unknown/unsupported variation selector intact so pre-redaction glyph
+    checks can safely fall back rather than silently deleting unknown sequences.
+    """
+    if not text:
+        return ""
+    return _KNOWN_TEX_OPERATOR_VS_RE.sub(r"\1", text)
+
+
+def _select_char_font(
+    ch: str,
+    ja_font_tag: str,
+    ja_font: pymupdf.Font,
+    math_font_tag: str | None = None,
+    math_font: pymupdf.Font | None = None,
+) -> tuple[str, pymupdf.Font] | None:
+    """Select the exact `(font_tag, pymupdf.Font)` for a single character `ch`, used
+    identically across glyph verification, width measurement, and PDF rendering.
+    Returns `None` if neither `ja_font` nor `math_font` has a glyph for `ch`.
+    """
+    cp = ord(ch)
+    if cp <= 0x20 or ch.isspace():
+        return (ja_font_tag, ja_font)
+    # Prefer math_font for SMP Mathematical Alphanumeric Symbols (U+1D400..U+1D7FF)
+    # and characters missing in ja_font
+    if 0x1D400 <= cp <= 0x1D7FF:
+        if math_font is not None and math_font_tag and math_font.has_glyph(cp) != 0:
+            return (math_font_tag, math_font)
+        if ja_font.has_glyph(cp) != 0:
+            return (ja_font_tag, ja_font)
+        return None
+    if ja_font.has_glyph(cp) != 0:
+        return (ja_font_tag, ja_font)
+    if math_font is not None and math_font_tag and math_font.has_glyph(cp) != 0:
+        return (math_font_tag, math_font)
+    return None
+
+
+def _segment_line_into_font_runs(
+    line_str: str,
+    ja_font_tag: str,
+    ja_font: pymupdf.Font,
+    math_font_tag: str | None = None,
+    math_font: pymupdf.Font | None = None,
+) -> list[tuple[str, pymupdf.Font, str]]:
+    """Split a single normalized line string into contiguous `(font_tag, font_obj, run_text)` runs."""
+    runs: list[tuple[str, pymupdf.Font, str]] = []
+    for ch in line_str:
+        sel = _select_char_font(ch, ja_font_tag, ja_font, math_font_tag, math_font)
+        tag, fobj = sel if sel is not None else (ja_font_tag, ja_font)
+        if runs and runs[-1][0] == tag:
+            runs[-1] = (tag, fobj, runs[-1][2] + ch)
+        else:
+            runs.append((tag, fobj, ch))
+    return runs
+
+
+def _fix_embedded_tounicode_smp(doc: pymupdf.Document) -> None:
+    """Fix MuPDF's 5-digit hex `<1xxxx>` entries for SMP codepoints (`U+10000`..`U+10FFFF`)
+    in embedded `/ToUnicode` CMap streams into valid PDF 8-digit UTF-16BE surrogate pairs
+    (`<D8xxDCxx>`) so extracted/copied text preserves exact Mathematical Unicode codepoints.
+    """
+    def _repl(m: re.Match) -> bytes:
+        cp = int(m.group(1), 16)
+        if 0x10000 <= cp <= 0x10FFFF:
+            u16 = chr(cp).encode("utf-16-be").hex().upper().encode("ascii")
+            return b"<" + u16 + b">"
+        return m.group(0)
+
+    for xref in range(1, doc.xref_length()):
+        try:
+            obj = doc.xref_object(xref)
+        except Exception:
+            continue
+        if "/ToUnicode " in obj:
+            try:
+                tu_xref = int(obj.split("/ToUnicode ")[1].split()[0])
+                raw = doc.xref_stream(tu_xref)
+                if raw:
+                    fixed = _SMP_TOUNICODE_HEX_RE.sub(_repl, raw)
+                    if fixed != raw:
+                        doc.update_stream(tu_xref, fixed)
+            except Exception:
+                continue
 
 
 def _find_unresolved_placeholders(restored_text: str, source_text: str) -> list[str]:
@@ -117,19 +209,24 @@ def _find_unresolved_placeholders(restored_text: str, source_text: str) -> list[
     return unresolved
 
 
-def _find_unrenderable_chars(text: str, fonts: list[pymupdf.Font]) -> list[str]:
-    """Return a list of unique characters (formatted as 'ch(U+XXXX)') in `text` that
-    have no glyph (`has_glyph == 0`) in any of the provided `fonts`.
+def _find_unrenderable_chars(
+    text: str,
+    ja_font_tag: str,
+    ja_font: pymupdf.Font,
+    math_font_tag: str | None = None,
+    math_font: pymupdf.Font | None = None,
+) -> list[str]:
+    """Return a list of unique characters (formatted as 'ch(U+XXXX)') in `normalize_for_pdf_rendering(text)`
+    that have no glyph (`has_glyph == 0`) in the active fonts.
     """
-    if not fonts:
-        return []
+    norm_text = normalize_for_pdf_rendering(text)
     missing: list[str] = []
     seen: set[int] = set()
-    for ch in text:
+    for ch in norm_text:
         cp = ord(ch)
         if cp <= 0x20 or ch.isspace() or cp in seen:
             continue
-        if not any(f.has_glyph(cp) != 0 for f in fonts):
+        if _select_char_font(ch, ja_font_tag, ja_font, math_font_tag, math_font) is None:
             seen.add(cp)
             missing.append(f"{ch}(U+{cp:04X})")
     return missing
@@ -1454,11 +1551,20 @@ class NativePreservingAdapter(PdfEngineAdapter):
             return blocks, issues
 
         font_path = self.config.font_serif_path or self.config.font_sans_path
-        active_fonts: list[pymupdf.Font] = []
         if font_path and font_path.exists():
-            active_fonts.append(pymupdf.Font(fontfile=str(font_path)))
+            ja_font_tag = "F_JA"
+            ja_font_obj = pymupdf.Font(fontfile=str(font_path))
         else:
-            active_fonts.append(pymupdf.Font("japan-s"))
+            ja_font_tag = "japan-s"
+            ja_font_obj = pymupdf.Font("japan-s")
+
+        math_font_path = getattr(self.config, "font_math_path", None)
+        if math_font_path and Path(math_font_path).exists():
+            math_font_tag: str | None = "F_MATH"
+            math_font_obj: pymupdf.Font | None = pymupdf.Font(fontfile=str(math_font_path))
+        else:
+            math_font_tag = None
+            math_font_obj = None
 
         blocks_by_page: dict[int, list[Block]] = {}
         for b in blocks:
@@ -1539,7 +1645,13 @@ class NativePreservingAdapter(PdfEngineAdapter):
                         continue
 
                     # Pre-redaction check 2: Verify all characters have glyphs in active rendering fonts
-                    missing_glyphs = _find_unrenderable_chars(restored_text, active_fonts)
+                    missing_glyphs = _find_unrenderable_chars(
+                        restored_text,
+                        ja_font_tag,
+                        ja_font_obj,
+                        math_font_tag,
+                        math_font_obj,
+                    )
                     if missing_glyphs:
                         blk.status = BlockStatus.FALLBACK_ORIGINAL
                         blk.translation_provenance = "fallback_original"
@@ -1595,12 +1707,17 @@ class NativePreservingAdapter(PdfEngineAdapter):
                         )
                         continue
 
+                    # Normalize known TeX operator variation selectors before width measurement & rendering
+                    render_ready_text = normalize_for_pdf_rendering(restored_text)
+
                     # Fit Japanese lines within bbox respecting min_font_size_pt (Section 12)
                     fitted_size, wrapped_lines, fits = fit_japanese_text_in_bbox(
-                        text=restored_text,
+                        text=render_ready_text,
                         bbox=blk.bbox,
                         initial_font_size=min(blk.font_size_pt, 11.0),
                         min_font_size=job_config.min_font_size_pt,
+                        ja_font=ja_font_obj,
+                        math_font=math_font_obj,
                     )
                     if not fits:
                         # Section 12: Never shrink below min_font_size_pt, never delete text,
@@ -1660,26 +1777,38 @@ class NativePreservingAdapter(PdfEngineAdapter):
                         graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
                     )
 
-                    font_name_tag = "F_JA"
                     if font_path and font_path.exists():
-                        mpage.insert_font(fontname=font_name_tag, fontfile=str(font_path))
+                        mpage.insert_font(fontname=ja_font_tag, fontfile=str(font_path))
                     else:
-                        font_name_tag = "japan-s"
-                        mpage.insert_font(fontname=font_name_tag, fontbuffer=None)
+                        mpage.insert_font(fontname=ja_font_tag, fontbuffer=None)
+                    if math_font_tag and math_font_path and Path(math_font_path).exists():
+                        mpage.insert_font(fontname=math_font_tag, fontfile=str(math_font_path))
 
                     for blk, fitted_size, wrapped_lines in approved_typeset_items:
                         line_height = fitted_size * 1.32
                         cursor_y = blk.bbox[1] + fitted_size * 0.95
                         for line_str in wrapped_lines:
-                            mpage.insert_text(
-                                pymupdf.Point(blk.bbox[0], cursor_y),
+                            cursor_x = float(blk.bbox[0])
+                            runs = _segment_line_into_font_runs(
                                 line_str,
-                                fontsize=fitted_size,
-                                fontname=font_name_tag,
-                                color=(0, 0, 0),
-                                overlay=True,
+                                ja_font_tag,
+                                ja_font_obj,
+                                math_font_tag,
+                                math_font_obj,
                             )
+                            for r_tag, r_font, r_text in runs:
+                                mpage.insert_text(
+                                    pymupdf.Point(cursor_x, cursor_y),
+                                    r_text,
+                                    fontsize=fitted_size,
+                                    fontname=r_tag,
+                                    color=(0, 0, 0),
+                                    overlay=True,
+                                )
+                                cursor_x += r_font.text_length(r_text, fontsize=fitted_size)
                             cursor_y += line_height
+
+            _fix_embedded_tounicode_smp(out_doc)
 
             if mono_output_path:
                 mono_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1909,21 +2038,44 @@ def unmask_inline_protected_elements(
     return restored
 
 
-def wrap_japanese_kinsoku(text: str, max_width_pt: float, font_size_pt: float) -> list[str]:
+def wrap_japanese_kinsoku(
+    text: str,
+    max_width_pt: float,
+    font_size_pt: float,
+    ja_font: pymupdf.Font | None = None,
+    math_font: pymupdf.Font | None = None,
+) -> list[str]:
     """Wrap mixed Japanese/English/math text into lines respecting `max_width_pt`
     and Kinsoku Shori (prohibited line-start and line-end characters).
+    When `ja_font` (and optionally `math_font`) are provided, uses exact glyph metrics
+    matching the rendering font selection.
     """
     if not text:
         return []
+    norm_text = normalize_for_pdf_rendering(text)
     lines: list[str] = []
 
     def _char_width(ch: str) -> float:
-        if ord(ch) < 128:
+        if ja_font is not None:
+            sel = _select_char_font(
+                ch,
+                "F_JA",
+                ja_font,
+                "F_MATH" if math_font is not None else None,
+                math_font,
+            )
+            fobj = sel[1] if sel is not None else ja_font
+            return float(fobj.text_length(ch, fontsize=font_size_pt))
+        if ord(ch) < 128 or (0x1D400 <= ord(ch) <= 0x1D7FF):
             return font_size_pt * 0.56
         return font_size_pt * 1.02
 
-    # Tokenize so `{vN}` or ASCII words stay together when possible
-    tokens = re.findall(r"[A-Za-z0-9_^\(\)\[\]{}=<>≤≥≈≠±+\-*/.,:;]+|\s+|.", text)
+    # Tokenize so `{vN}`, ASCII words, or inline math sequences stay together when possible
+    tokens = re.findall(
+        r"[A-Za-z0-9\U0001d400-\U0001d7ff\u0370-\u03ff\u2070-\u209f\u02c6_^\(\)\[\]{}=<>≤≥≈≠±+\-−∗√∑∏∫*/.,:;′″']+"
+        r"|\s+|.",
+        norm_text,
+    )
     cur_line = ""
     cur_w = 0.0
 
@@ -1973,6 +2125,8 @@ def fit_japanese_text_in_bbox(
     bbox: list[float],
     initial_font_size: float = 10.0,
     min_font_size: float = 8.0,
+    ja_font: pymupdf.Font | None = None,
+    math_font: pymupdf.Font | None = None,
 ) -> tuple[float, list[str], bool]:
     """Find the largest font size in `[min_font_size, initial_font_size]` (step 0.5pt)
     such that the wrapped text fits inside `bbox` width and height.
@@ -1984,7 +2138,7 @@ def fit_japanese_text_in_bbox(
 
     sz = start_sz
     while sz >= min_font_size - 1e-6:
-        lines = wrap_japanese_kinsoku(text, box_w, sz)
+        lines = wrap_japanese_kinsoku(text, box_w, sz, ja_font=ja_font, math_font=math_font)
         line_h = sz * 1.32
         required_h = len(lines) * line_h
         if required_h <= box_h + sz * 0.45:
@@ -1992,5 +2146,7 @@ def fit_japanese_text_in_bbox(
         sz -= 0.5
 
     # Even at min_font_size it overflows
-    min_lines = wrap_japanese_kinsoku(text, box_w, min_font_size)
+    min_lines = wrap_japanese_kinsoku(
+        text, box_w, min_font_size, ja_font=ja_font, math_font=math_font
+    )
     return round(min_font_size, 2), min_lines, False

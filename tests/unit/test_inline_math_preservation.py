@@ -389,9 +389,49 @@ def test_unit_a_densepose_block16_inline_math_no_missing_glyphs(tmp_path: Path) 
 
     out_pdf = pymupdf.open(str(mono_out))
     extracted = out_pdf[0].get_text("text", clip=pymupdf.Rect(blk.bbox)).replace("\xa0", " ")
+    page_fonts = [f[3] for f in out_pdf[0].get_fonts()]
     out_pdf.close()
 
     assert "\x00" not in extracted
     assert "\ufe01" not in extracted
+    assert any("Cambria" in fn or "Segoe" in fn for fn in page_fonts)
     for expected_token in ("𝑧", "𝑎", "𝑏", "𝑖", "𝐴", "Φ", "√", "𝑎𝑟𝑐𝑡𝑎𝑛", "−", "𝜋"):
         assert expected_token in extracted, f"Missing token {expected_token!r} in extracted text: {extracted!r}"
+
+
+def test_unit_b_variation_selector_scoped_handling(tmp_path: Path) -> None:
+    """Section 3: Known TeX operator + variation selector pairs (√+U+FE01, ∑+U+FE01) are
+    normalized for rendering, whereas unknown variation selector combinations (e.g. A+U+FE05)
+    are NOT blindly stripped and instead trigger safe FALLBACK_ORIGINAL + warning.
+    """
+    pdf_path = tmp_path / "vs_test.pdf"
+    doc_model = _make_densepose_p3_block16_pdf(pdf_path)
+
+    blk_unknown_vs = Block(
+        id="doc-repro16:page-1:block-2",
+        page_index=0,
+        bbox=[318.0, 357.0, 560.0, 433.0],
+        kind=BlockKind.PARAGRAPH,
+        reading_order=1,
+        source_text="In raw CSI samples, A\ufe05 is an unsupported variation sequence.",
+        translation_text="生のCSIサンプルにおいて、A\ufe05 は未対応の異体字セレクタ組み合わせである。",
+        status=BlockStatus.TRANSLATED,
+        font_size_pt=8.97,
+    )
+
+    adapter = NativePreservingAdapter()
+    mono_out = tmp_path / "vs_unknown_out.pdf"
+    _, issues = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=[blk_unknown_vs],
+        page_indices=[0],
+        job_config=TranslationJobConfig(),
+        mono_output_path=mono_out,
+        dual_output_path=None,
+        job_id="job-test-vs",
+    )
+
+    assert blk_unknown_vs.status == BlockStatus.FALLBACK_ORIGINAL
+    assert "UNRENDERABLE_GLYPH_FALLBACK" in blk_unknown_vs.warnings
+    assert any(iss.code == "UNRENDERABLE_GLYPH_FALLBACK" for iss in issues)
+

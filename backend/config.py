@@ -49,8 +49,23 @@ def _find_default_japanese_font(prefer_serif: bool = True) -> Path | None:
     return None
 
 
+def _find_default_math_font() -> Path | None:
+    env_font = os.environ.get("PAPERBRIDGE_MATH_FONT_PATH", "").strip()
+    if env_font:
+        p = Path(env_font).expanduser().resolve()
+        if p.exists():
+            return p
+    win_fonts = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Fonts"
+    for name in ("cambria.ttc", "seguisym.ttf"):
+        p = win_fonts / name
+        if p.exists():
+            return p
+    return None
+
+
 @dataclass
 class AppConfig:
+
     host: str = field(
         default_factory=lambda: os.environ.get("PAPERBRIDGE_HOST", "127.0.0.1")
     )
@@ -107,6 +122,7 @@ class AppConfig:
     font_sans_path: Path | None = field(
         default_factory=lambda: _find_default_japanese_font(prefer_serif=False)
     )
+    font_math_path: Path | None = field(default_factory=_find_default_math_font)
 
     # Security & download gates (Section 16 & 17)
     allow_auto_asset_download: bool = field(
