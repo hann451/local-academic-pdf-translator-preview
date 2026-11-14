@@ -25,6 +25,7 @@ from backend.pdf.adapters.native_preserving_adapter import (
     mask_inline_protected_elements,
     unmask_inline_protected_elements,
 )
+from backend.translation.validation.validator import validate_translation_output
 
 pytestmark = pytest.mark.unit
 
@@ -434,4 +435,217 @@ def test_unit_b_variation_selector_scoped_handling(tmp_path: Path) -> None:
     assert blk_unknown_vs.status == BlockStatus.FALLBACK_ORIGINAL
     assert "UNRENDERABLE_GLYPH_FALLBACK" in blk_unknown_vs.warnings
     assert any(iss.code == "UNRENDERABLE_GLYPH_FALLBACK" for iss in issues)
+
+
+# ==============================================================================
+# Unit C: Math Masking, Prose-vs-Math Disambiguation, Collision, & Span Space Recovery
+# ==============================================================================
+def test_unit_c_densepose_all_14_blocks_math_masking() -> None:
+    """Section 6: Verify that all inline math patterns across DensePose From WiFi
+    (complex numbers z = a + bi, radicals A = sqrt(a^2 + b^2), arctan(b/a), -pi to pi,
+    circumflex hats, subscripts, superscripts, scientific notation 1e-5, sets, and MSE)
+    are masked intact without splitting inside operators/variation selectors.
+    """
+    src_b16 = (
+        "In raw CSI samples (5 consecutive samples visualized in Fig- ure 3(a-b)), "
+        "the amplitude (𝐴) and phase (Φ) of each complex ele- ment 𝑧= 𝑎+𝑏𝑖 are computed "
+        "using the formulation 𝐴=√︁(𝑎2 + 𝑏2) and Φ = 𝑎𝑟𝑐𝑡𝑎𝑛(𝑏/𝑎). Note that the range "
+        "of the arctan function is from −𝜋 to 𝜋 and the phase values outside this range "
+        "get wrapped, leading to a discontinuity in phase values. Our first sanitization "
+        "step is to unwrap the phase following [10]:"
+    )
+    masked_b16, items_b16 = mask_inline_protected_elements(src_b16)
+    orig_texts = [it.original_text for it in items_b16]
+    assert orig_texts == [
+        "𝐴",
+        "Φ",
+        "𝑧= 𝑎+𝑏𝑖",
+        "𝐴=√︁(𝑎2 + 𝑏2)",
+        "Φ = 𝑎𝑟𝑐𝑡𝑎𝑛(𝑏/𝑎)",
+        "−𝜋",
+        "𝜋",
+    ]
+    assert unmask_inline_protected_elements(masked_b16, items_b16) == src_b16
+
+    # Check block-18 (circumflex hat + subscript without swallowing parenthetical prose)
+    src_b18 = "ˆ𝜙𝑓 is the sanitized phase values at subcarrier 𝑓 (the 𝑓th frequency)."
+    masked_b18, items_b18 = mask_inline_protected_elements(src_b18)
+    assert [it.original_text for it in items_b18] == ["ˆ𝜙𝑓", "𝑓", "𝑓"]
+    assert unmask_inline_protected_elements(masked_b18, items_b18) == src_b18
+
+    # Check block-13 / block-14 / block-19 / block-26 patterns
+    src_misc = (
+        "where 𝑀𝑆𝐸(·) uses {𝑃2, 𝑃3, 𝑃4, 𝑃5} and {𝑃∗ 2, 𝑃∗ 3, 𝑃∗ 5} with losses "
+        "𝐿𝑐𝑙𝑠, 𝐿𝑏𝑜𝑥, 𝐿𝑑𝑝, 𝐿𝑘𝑝, 𝐿𝑡𝑟 and 𝜆𝑑𝑝= 0.6, learning rate 1𝑒−5 to 1𝑒−3."
+    )
+    masked_misc, items_misc = mask_inline_protected_elements(src_misc)
+    misc_origs = [it.original_text for it in items_misc]
+    for expected in (
+        "𝑀𝑆𝐸(·)",
+        "{𝑃2, 𝑃3, 𝑃4, 𝑃5}",
+        "𝐿𝑐𝑙𝑠",
+        "𝐿𝑏𝑜𝑥",
+        "𝐿𝑑𝑝",
+        "𝐿𝑘𝑝",
+        "𝐿𝑡𝑟",
+        "𝜆𝑑𝑝= 0.6",
+        "1𝑒−5",
+        "1𝑒−3",
+    ):
+        assert expected in misc_origs
+    assert unmask_inline_protected_elements(masked_misc, items_misc) == src_misc
+
+
+def test_unit_c_prose_parenthetical_vs_math_function_disambiguation() -> None:
+    """Section 6: Ordinary English prose words followed by parenthetical glosses without spaces
+    such as `subcarriers(frequencies)` or `samples(frequencies)` must NOT be masked as inline math,
+    whereas true mathematical function calls (`arctan(b/a)`, `𝑎𝑟𝑐𝑡𝑎𝑛(𝑏/𝑎)`, `sin(x)`, `f(x)`, `N''(f)`)
+    are masked.
+    """
+    src_b20 = (
+        "where 𝑖 denotes the index of the measurements in the five consecu- tive samples, "
+        "and 𝑗 denotes the index of the subcarriers(frequencies) and samples(frequencies)."
+    )
+    masked_b20, items_b20 = mask_inline_protected_elements(src_b20)
+    origs_b20 = [it.original_text for it in items_b20]
+    assert origs_b20 == ["𝑖", "𝑗"]
+    assert "subcarriers(frequencies)" in masked_b20
+    assert "samples(frequencies)" in masked_b20
+
+    src_funcs = "Compute arctan(b/a), sin(2πf), f(x), P(y|x), and N''(f) in(frequencies)."
+    masked_funcs, items_funcs = mask_inline_protected_elements(src_funcs)
+    origs_funcs = [it.original_text for it in items_funcs]
+    assert "arctan(b/a)" in origs_funcs
+    assert "sin(2πf)" in origs_funcs
+    assert "f(x)" in origs_funcs
+    assert "P(y|x)" in origs_funcs
+    assert "N''(f)" in origs_funcs
+    assert "in(frequencies)" in masked_funcs
+
+
+def test_unit_c_preexisting_literal_placeholder_no_collision() -> None:
+    """Section 6: If the source text already contains a literal `{v1}`, masking must not
+    collide with it, validation must pass when placeholders are preserved, and unmasking
+    must restore both the literal `{v1}` and all formulas without chain-expansion.
+    """
+    src = "Suppose vertex set {v1} satisfies 𝑧= 𝑎+𝑏𝑖 and 𝐴=√︁(𝑎2 + 𝑏2)."
+    masked, items = mask_inline_protected_elements(src)
+    assert len(items) == 3
+    assert [it.placeholder for it in items] == ["{v1}", "{v2}", "{v3}"]
+    assert items[0].original_text == "{v1}"
+    assert items[1].original_text == "𝑧= 𝑎+𝑏𝑖"
+    assert items[2].original_text == "𝐴=√︁(𝑎2 + 𝑏2)"
+
+    # Simulate Japanese translation with reordered placeholders ({v2} and {v3} before {v1})
+    ja_trans = "式 {v2} および {v3} を頂点集合 {v1} が満たすとする。"
+    val = validate_translation_output(
+        source_text=src,
+        masked_source_text=masked,
+        translated_text=ja_trans,
+        protected_items=items,
+    )
+    assert val.is_valid, f"Validation failed unexpectedly: {val.findings}"
+
+    unmasked = unmask_inline_protected_elements(ja_trans, items)
+    assert unmasked == "式 𝑧= 𝑎+𝑏𝑖 および 𝐴=√︁(𝑎2 + 𝑏2) を頂点集合 {v1} が満たすとする。"
+
+
+def test_unit_c_placeholder_reordering_and_validation_checks() -> None:
+    """Section 6: Reordered placeholders in Japanese ({v2} ... {v1}) are valid, while
+    missing, duplicated, altered (fullwidth/spaced), and unknown placeholders are flagged.
+    """
+    src = "The amplitude 𝐴=√︁(𝑎2 + 𝑏2) and phase Φ = 𝑎𝑟𝑐𝑡𝑎𝑛(𝑏/𝑎) are computed."
+    masked, items = mask_inline_protected_elements(src)
+    assert [it.placeholder for it in items] == ["{v1}", "{v2}"]
+
+    # 1. Reordered placeholders in Japanese -> VALID
+    res_reordered = validate_translation_output(
+        source_text=src,
+        masked_source_text=masked,
+        translated_text="位相 {v2} と振幅 {v1} が計算される。",
+        protected_items=items,
+    )
+    assert res_reordered.is_valid
+
+    # 2. Missing placeholder -> PLACEHOLDER_MISSING
+    res_missing = validate_translation_output(
+        source_text=src,
+        masked_source_text=masked,
+        translated_text="振幅 {v1} が計算される。",
+        protected_items=items,
+    )
+    assert not res_missing.is_valid
+    assert "PLACEHOLDER_MISSING" in res_missing.error_codes
+
+    # 3. Duplicated placeholder -> PLACEHOLDER_DUPLICATED
+    res_dup = validate_translation_output(
+        source_text=src,
+        masked_source_text=masked,
+        translated_text="振幅 {v1} と {v1} および位相 {v2} が計算される。",
+        protected_items=items,
+    )
+    assert not res_dup.is_valid
+    assert "PLACEHOLDER_DUPLICATED" in res_dup.error_codes
+
+    # 4. Altered placeholder (fullwidth or spaces) -> PLACEHOLDER_ALTERED
+    res_altered = validate_translation_output(
+        source_text=src,
+        masked_source_text=masked,
+        translated_text="振幅 ｛v1｝ と位相 { v2 } が計算される。",
+        protected_items=items,
+    )
+    assert not res_altered.is_valid
+    assert "PLACEHOLDER_ALTERED" in res_altered.error_codes
+
+    # 5. Unknown / hallucinated placeholder -> PLACEHOLDER_HALLUCINATED
+    res_hallucinated = validate_translation_output(
+        source_text=src,
+        masked_source_text=masked,
+        translated_text="振幅 {v1} と位相 {v2} および {v99} が計算される。",
+        protected_items=items,
+    )
+    assert not res_hallucinated.is_valid
+    assert "PLACEHOLDER_HALLUCINATED" in res_hallucinated.error_codes
+
+
+def test_unit_c_inter_span_space_recovery() -> None:
+    """Section 6: `_extract_lines_and_style` recovers missing inter-span spaces when a horizontal
+    word-space gap exists between a math span and a prose span, without inserting spaces inside
+    subscript/superscript attachments or scientific notation.
+    """
+    adapter = NativePreservingAdapter()
+    raw_lines = [
+        {
+            "spans": [
+                {"text": "ment ", "size": 8.97, "font": "LinLibertineT", "flags": 4, "bbox": [318.0, 368.0, 331.49, 379.0]},
+                {"text": "𝑧= 𝑎+𝑏𝑖", "size": 8.97, "font": "LibertineMathMI", "flags": 6, "bbox": [331.49, 368.0, 370.45, 379.0]},
+                {"text": "are computed using ", "size": 8.88, "font": "LinLibertineT", "flags": 4, "bbox": [372.93, 368.0, 460.0, 379.0]},
+                {"text": "𝐴=√︁(", "size": 8.97, "font": "LibertineMathMI", "flags": 6, "bbox": [460.0, 368.0, 529.02, 379.0]},
+                {"text": "𝑎", "size": 8.97, "font": "LibertineMathMI", "flags": 6, "bbox": [529.02, 368.0, 534.72, 379.0]},
+                {"text": "2", "size": 7.27, "font": "LinLibertineT", "flags": 5, "bbox": [535.03, 365.0, 539.26, 374.0]},
+                {"text": " + ", "size": 8.97, "font": "txsys", "flags": 4, "bbox": [539.26, 368.0, 548.55, 379.0]},
+                {"text": "𝑏", "size": 8.97, "font": "LibertineMathMI", "flags": 6, "bbox": [548.55, 368.0, 553.67, 379.0]},
+                {"text": "2", "size": 7.27, "font": "LinLibertineT", "flags": 5, "bbox": [554.21, 365.0, 558.20, 374.0]},
+                {"text": ")", "size": 8.97, "font": "txsys", "flags": 4, "bbox": [558.20, 368.0, 561.0, 379.0]},
+            ]
+        },
+        {
+            "spans": [
+                {"text": "from ", "size": 8.90, "font": "LinLibertineT", "flags": 4, "bbox": [318.0, 392.0, 336.0, 403.0]},
+                {"text": "−𝜋", "size": 8.97, "font": "LibertineMathMI", "flags": 6, "bbox": [336.0, 392.0, 347.89, 403.0]},
+                {"text": "to ", "size": 8.90, "font": "LinLibertineT", "flags": 4, "bbox": [350.97, 392.0, 360.0, 403.0]},
+                {"text": "𝜋", "size": 8.97, "font": "LibertineMathMI", "flags": 6, "bbox": [360.0, 392.0, 365.70, 403.0]},
+                {"text": "and rate 1", "size": 8.90, "font": "LinLibertineT", "flags": 4, "bbox": [368.78, 392.0, 410.0, 403.0]},
+                {"text": "𝑒", "size": 8.97, "font": "LibertineMathMI", "flags": 6, "bbox": [410.0, 392.0, 414.0, 403.0]},
+                {"text": "−", "size": 8.97, "font": "txsys", "flags": 4, "bbox": [416.78, 392.0, 421.0, 403.0]},
+                {"text": "5.", "size": 8.90, "font": "LinLibertineT", "flags": 4, "bbox": [423.15, 392.0, 430.0, 403.0]},
+            ]
+        },
+    ]
+    text_lines, _, has_math, has_sub = adapter._extract_lines_and_style(raw_lines)
+    assert has_math is True
+    assert has_sub is True
+    assert text_lines[0] == "ment 𝑧= 𝑎+𝑏𝑖 are computed using 𝐴=√︁(𝑎2 + 𝑏2)"
+    assert text_lines[1] == "from −𝜋 to 𝜋 and rate 1𝑒−5."
+
 

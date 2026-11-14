@@ -64,20 +64,96 @@ _EQUATION_REFERENCE_RE = re.compile(
     r"\b(?:Eq(?:uation)?\.?\s*)\(\d+(?:\.\d+)*[a-z]?\)",
     re.IGNORECASE,
 )
+_KNOWN_MATH_FUNCS = (
+    r"(?:arcsin|arccos|arctan|sinh|cosh|tanh|sin|cos|tan|cot|sec|csc"
+    r"|log|ln|lg|exp|lim|sup|inf|max|min|arg\s*max|arg\s*min"
+    r"|det|dim|ker|rank|diag|sgn|sign|erf|cov|var|Prob|Pr"
+    r"|MSE|MAE|RMSE|BCE|KL|IoU|sqrt)"
+)
+_SMP_OR_GREEK_OR_OP = r"[\U0001d400-\U0001d7ff\u0370-\u03ff∇∂∑∏∐∫∬∭∮√]"
+_HAT_CHARS = r"[\u02c6\u0302]"
+_VS_CHARS = r"\ufe00\ufe01"
+_SUBSUP_TAIL = (
+    r"(?:\s*[_^]\s*(?:\{[^}]+\}|[0-9A-Za-z\u0370-\u03ff\U0001d400-\U0001d7ff+\-()∗]+))*"
+)
+_PROSE_SHORT_WORDS = (
+    r"(?:in|of|on|to|at|by|or|as|is|it|we|be|do|no|so|up|us|an|if|he|me|my|go|am)"
+)
+# Disallow 3+ letter plain ASCII prose words inside math function args unless they are known math functions
+_NON_PROSE_ARG = (
+    r"\((?!(?:(?!"
+    + _KNOWN_MATH_FUNCS
+    + r"\b)[^()\n])*\b(?!(?:"
+    + _KNOWN_MATH_FUNCS
+    + r")\b)[A-Za-z]{3,}\b)[^()\n]+\)"
+)
+_MATH_FUNC_CALL = (
+    r"(?<![A-Za-z0-9\U0001d400-\U0001d7ff])(?:"
+    + _KNOWN_MATH_FUNCS
+    + r"\s*"
+    + _NON_PROSE_ARG
+    + r"|(?:"
+    + _HAT_CHARS
+    + r"\s*)?"
+    + _SMP_OR_GREEK_OR_OP
+    + r"[\U0001d400-\U0001d7ff\u0370-\u03ff∇∂∑∏∐∫∬∭∮√A-Za-z0-9′″'\u2217∗"
+    + _VS_CHARS
+    + r"]*"
+    + _SUBSUP_TAIL
+    + _NON_PROSE_ARG
+    + r"|(?!(?:"
+    + _PROSE_SHORT_WORDS
+    + r")\b)[A-Za-z]{1,2}(?:[′″']+)+"
+    + _SUBSUP_TAIL
+    + r"\([^()\n]+\)"
+    + r"|(?!(?:"
+    + _PROSE_SHORT_WORDS
+    + r")\b)[A-Za-z]{1,2}"
+    + _SUBSUP_TAIL
+    + _NON_PROSE_ARG
+    + r")"
+)
+_MATH_SET_ATOM = r"\{(?!v\d+\})[^}\n]*" + _SMP_OR_GREEK_OR_OP + r"[^}\n]*\}"
+_MATH_DIM_ATOM = r"\b\d+(?:\.\d+)?(?:\s*[×±]\s*\d+(?:\.\d+)?)+\b"
+_MATH_SCI_ATOM = (
+    r"(?<![A-Za-z\U0001d400-\U0001d7ff])\d+(?:\.\d+)?(?:e|E|\U0001d452)[+\-−]?\d+\b"
+)
+_MATH_SYMBOL_ATOM = (
+    r"(?:[−\-]\s*)?(?:"
+    + _HAT_CHARS
+    + r"\s*)?"
+    + _SMP_OR_GREEK_OR_OP
+    + r"(?:\s*[_^]\s*(?:\{[^}]+\}|[0-9A-Za-z\u0370-\u03ff\U0001d400-\U0001d7ff+\-()∗]+)|[\U0001d400-\U0001d7ff\u0370-\u03ff∇∂∑∏∐∫∬∭∮√0-9′″'\u2217∗"
+    + _VS_CHARS
+    + r"]|(?<=[\u2217∗])\s+\d+)*"
+)
+_MATH_ASCII_SUBSUP_ATOM = (
+    r"(?<![A-Za-z0-9\U0001d400-\U0001d7ff])[A-Za-z0-9]+(?:[′″']+)?(?:\s*[_^]\s*(?:\{[^}]+\}|[0-9A-Za-z\u0370-\u03ff\U0001d400-\U0001d7ff+\-()∗]+))+"
+    r"|(?<![A-Za-z0-9\U0001d400-\U0001d7ff])[A-Za-z]+(?:[′″']+)(?:[0-9A-Za-z_^{}\(\)]*)"
+)
 _MATH_ATOM = (
     r"(?:"
-    r"[A-Za-zα-ωΑ-Ω∇∂∑∏∫√]+(?:[′″']+)?(?:\s*[_^]\s*(?:\{[^}]+\}|[0-9A-Za-zα-ωΑ-Ω+\-()]+))*\([^()\n]+\)"
-    r"|[A-Za-zα-ωΑ-Ω0-9]+(?:[′″']+)?(?:\s*[_^]\s*(?:\{[^}]+\}|[0-9A-Za-zα-ωΑ-Ω+\-()]+))+"
-    r"|[A-Za-zα-ωΑ-Ω]+(?:[′″']+)(?:[0-9A-Za-zα-ωΑ-Ω_^{}\(\)]*)"
-    r"|(?:\b(?:sin|cos|tan|log|ln|exp|lim|sup|inf|max|min|arg\s*max|arg\s*min)\s*\([^()\n]+\))"
-    r"|[\u0370-\u03ff\u2200-\u22ff\u2190-\u21ff]+[A-Za-zα-ωΑ-Ω0-9_^{}\(\)′″']*"
-    r")"
+    + _MATH_SET_ATOM
+    + r"|"
+    + _MATH_FUNC_CALL
+    + r"|"
+    + _MATH_DIM_ATOM
+    + r"|"
+    + _MATH_SCI_ATOM
+    + r"|"
+    + _MATH_SYMBOL_ATOM
+    + r"|"
+    + _MATH_ASCII_SUBSUP_ATOM
+    + r"|[\u2200-\u22ff\u2190-\u21ff]+[\ufe00\ufe01]?[A-Za-z\u0370-\u03ff\U0001d400-\U0001d7ff0-9_^{}\(\)′″']*"
+    + r")"
 )
 _MATH_RHS_ATOM = (
     r"(?:"
     + _MATH_ATOM
+    + r"|"
+    + _NON_PROSE_ARG
     + r"|[0-9]+(?:\.[0-9]+)?(?:e[+\-]?\d+)?"
-    + r"|[A-Za-z0-9_^{}\(\)′″']+"
+    + r"|(?<![A-Za-z\U0001d400-\U0001d7ff])[A-Za-z0-9_^{}\(\)′″']+(?![A-Za-z])"
     + r")"
 )
 _INLINE_MATH_EXPR_RE = re.compile(
@@ -85,12 +161,12 @@ _INLINE_MATH_EXPR_RE = re.compile(
     r"\$[^$]+\$"
     r"|"
     + _MATH_ATOM
-    + r"(?:\s*[=<>≤≥≈≠±+\-*/∈∉⊂⊆∪∩]\s*"
+    + r"(?:\s*[=<>≤≥≈≠±+\-−*/×⋅·∈∉⊂⊆∪∩]\s*"
     + _MATH_RHS_ATOM
     + r")*"
-    r"|\b[A-Za-zα-ωΑ-Ω][A-Za-z0-9α-ωΑ-Ω_^{}′″']*\s*[=≈≠≤≥]\s*"
+    r"|(?<![A-Za-z0-9\U0001d400-\U0001d7ff])[A-Za-z\u0370-\u03ff\U0001d400-\U0001d7ff][A-Za-z0-9\u0370-\u03ff\U0001d400-\U0001d7ff_^{}′″']*\s*[=≈≠≤≥]\s*"
     + _MATH_RHS_ATOM
-    + r"(?:\s*[+\-*/]\s*"
+    + r"(?:\s*[+\-−*/×⋅·]\s*"
     + _MATH_RHS_ATOM
     + r")*"
     r")"
@@ -803,6 +879,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
             line_sizes = [float(s.get("size", 10.0)) for s in spans if s.get("text", "").strip()]
             max_line_size = max(line_sizes) if line_sizes else 10.0
             line_parts: list[str] = []
+            prev_span: dict | None = None
 
             for s in spans:
                 t = str(s.get("text", ""))
@@ -813,12 +890,39 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 flags = int(s.get("flags", 0))
                 sizes.append(sz)
 
-                if any(k in font_name for k in ("cmmi", "cmsy", "cmex", "math", "symbol")):
+                if any(k in font_name for k in ("cmmi", "cmsy", "cmex", "math", "symbol", "txsys", "txexs", "txmia")):
                     has_math_font = True
                 if (flags & 1) or (sz < max_line_size * 0.78 and len(t.strip()) <= 4):
                     has_sub_super = True
 
+                if prev_span is not None:
+                    prev_t = str(prev_span.get("text", ""))
+                    prev_bbox = prev_span.get("bbox")
+                    cur_bbox = s.get("bbox")
+                    if (
+                        prev_t
+                        and not prev_t[-1].isspace()
+                        and not t[0].isspace()
+                        and isinstance(prev_bbox, (list, tuple))
+                        and len(prev_bbox) == 4
+                        and isinstance(cur_bbox, (list, tuple))
+                        and len(cur_bbox) == 4
+                    ):
+                        dx = float(cur_bbox[0]) - float(prev_bbox[2])
+                        if dx >= max(1.8, max_line_size * 0.22):
+                            has_prose_boundary = bool(
+                                re.search(r"(?:[A-Za-z]{2,}|\b[aI])$", prev_t)
+                                or re.match(r"^\(?([A-Za-z]{2,}|[aI])\b", t)
+                            )
+                            if (
+                                has_prose_boundary
+                                and t[0] not in ".,;:!?)]}’”'"
+                                and prev_t[-1] not in "([{‘“"
+                            ):
+                                line_parts.append(" ")
+
                 line_parts.append(t)
+                prev_span = s
 
             joined_line = "".join(line_parts)
             if joined_line.strip():
@@ -1977,24 +2081,37 @@ class NativePreservingAdapter(PdfEngineAdapter):
 def mask_inline_protected_elements(text: str) -> tuple[str, list[ProtectedItem]]:
     """Detect inline formulas, Greek/math symbols, sub/superscripts, and URLs/DOIs,
     replacing them with `{v1}`, `{v2}`, ... while leaving `[1]` citation brackets visible
-    (or protected) for validation.
+    (or protected) for validation. Also safely protects any pre-existing literal `{vN}`
+    in the source text so it cannot collide with generated placeholders.
     """
-    items: list[ProtectedItem] = []
-    counter = 0
+    pending_items: list[tuple[ProtectedItemKind, str]] = []
+    sentinel_re = re.compile(r"[\ue100-\ue8ff]")
+
+    def _alloc_sentinel(kind: ProtectedItemKind, orig_text: str) -> str:
+        idx = len(pending_items)
+        pending_items.append((kind, orig_text))
+        return chr(0xE100 + idx)
+
+    # Protect any pre-existing literal `{v1}`, `{v2}`, ... in source text first
+    working = re.sub(
+        r"\{v\d+\}",
+        lambda m: _alloc_sentinel(ProtectedItemKind.INLINE_FORMULA, m.group(0)),
+        text,
+    )
 
     def _replace(match: re.Match, kind: ProtectedItemKind) -> str:
-        nonlocal counter
         raw_match = match.group(0)
-        if re.search(r"\{v\d+\}", raw_match):
+        if sentinel_re.search(raw_match):
             return raw_match
 
-        # Strip trailing sentence punctuation or unbalanced closing brackets/parens
+        # Strip trailing sentence punctuation or unbalanced closing brackets/parens/braces
         orig = raw_match
         trailing = ""
         while orig and (
             orig[-1] in ".,;:"
             or (orig[-1] == ")" and orig.count(")") > orig.count("("))
             or (orig[-1] == "]" and orig.count("]") > orig.count("["))
+            or (orig[-1] == "}" and orig.count("}") > orig.count("{"))
         ):
             trailing = orig[-1] + trailing
             orig = orig[:-1]
@@ -2007,35 +2124,50 @@ def mask_inline_protected_elements(text: str) -> tuple[str, list[ProtectedItem]]
         # Skip single plain ASCII letters or numbers
         if not orig or re.match(r"^[A-Za-z0-9]+$", orig):
             return raw_match
-        counter += 1
-        ph = f"{{v{counter}}}"
-        items.append(
-            ProtectedItem(
-                placeholder=ph,
-                kind=kind,
-                original_text=orig,
-            )
-        )
-        return f"{ph}{trailing}"
+        sentinel = _alloc_sentinel(kind, orig)
+        return f"{sentinel}{trailing}"
 
-    working = _URL_DOI_RE.sub(lambda m: _replace(m, ProtectedItemKind.URL_OR_DOI), text)
+    working = _URL_DOI_RE.sub(lambda m: _replace(m, ProtectedItemKind.URL_OR_DOI), working)
     working = _EQUATION_REFERENCE_RE.sub(
         lambda m: _replace(m, ProtectedItemKind.EQUATION_NUMBER), working
     )
     working = _INLINE_MATH_EXPR_RE.sub(
         lambda m: _replace(m, ProtectedItemKind.INLINE_FORMULA), working
     )
-    return working, items
+
+    items: list[ProtectedItem] = []
+    counter = 0
+
+    def _finalize_sentinel(match: re.Match) -> str:
+        nonlocal counter
+        idx = ord(match.group(0)) - 0xE100
+        kind, orig_text = pending_items[idx]
+        counter += 1
+        ph = f"{{v{counter}}}"
+        items.append(
+            ProtectedItem(
+                placeholder=ph,
+                kind=kind,
+                original_text=orig_text,
+            )
+        )
+        return ph
+
+    final_masked = sentinel_re.sub(_finalize_sentinel, working)
+    return final_masked, items
 
 
 def unmask_inline_protected_elements(
     translated_text: str, protected_items: list[ProtectedItem]
 ) -> str:
-    """Restore `{v1}`, `{v2}` placeholders back to their exact original math/symbol strings."""
-    restored = translated_text
-    for item in protected_items:
-        restored = restored.replace(item.placeholder, item.original_text)
-    return restored
+    """Restore `{v1}`, `{v2}` placeholders back to their exact original math/symbol strings
+    in a single simultaneous pass so literal `{vN}` values never chain-expand.
+    """
+    if not translated_text or not protected_items:
+        return translated_text
+    ph_map = {item.placeholder: item.original_text for item in protected_items}
+    pattern = re.compile("|".join(re.escape(ph) for ph in sorted(ph_map, key=len, reverse=True)))
+    return pattern.sub(lambda m: ph_map[m.group(0)], translated_text)
 
 
 def wrap_japanese_kinsoku(
