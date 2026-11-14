@@ -17,6 +17,9 @@ import React, { useState } from "react";
 import type {
   Block,
   BlockKind,
+  BlockSplitPreviewResult,
+  BlockSplitRole,
+  BlockSplitSpec,
   Document,
   ProtectionMode,
   ProtectionRegion,
@@ -36,6 +39,7 @@ export interface Screen2Props {
   pdfBytes: Uint8Array | null;
   blocks: Block[];
   protectionRegions: ProtectionRegion[];
+  blockSplits?: BlockSplitSpec[];
   isParsing: boolean;
   saveStatus: "saved" | "saving" | "error";
   saveMessage: string | null;
@@ -47,6 +51,21 @@ export interface Screen2Props {
     note?: string | null;
   }) => Promise<void>;
   onDeleteProtectionRegion: (regionId: string) => Promise<void>;
+  onPreviewBlockSplit?: (payload: {
+    page_index: number;
+    requested_bbox: BBox4;
+    include_equation_number: boolean;
+  }) => Promise<BlockSplitPreviewResult>;
+  onCreateBlockSplit?: (payload: {
+    page_index: number;
+    requested_bbox: BBox4;
+    include_equation_number: boolean;
+    note?: string | null;
+    expected_protection_revision?: number | null;
+    expected_parse_revision?: number | null;
+    expected_parent_signature?: string | null;
+  }) => Promise<unknown>;
+  onDeleteBlockSplit?: (splitId: string) => Promise<void>;
   onProceedToStartJob: () => Promise<void>;
   onSetBlockOverride?: (
     blockId: string,
@@ -169,11 +188,28 @@ const PROTECTION_MODE_LABELS: Record<
 const ZOOM_SCALES = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5];
 const ROTATION_OPTIONS: Array<0 | 90 | 180 | 270> = [0, 90, 180, 270];
 
+const SPLIT_STATUS_LABELS: Record<
+  BlockSplitSpec["applied_status"],
+  { labelJa: string; badgeClass: string }
+> = {
+  applied: { labelJa: "✅ 適用中", badgeClass: "badge-success" },
+  pending_ambiguous: { labelJa: "⚠ 適用保留（曖昧）", badgeClass: "badge-warning" },
+  pending_missing: { labelJa: "⚠ 適用保留（対象消失）", badgeClass: "badge-warning" },
+  pending_changed: { labelJa: "⚠ 適用保留（親内容変更）", badgeClass: "badge-warning" },
+};
+
+const SPLIT_ROLE_LABELS: Record<BlockSplitRole, { labelJa: string; shortTag: string }> = {
+  top: { labelJa: "上の本文（翻訳対象）", shortTag: "✂上本文" },
+  formula: { labelJa: "選択数式（原文保護）", shortTag: "✂数式保護" },
+  bottom: { labelJa: "下の本文（翻訳対象）", shortTag: "✂下本文" },
+};
+
 export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
   document,
   pdfBytes,
   blocks,
   protectionRegions,
+  blockSplits = [],
   isParsing,
   saveStatus,
   saveMessage,
@@ -182,13 +218,25 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
   onReapplyAutoProtection,
   onAddProtectionRegion,
   onDeleteProtectionRegion,
+  onPreviewBlockSplit,
+  onCreateBlockSplit,
+  onDeleteBlockSplit,
   onProceedToStartJob,
 }) => {
   const [displayPage, setDisplayPage] = useState<number>(1);
   const [scale, setScale] = useState<number>(1.0);
   const [userRotation, setUserRotation] = useState<0 | 90 | 180 | 270>(0);
+  const [dragToolMode, setDragToolMode] = useState<"protection_region" | "split_formula">(
+    "protection_region"
+  );
   const [newRegionMode, setNewRegionMode] = useState<ProtectionMode>("do_not_translate");
   const [newRegionNote, setNewRegionNote] = useState<string>("");
+  const [splitIncludeEqNum, setSplitIncludeEqNum] = useState<boolean>(true);
+  const [splitNote, setSplitNote] = useState<string>("");
+  const [splitPreview, setSplitPreview] = useState<BlockSplitPreviewResult | null>(null);
+  const [isPreviewLoading, setIsPreviewLoading] = useState<boolean>(false);
+  const [isConfirmingSplit, setIsConfirmingSplit] = useState<boolean>(false);
+  const [splitActionError, setSplitActionError] = useState<string | null>(null);
   const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null);
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
   const [dragNotice, setDragNotice] = useState<string | null>(null);
@@ -223,8 +271,95 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
     1
   );
 
+  const toVp = (bbox: BBox4): BBox4 =>
+    backendToViewportBbox(
+      bbox,
+      pageMeta.width_pt,
+      pageMeta.height_pt,
+      scale,
+      pageMeta.rotation_deg,
+      userRotation
+    );
+
   const pageBlocks = blocks.filter((b) => b.page_index === currentPageIndex0);
   const pageRegions = protectionRegions.filter((r) => r.page_index === currentPageIndex0);
+  const pageSplits = blockSplits.filter((s) => s.page_index === currentPageIndex0);
+
+  const handlePageChange = (nextPage: number) => {
+    setDisplayPage(nextPage);
+    setSplitPreview(null);
+    setSplitActionError(null);
+    setDragNotice(null);
+  };
+
+  const requestSplitPreview = async (
+    pageIndex: number,
+    backendBbox: BBox4,
+    includeEqNum: boolean
+  ) => {
+    if (!onPreviewBlockSplit) return;
+    setIsPreviewLoading(true);
+    setSplitActionError(null);
+    try {
+      const preview = await onPreviewBlockSplit({
+        page_index: pageIndex,
+        requested_bbox: backendBbox,
+        include_equation_number: includeEqNum,
+      });
+      setSplitPreview(preview);
+      if (preview.valid) {
+        setDragNotice(
+          `分割プレビューを取得しました（分割数: ${preview.parts.length}）。右パネルで内容を確認し、「分割を確定」を押してください。`
+        );
+      } else {
+        setDragNotice(
+          `選択範囲を分割できませんでした: ${preview.rejection_reason || preview.rejection_code || "不明な理由"}`
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setSplitActionError(msg);
+      setDragNotice(`分割プレビュー取得に失敗しました: ${msg}`);
+    } finally {
+      setIsPreviewLoading(false);
+    }
+  };
+
+  const handleToggleSplitEqNum = async (includeEqNum: boolean) => {
+    setSplitIncludeEqNum(includeEqNum);
+    if (splitPreview && splitPreview.page_index === currentPageIndex0 && onPreviewBlockSplit) {
+      await requestSplitPreview(
+        splitPreview.page_index,
+        splitPreview.requested_bbox,
+        includeEqNum
+      );
+    }
+  };
+
+  const handleConfirmSplit = async () => {
+    if (!splitPreview || !splitPreview.valid || !onCreateBlockSplit) return;
+    setIsConfirmingSplit(true);
+    setSplitActionError(null);
+    try {
+      await onCreateBlockSplit({
+        page_index: splitPreview.page_index,
+        requested_bbox: splitPreview.requested_bbox,
+        include_equation_number: splitIncludeEqNum,
+        note: splitNote.trim() || null,
+        expected_protection_revision: splitPreview.protection_revision,
+        expected_parse_revision: splitPreview.parse_revision,
+        expected_parent_signature: splitPreview.parent_signature,
+      });
+      setSplitPreview(null);
+      setSplitNote("");
+      setDragNotice("選択範囲の数式保護と本文への分割を確定しました。");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setSplitActionError(msg);
+    } finally {
+      setIsConfirmingSplit(false);
+    }
+  };
 
   const handleMouseDown = (xPx: number, yPx: number) => {
     setDragStart([xPx, yPx]);
@@ -272,6 +407,11 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
       pageMeta.rotation_deg,
       userRotation
     );
+
+    if (dragToolMode === "split_formula") {
+      await requestSplitPreview(currentPageIndex0, backendBbox, splitIncludeEqNum);
+      return;
+    }
 
     if (norm.clampedOutOfBounds) {
       setDragNotice(
@@ -321,7 +461,7 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
               className="btn btn-secondary"
               data-testid="prev-page-btn"
               disabled={safeDisplayPage <= 1}
-              onClick={() => setDisplayPage((p) => Math.max(1, p - 1))}
+              onClick={() => handlePageChange(Math.max(1, safeDisplayPage - 1))}
             >
               ◀ 前へ
             </button>
@@ -333,7 +473,7 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
               className="btn btn-secondary"
               data-testid="next-page-btn"
               disabled={safeDisplayPage >= totalPages}
-              onClick={() => setDisplayPage((p) => Math.min(totalPages, p + 1))}
+              onClick={() => handlePageChange(Math.min(totalPages, safeDisplayPage + 1))}
             >
               次へ ▶
             </button>
@@ -552,9 +692,14 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
               const isFallback = blk.status === "fallback_original";
               const isManualOverride = blk.protection_source === "manual";
               const isSelected = selectedBlockId === blk.id;
-
+              const isSplitChild = Boolean(blk.split_role);
+              const splitTag = blk.split_role
+                ? SPLIT_ROLE_LABELS[blk.split_role]?.shortTag
+                : null;
               const sourceBadge = isFallback
                 ? "⚠Fallback"
+                : splitTag
+                ? splitTag
                 : isManualOverride
                 ? "🔒Manual"
                 : blk.protection_source === "auto"
@@ -567,6 +712,7 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
                   data-testid={`svg-block-${blk.id}`}
                   data-block-kind={blk.kind}
                   data-protection-source={blk.protection_source}
+                  data-split-role={blk.split_role || ""}
                   onClick={(ev) => {
                     ev.stopPropagation();
                     setSelectedBlockId(blk.id);
@@ -577,9 +723,23 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
                     y={y}
                     width={w}
                     height={h}
-                    fill={isFallback ? "rgba(234, 88, 12, 0.18)" : st.fill}
-                    stroke={isFallback ? "#ea580c" : isManualOverride ? "#dc2626" : st.stroke}
-                    strokeWidth={isSelected ? 2.5 : 1.4}
+                    fill={
+                      isFallback
+                        ? "rgba(234, 88, 12, 0.18)"
+                        : blk.split_role === "formula"
+                        ? "rgba(124, 58, 237, 0.15)"
+                        : st.fill
+                    }
+                    stroke={
+                      isFallback
+                        ? "#ea580c"
+                        : blk.split_role === "formula"
+                        ? "#7c3aed"
+                        : isManualOverride
+                        ? "#dc2626"
+                        : st.stroke
+                    }
+                    strokeWidth={isSelected ? 2.5 : isSplitChild ? 2 : 1.4}
                     strokeDasharray={isFallback ? "3 2" : st.dashArray}
                   />
                   <text
@@ -646,7 +806,125 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
               );
             })}
 
-            {/* 3. Active drag preview rectangle */}
+            {/* 3. Pending block split warnings (not currently matched uniquely) */}
+            {pageSplits
+              .filter((sp) => sp.applied_status !== "applied")
+              .map((sp) => {
+                const vp = backendToViewportBbox(
+                  sp.snapped_bbox,
+                  pageMeta.width_pt,
+                  pageMeta.height_pt,
+                  scale,
+                  pageMeta.rotation_deg,
+                  userRotation
+                );
+                return (
+                  <rect
+                    key={sp.id}
+                    data-testid={`svg-pending-split-${sp.id}`}
+                    x={vp[0]}
+                    y={vp[1]}
+                    width={Math.max(4, vp[2] - vp[0])}
+                    height={Math.max(4, vp[3] - vp[1])}
+                    fill="rgba(217, 119, 6, 0.12)"
+                    stroke="#d97706"
+                    strokeWidth={2}
+                    strokeDasharray="6 3"
+                  />
+                );
+              })}
+
+            {/* 4. Interactive Split Preview Overlay */}
+            {splitPreview &&
+              splitPreview.page_index === currentPageIndex0 &&
+              (splitPreview.valid ? (
+                <g data-testid="svg-split-preview-group">
+                  {splitPreview.parts.map((part) => {
+                    const pvp = toVp(part.bbox);
+                    const isFormulaPart = part.role === "formula";
+                    return (
+                      <g key={part.role} data-testid={`svg-split-part-${part.role}`}>
+                        <rect
+                          x={pvp[0]}
+                          y={pvp[1]}
+                          width={Math.max(4, pvp[2] - pvp[0])}
+                          height={Math.max(4, pvp[3] - pvp[1])}
+                          fill={
+                            isFormulaPart
+                              ? "rgba(124, 58, 237, 0.22)"
+                              : "rgba(13, 148, 136, 0.14)"
+                          }
+                          stroke={isFormulaPart ? "#7c3aed" : "#0d9488"}
+                          strokeWidth={2}
+                          strokeDasharray={isFormulaPart ? "none" : "5 3"}
+                        />
+                        <text
+                          x={pvp[0] + 4}
+                          y={Math.max(12, pvp[1] + 12)}
+                          fontSize={10}
+                          fontWeight={700}
+                          fill={isFormulaPart ? "#5b21b6" : "#115e59"}
+                          style={{ pointerEvents: "none" }}
+                        >
+                          {part.will_protect ? "🔒" : "📝"} {part.label_ja}
+                        </text>
+                      </g>
+                    );
+                  })}
+                  {splitPreview.snapped_bbox &&
+                    (() => {
+                      const svp = toVp(splitPreview.snapped_bbox);
+                      return (
+                        <rect
+                          data-testid="svg-split-preview-snapped"
+                          x={svp[0]}
+                          y={svp[1]}
+                          width={Math.max(4, svp[2] - svp[0])}
+                          height={Math.max(4, svp[3] - svp[1])}
+                          fill="none"
+                          stroke="#6d28d9"
+                          strokeWidth={2}
+                          strokeDasharray="2 2"
+                        />
+                      );
+                    })()}
+                  {splitPreview.equation_number_candidate_bbox &&
+                    (() => {
+                      const evp = toVp(splitPreview.equation_number_candidate_bbox);
+                      return (
+                        <rect
+                          data-testid="svg-split-preview-eqnum"
+                          x={evp[0]}
+                          y={evp[1]}
+                          width={Math.max(4, evp[2] - evp[0])}
+                          height={Math.max(4, evp[3] - evp[1])}
+                          fill="rgba(217, 119, 6, 0.25)"
+                          stroke="#d97706"
+                          strokeWidth={2}
+                        />
+                      );
+                    })()}
+                </g>
+              ) : (
+                (() => {
+                  const rvp = toVp(splitPreview.requested_bbox);
+                  return (
+                    <rect
+                      data-testid="svg-split-preview-rejected"
+                      x={rvp[0]}
+                      y={rvp[1]}
+                      width={Math.max(4, rvp[2] - rvp[0])}
+                      height={Math.max(4, rvp[3] - rvp[1])}
+                      fill="rgba(220, 38, 38, 0.14)"
+                      stroke="#dc2626"
+                      strokeWidth={2}
+                      strokeDasharray="4 2"
+                    />
+                  );
+                })()
+              ))}
+
+            {/* 5. Active drag preview rectangle */}
             {activeDragRect && (
               <rect
                 data-testid="active-drag-rect"
@@ -654,8 +932,12 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
                 y={activeDragRect[1]}
                 width={Math.max(1, activeDragRect[2] - activeDragRect[0])}
                 height={Math.max(1, activeDragRect[3] - activeDragRect[1])}
-                fill="rgba(37, 99, 235, 0.18)"
-                stroke="#2563eb"
+                fill={
+                  dragToolMode === "split_formula"
+                    ? "rgba(124, 58, 237, 0.2)"
+                    : "rgba(37, 99, 235, 0.18)"
+                }
+                stroke={dragToolMode === "split_formula" ? "#7c3aed" : "#2563eb"}
                 strokeWidth={2}
                 strokeDasharray="4 2"
               />
@@ -666,52 +948,398 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
         {/* Right Sidebar: Drag Mode Configuration, Manual Regions List & Block Inspector */}
         <aside className="card" style={{ alignSelf: "start" }}>
           <h3 className="card-title" style={{ fontSize: "16px" }}>
-            手動保護領域のドラッグ追加
+            PDFドラッグ操作ツール
           </h3>
-          <p className="card-subtitle" style={{ fontSize: "12px" }}>
-            左のPDFページ上をマウスでドラッグすると、指定モードの保護領域（PDF座標pt）を追加できます。
-          </p>
 
-          <div className="form-group">
-            <label className="form-label" htmlFor="protection-mode-select">
-              ドラッグ追加時の保護モード
-            </label>
-            <select
-              id="protection-mode-select"
-              data-testid="protection-mode-select"
-              className="form-input"
-              value={newRegionMode}
-              onChange={(ev) => setNewRegionMode(ev.target.value as ProtectionMode)}
+          <div
+            data-testid="drag-tool-selector"
+            style={{ display: "flex", gap: "6px", marginBottom: "10px", flexWrap: "wrap" }}
+          >
+            <button
+              type="button"
+              data-testid="drag-tool-protection-btn"
+              className={`btn ${
+                dragToolMode === "protection_region" ? "btn-primary" : "btn-secondary"
+              }`}
+              onClick={() => {
+                setDragToolMode("protection_region");
+                setSplitActionError(null);
+              }}
             >
-              <option value="do_not_translate">
-                🔒 翻訳しない (do_not_translate)
-              </option>
-              <option value="protect_as_formula">
-                ∑ 数式として保護 (protect_as_formula)
-              </option>
-              <option value="protect_as_figure">
-                ▣ 図として保護 (protect_as_figure)
-              </option>
-              <option value="translate_as_body">
-                ✎ 本文として翻訳 (translate_as_body)
-              </option>
-            </select>
+              手動保護領域を追加
+            </button>
+            <button
+              type="button"
+              data-testid="drag-tool-split-btn"
+              className={`btn ${
+                dragToolMode === "split_formula" ? "btn-primary" : "btn-secondary"
+              }`}
+              onClick={() => {
+                setDragToolMode("split_formula");
+                setDragNotice(
+                  "分離対象の数式と式番号を左のPDFページ上でドラッグしてください（保存前にプレビュー表示されます）。"
+                );
+              }}
+            >
+              選択範囲を分離して原文保護
+            </button>
           </div>
 
-          <div className="form-group">
-            <label className="form-label" htmlFor="protection-note-input">
-              メモ（任意）
-            </label>
-            <input
-              id="protection-note-input"
-              data-testid="protection-note-input"
-              type="text"
-              className="form-input"
-              placeholder="例: 定理1の図式・可換図"
-              value={newRegionNote}
-              onChange={(ev) => setNewRegionNote(ev.target.value)}
-            />
-          </div>
+          {dragToolMode === "protection_region" ? (
+            <>
+              <p className="card-subtitle" style={{ fontSize: "12px" }}>
+                左のPDFページ上をマウスでドラッグすると、指定モードの保護領域（PDF座標pt）を追加できます。
+              </p>
+
+              <div className="form-group">
+                <label className="form-label" htmlFor="protection-mode-select">
+                  ドラッグ追加時の保護モード
+                </label>
+                <select
+                  id="protection-mode-select"
+                  data-testid="protection-mode-select"
+                  className="form-input"
+                  value={newRegionMode}
+                  onChange={(ev) => setNewRegionMode(ev.target.value as ProtectionMode)}
+                >
+                  <option value="do_not_translate">
+                    🔒 翻訳しない (do_not_translate)
+                  </option>
+                  <option value="protect_as_formula">
+                    ∑ 数式として保護 (protect_as_formula)
+                  </option>
+                  <option value="protect_as_figure">
+                    ▣ 図として保護 (protect_as_figure)
+                  </option>
+                  <option value="translate_as_body">
+                    ✎ 本文として翻訳 (translate_as_body)
+                  </option>
+                </select>
+              </div>
+
+              <div className="form-group">
+                <label className="form-label" htmlFor="protection-note-input">
+                  メモ（任意）
+                </label>
+                <input
+                  id="protection-note-input"
+                  data-testid="protection-note-input"
+                  type="text"
+                  className="form-input"
+                  placeholder="例: 定理1の図式・可換図"
+                  value={newRegionNote}
+                  onChange={(ev) => setNewRegionNote(ev.target.value)}
+                />
+              </div>
+            </>
+          ) : (
+            <div data-testid="split-tool-panel">
+              <p className="card-subtitle" style={{ fontSize: "12px" }}>
+                混在ブロック内の独立数式と式番号をドラッグで囲むと、「選択数式（原文保護）」と前後の「本文（翻訳対象）」に安全に分割するプレビューを作成します。
+              </p>
+
+              <label
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "6px",
+                  fontSize: "12px",
+                  marginBottom: "10px",
+                }}
+              >
+                <input
+                  type="checkbox"
+                  data-testid="split-include-eqnum-checkbox"
+                  checked={splitIncludeEqNum}
+                  disabled={isPreviewLoading || isConfirmingSplit}
+                  onChange={(ev) => void handleToggleSplitEqNum(ev.target.checked)}
+                />
+                式番号（例: (6)）を数式保護範囲へ含める
+              </label>
+
+              <div data-testid="split-preview-panel">
+                {isPreviewLoading && (
+                  <div className="alert alert-info" style={{ fontSize: "12px" }}>
+                    分割候補を解析しています...
+                  </div>
+                )}
+
+                {!isPreviewLoading && !splitPreview && (
+                  <div style={{ fontSize: "12px", color: "#475569", marginBottom: "8px" }}>
+                    PDFページ上で独立数式をドラッグして分割プレビューを生成してください。
+                  </div>
+                )}
+
+                {splitPreview && splitPreview.valid && (
+                  <div
+                    data-testid="split-preview-valid-box"
+                    style={{
+                      border: "2px solid #7c3aed",
+                      borderRadius: "8px",
+                      padding: "10px",
+                      backgroundColor: "#faf5ff",
+                      marginBottom: "10px",
+                      fontSize: "12px",
+                    }}
+                  >
+                    <div style={{ fontWeight: 700, marginBottom: "6px", color: "#5b21b6" }}>
+                      分割プレビュー（確定前）— 親ブロック: {splitPreview.parent_block_id}
+                    </div>
+                    {splitPreview.equation_number_text && (
+                      <div
+                        data-testid="split-preview-eqnum-info"
+                        style={{ marginBottom: "6px", color: "#92400e" }}
+                      >
+                        検出された式番号: <code>{splitPreview.equation_number_text}</code>{" "}
+                        （{splitIncludeEqNum ? "数式保護に含む" : "除外"}）
+                      </div>
+                    )}
+                    {splitPreview.will_invalidate_manual_edits && (
+                      <div
+                        data-testid="split-manual-warning"
+                        className="alert alert-warning"
+                        style={{ padding: "6px 8px", marginBottom: "8px", fontSize: "11px" }}
+                      >
+                        ⚠ 対象ブロック（{splitPreview.affected_manual_block_ids.join(", ")}）の手動修正訳文は分割確定後に無効化され、再翻訳または再編集が必要になります。
+                      </div>
+                    )}
+                    {splitPreview.has_active_job && (
+                      <div
+                        className="alert alert-warning"
+                        style={{ padding: "6px 8px", marginBottom: "8px", fontSize: "11px" }}
+                      >
+                        実行中ジョブがあるため確定時に 409 Conflict で拒否される場合があります。
+                      </div>
+                    )}
+                    {splitPreview.warnings.map((w, idx) => (
+                      <div key={idx} style={{ color: "#b45309", marginBottom: "4px" }}>
+                        ※ {w}
+                      </div>
+                    ))}
+                    <ul
+                      data-testid="split-preview-parts"
+                      style={{
+                        listStyle: "none",
+                        padding: 0,
+                        margin: "6px 0 8px 0",
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: "6px",
+                      }}
+                    >
+                      {splitPreview.parts.map((p) => (
+                        <li
+                          key={p.role}
+                          data-testid={`split-preview-part-${p.role}`}
+                          style={{
+                            border: p.will_protect
+                              ? "1px solid #7c3aed"
+                              : "1px solid #0d9488",
+                            borderRadius: "6px",
+                            padding: "6px",
+                            backgroundColor: "#ffffff",
+                          }}
+                        >
+                          <div
+                            style={{
+                              display: "flex",
+                              justifyContent: "space-between",
+                              marginBottom: "2px",
+                            }}
+                          >
+                            <strong>{p.label_ja}</strong>
+                            <span
+                              className={`badge ${
+                                p.will_protect ? "badge-warning" : "badge-success"
+                              }`}
+                            >
+                              {p.will_protect ? "原文保護" : "翻訳対象"}
+                            </span>
+                          </div>
+                          <div style={{ color: "#334155", wordBreak: "break-word" }}>
+                            {p.source_text}
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                    <div className="form-group" style={{ marginBottom: "8px" }}>
+                      <label className="form-label" htmlFor="split-note-input">
+                        分割メモ（任意）
+                      </label>
+                      <input
+                        id="split-note-input"
+                        data-testid="split-note-input"
+                        type="text"
+                        className="form-input"
+                        placeholder="例: 式(6)と直後本文の分離"
+                        value={splitNote}
+                        onChange={(ev) => setSplitNote(ev.target.value)}
+                      />
+                    </div>
+                    {splitActionError && (
+                      <div
+                        data-testid="split-action-error"
+                        className="alert alert-error"
+                        style={{ padding: "6px 8px", marginBottom: "8px", fontSize: "11px" }}
+                      >
+                        {splitActionError}
+                      </div>
+                    )}
+                    <div style={{ display: "flex", gap: "8px" }}>
+                      <button
+                        type="button"
+                        className="btn btn-primary"
+                        data-testid="confirm-split-btn"
+                        disabled={isConfirmingSplit}
+                        onClick={() => void handleConfirmSplit()}
+                      >
+                        {isConfirmingSplit ? "確定・保存中..." : "✂ 分割を確定して保存"}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-secondary"
+                        data-testid="cancel-split-btn"
+                        disabled={isConfirmingSplit}
+                        onClick={() => {
+                          setSplitPreview(null);
+                          setSplitActionError(null);
+                        }}
+                      >
+                        キャンセル
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {splitPreview && !splitPreview.valid && (
+                  <div
+                    data-testid="split-rejection-box"
+                    className="alert alert-error"
+                    style={{ fontSize: "12px", marginBottom: "10px" }}
+                  >
+                    <div style={{ fontWeight: 700, marginBottom: "4px" }}>
+                      分割できません（{splitPreview.rejection_code || "REJECTED"}）
+                    </div>
+                    <div>{splitPreview.rejection_reason}</div>
+                    {splitPreview.retry_guidance && (
+                      <div style={{ marginTop: "4px", color: "#7f1d1d" }}>
+                        <strong>対処方法:</strong> {splitPreview.retry_guidance}
+                      </div>
+                    )}
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      style={{ marginTop: "6px" }}
+                      onClick={() => setSplitPreview(null)}
+                    >
+                      閉じる
+                    </button>
+                  </div>
+                )}
+
+                {!splitPreview && splitActionError && (
+                  <div
+                    data-testid="split-action-error"
+                    className="alert alert-error"
+                    style={{ fontSize: "12px", marginBottom: "10px" }}
+                  >
+                    {splitActionError}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          <hr style={{ border: "none", borderTop: "1px solid #e2e8f0", margin: "14px 0" }} />
+
+          <h4 style={{ margin: "0 0 8px 0", fontSize: "14px" }}>
+            このページの分割指定 ({pageSplits.length}件)
+          </h4>
+          {pageSplits.length === 0 ? (
+            <div style={{ fontSize: "12px", color: "#64748b", marginBottom: "12px" }}>
+              このページにはブロック分割指定はまだありません。
+            </div>
+          ) : (
+            <ul
+              data-testid="block-split-list"
+              style={{
+                listStyle: "none",
+                padding: 0,
+                margin: "0 0 14px 0",
+                display: "flex",
+                flexDirection: "column",
+                gap: "8px",
+              }}
+            >
+              {pageSplits.map((sp) => {
+                const stInfo =
+                  SPLIT_STATUS_LABELS[sp.applied_status] || SPLIT_STATUS_LABELS.applied;
+                return (
+                  <li
+                    key={sp.id}
+                    data-testid={`split-item-${sp.id}`}
+                    style={{
+                      border:
+                        sp.applied_status === "applied"
+                          ? "1px solid #7c3aed"
+                          : "1px solid #d97706",
+                      borderRadius: "6px",
+                      padding: "8px",
+                      fontSize: "12px",
+                      backgroundColor:
+                        sp.applied_status === "applied" ? "#faf5ff" : "#fffbeb",
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        gap: "6px",
+                      }}
+                    >
+                      <span
+                        className={`badge ${stInfo.badgeClass}`}
+                        data-testid={`split-status-${sp.id}`}
+                      >
+                        {stInfo.labelJa}
+                      </span>
+                      {onDeleteBlockSplit && (
+                        <button
+                          type="button"
+                          className="btn btn-danger-sm"
+                          data-testid={`delete-split-${sp.id}`}
+                          onClick={() => void onDeleteBlockSplit(sp.id)}
+                        >
+                          削除
+                        </button>
+                      )}
+                    </div>
+                    <div style={{ fontFamily: "monospace", marginTop: "4px" }}>
+                      親: {sp.parent_block_id || "-"} / snapped: [
+                      {sp.snapped_bbox.map((v) => v.toFixed(1)).join(", ")}] pt
+                    </div>
+                    {sp.status_reason && (
+                      <div
+                        data-testid={`split-status-reason-${sp.id}`}
+                        style={{ color: "#b45309", marginTop: "3px" }}
+                      >
+                        理由: {sp.status_reason}
+                      </div>
+                    )}
+                    {sp.parent_source_preview && (
+                      <div style={{ color: "#475569", marginTop: "3px" }}>
+                        {sp.parent_source_preview}
+                      </div>
+                    )}
+                    {sp.note && (
+                      <div style={{ color: "#475569", marginTop: "2px" }}>備考: {sp.note}</div>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
 
           <hr style={{ border: "none", borderTop: "1px solid #e2e8f0", margin: "14px 0" }} />
 
@@ -815,13 +1443,42 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
                       (#{b.reading_order + 1})
                     </span>
                     <span className="badge badge-neutral">
-                      {b.protection_source === "manual"
+                      {b.split_role === "formula"
+                        ? "✂ 分割数式・原文保護"
+                        : b.protection_source === "manual"
                         ? "🔒手動保護"
                         : b.status === "protected_skip"
                         ? b.protection_reason || "自動保護"
                         : "翻訳対象"}
                     </span>
                   </div>
+                  {(b.split_role || b.needs_retranslation) && (
+                    <div
+                      style={{
+                        display: "flex",
+                        gap: "4px",
+                        flexWrap: "wrap",
+                        marginTop: "3px",
+                      }}
+                    >
+                      {b.split_role && (
+                        <span
+                          className="badge badge-info"
+                          data-testid={`block-split-role-${b.id}`}
+                        >
+                          {SPLIT_ROLE_LABELS[b.split_role]?.labelJa || b.split_role}
+                        </span>
+                      )}
+                      {b.needs_retranslation && (
+                        <span
+                          className="badge badge-warning"
+                          data-testid={`block-needs-retranslation-${b.id}`}
+                        >
+                          ⚠ 要再翻訳
+                        </span>
+                      )}
+                    </div>
+                  )}
                   {(b.user_protection_override ||
                     b.protection_confidence === "review_candidate") && (
                     <div style={{ marginTop: "3px", color: "#b45309" }}>
@@ -830,47 +1487,56 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
                       {!b.user_protection_override && "要確認候補"}
                     </div>
                   )}
-                  {onSetBlockOverride && (
-                    <div style={{ display: "flex", gap: "4px", marginTop: "4px" }}>
-                      {b.status === "protected_skip" ? (
-                        <button
-                          type="button"
-                          className="btn btn-secondary"
-                          data-testid={`override-translate-${b.id}`}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            void onSetBlockOverride(b.id, "force_translate");
-                          }}
-                        >
-                          翻訳対象にする
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          className="btn btn-secondary"
-                          data-testid={`override-protect-${b.id}`}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            void onSetBlockOverride(b.id, "force_protect");
-                          }}
-                        >
-                          非翻訳にする
-                        </button>
-                      )}
-                      {b.user_protection_override && (
-                        <button
-                          type="button"
-                          className="btn btn-secondary"
-                          data-testid={`override-reset-${b.id}`}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            void onSetBlockOverride(b.id, null);
-                          }}
-                        >
-                          自動判定に戻す
-                        </button>
-                      )}
+                  {b.split_role === "formula" ? (
+                    <div
+                      data-testid={`split-formula-immutable-note-${b.id}`}
+                      style={{ marginTop: "4px", fontSize: "11px", color: "#5b21b6" }}
+                    >
+                      ※分割指定で分離した数式のため原文保護に固定されています。翻訳対象に戻すには上の「分割指定」を削除してください。
                     </div>
+                  ) : (
+                    onSetBlockOverride && (
+                      <div style={{ display: "flex", gap: "4px", marginTop: "4px" }}>
+                        {b.status === "protected_skip" ? (
+                          <button
+                            type="button"
+                            className="btn btn-secondary"
+                            data-testid={`override-translate-${b.id}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void onSetBlockOverride(b.id, "force_translate");
+                            }}
+                          >
+                            翻訳対象にする
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            className="btn btn-secondary"
+                            data-testid={`override-protect-${b.id}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void onSetBlockOverride(b.id, "force_protect");
+                            }}
+                          >
+                            非翻訳にする
+                          </button>
+                        )}
+                        {b.user_protection_override && (
+                          <button
+                            type="button"
+                            className="btn btn-secondary"
+                            data-testid={`override-reset-${b.id}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void onSetBlockOverride(b.id, null);
+                            }}
+                          >
+                            自動判定に戻す
+                          </button>
+                        )}
+                      </div>
+                    )
                   )}
                   <div
                     style={{

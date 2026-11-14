@@ -586,6 +586,18 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
           </div>
         </div>
 
+        {job.outputs_stale && (
+          <div
+            role="alert"
+            data-testid="outputs-stale-banner"
+            className="alert alert-warning"
+            style={{ marginTop: "10px", fontSize: "13px" }}
+          >
+            <strong>⚠ 成果物は古い解析状態に基づいています:</strong>{" "}
+            {job.outputs_stale_reason ||
+              "ブロック分割または保護設定が変更されたため、最新のブロック構成へ反映するには再翻訳または再組版を実行してください。"}
+          </div>
+        )}
         {retypesetMessage && (
           <div
             data-testid="retypeset-success-banner"
@@ -881,29 +893,42 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
                     fontSize: "12px",
                   }}
                 >
-                  <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: "6px" }}>
                     <strong>
                       #{b.reading_order + 1} [{b.kind}] ({b.id})
                     </strong>
-                    <span
-                      className={`badge ${
-                        b.status === "manually_edited"
-                          ? "badge-info"
+                    <div style={{ display: "flex", gap: "4px", flexWrap: "wrap" }}>
+                      {b.split_role === "formula" && (
+                        <span className="badge badge-info">✂ 数式保護</span>
+                      )}
+                      {b.needs_retranslation && (
+                        <span
+                          className="badge badge-warning"
+                          data-testid={`review-needs-retranslation-${b.id}`}
+                        >
+                          要再翻訳
+                        </span>
+                      )}
+                      <span
+                        className={`badge ${
+                          b.status === "manually_edited"
+                            ? "badge-info"
+                            : b.status === "translated"
+                            ? "badge-success"
+                            : b.status === "fallback_original"
+                            ? "badge-error"
+                            : "badge-neutral"
+                        }`}
+                      >
+                        {b.status === "manually_edited"
+                          ? "✎ 手動修正済み"
                           : b.status === "translated"
-                          ? "badge-success"
+                          ? "AI翻訳済み"
                           : b.status === "fallback_original"
-                          ? "badge-error"
-                          : "badge-neutral"
-                      }`}
-                    >
-                      {b.status === "manually_edited"
-                        ? "✎ 手動修正済み"
-                        : b.status === "translated"
-                        ? "AI翻訳済み"
-                        : b.status === "fallback_original"
-                        ? "⚠ 原文保持フォールバック"
-                        : "🔒 保護スキップ"}
-                    </span>
+                          ? "⚠ 原文保持フォールバック"
+                          : "🔒 保護スキップ"}
+                      </span>
+                    </div>
                   </div>
                   <div style={{ color: "#334155", marginTop: "4px" }}>
                     {b.source_text.slice(0, 120)}
@@ -992,11 +1017,22 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
                     type="button"
                     className="btn btn-secondary"
                     data-testid="retranslate-block-btn"
-                    disabled={isRetranslatingBlock || isJobRunning}
+                    disabled={
+                      isRetranslatingBlock ||
+                      isJobRunning ||
+                      selectedBlock.split_role === "formula"
+                    }
+                    title={
+                      selectedBlock.split_role === "formula"
+                        ? "分割指定で原文保護された数式のため部分再翻訳できません（解除は画面2で分割を削除）"
+                        : undefined
+                    }
                     onClick={() => void onRetranslateBlock(selectedBlock.id)}
                   >
                     {isRetranslatingBlock
                       ? "部分再翻訳中..."
+                      : selectedBlock.split_role === "formula"
+                      ? "分割数式（原文保護）"
                       : "このブロックのみ部分再翻訳"}
                   </button>
                 </div>

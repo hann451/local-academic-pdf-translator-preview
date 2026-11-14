@@ -8,6 +8,7 @@ ValidationIssue, ExportArtifact, and SystemDiagnostics.
 from __future__ import annotations
 
 import enum
+import hashlib
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -16,6 +17,11 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def compute_source_text_hash(text: str) -> str:
+    """Return a deterministic SHA-256 hex digest of an extracted block text."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
 class BlockKind(str, enum.Enum):
@@ -261,6 +267,34 @@ class Block(BaseModel):
         default=None,
         description="Explicit user block-level override: 'force_translate' | 'force_protect' | None",
     )
+    split_spec_id: str | None = Field(
+        default=None,
+        description="ID of the BlockSplitSpec that produced this child block, if split",
+    )
+    split_role: Literal["top", "formula", "bottom"] | None = Field(
+        default=None,
+        description="Role of a split child block within its parent raw block ('top' | 'formula' | 'bottom')",
+    )
+    parent_block_id: str | None = Field(
+        default=None,
+        description="Original parent block ID from which this split child was derived",
+    )
+    parent_bbox: list[float] | None = Field(
+        default=None,
+        description="Original parent raw block bbox [x0, y0, x1, y1]",
+    )
+    parent_source_hash: str | None = Field(
+        default=None,
+        description="SHA-256 hash of the original parent block source_text",
+    )
+    source_text_hash: str | None = Field(
+        default=None,
+        description="SHA-256 hash of this block's own source_text",
+    )
+    needs_retranslation: bool = Field(
+        default=False,
+        description="True when block content or processing unit changed via split/re-merge and requires retranslation",
+    )
     translation_provenance: str = Field(
         default="none",
         description="'llm_inference' | 'cache_hit' | 'manual_edit' | 'reused_block' | 'protected_skip' | 'fallback_original' | 'none'",
@@ -268,6 +302,12 @@ class Block(BaseModel):
     edit_revision: int = Field(default=0, ge=0)
     manual_validation_errors: list[str] = Field(default_factory=list)
     manual_validation_warnings: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _ensure_source_text_hash(self) -> "Block":
+        if self.source_text_hash is None:
+            self.source_text_hash = compute_source_text_hash(self.source_text)
+        return self
 
     @field_validator("bbox")
     @classmethod
@@ -315,6 +355,97 @@ class ProtectionRegion(BaseModel):
         return [x0, y0, x1, y1]
 
 
+BlockSplitRole = Literal["top", "formula", "bottom"]
+BlockSplitAppliedStatus = Literal[
+    "applied",
+    "pending_ambiguous",
+    "pending_missing",
+    "pending_changed",
+]
+
+
+def _validate_positive_bbox(v: list[float], label: str) -> list[float]:
+    if len(v) != 4:
+        raise ValueError(f"{label} must have 4 elements [x0, y0, x1, y1]")
+    x0, y0, x1, y1 = (float(x) for x in v)
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError(f"{label} must have positive area: {v}")
+    return [x0, y0, x1, y1]
+
+
+class BlockSplitSpec(BaseModel):
+    """Persistent drag-selection rule that splits a mixed formula/prose raw block."""
+
+    id: str
+    document_id: str
+    page_index: int = Field(..., ge=0)
+    requested_bbox: list[float]
+    snapped_bbox: list[float]
+    operation_mode: Literal["split_and_protect_formula"] = "split_and_protect_formula"
+    parent_block_id: str | None = None
+    parent_bbox: list[float]
+    parent_source_hash: str
+    parent_source_preview: str = ""
+    include_equation_number: bool = True
+    applied_status: BlockSplitAppliedStatus = "applied"
+    status_reason: str | None = None
+    note: str | None = None
+    created_at: str = Field(default_factory=utc_now_iso)
+
+    @field_validator("requested_bbox")
+    @classmethod
+    def _check_req_bbox(cls, v: list[float]) -> list[float]:
+        return _validate_positive_bbox(v, "requested_bbox")
+
+    @field_validator("snapped_bbox")
+    @classmethod
+    def _check_snapped_bbox(cls, v: list[float]) -> list[float]:
+        return _validate_positive_bbox(v, "snapped_bbox")
+
+    @field_validator("parent_bbox")
+    @classmethod
+    def _check_parent_bbox(cls, v: list[float]) -> list[float]:
+        return _validate_positive_bbox(v, "parent_bbox")
+
+
+class BlockSplitPreviewPart(BaseModel):
+    """Preview item for one resulting part of a candidate block split."""
+
+    role: BlockSplitRole
+    kind: BlockKind
+    will_protect: bool
+    bbox: list[float]
+    source_text: str
+    label_ja: str
+
+
+class BlockSplitPreviewResult(BaseModel):
+    """Server-verified candidate preview or rejection explanation before saving a BlockSplitSpec."""
+
+    valid: bool
+    document_id: str
+    page_index: int = Field(..., ge=0)
+    protection_revision: int = Field(default=0, ge=0)
+    parse_revision: int = Field(default=0, ge=0)
+    requested_bbox: list[float]
+    snapped_bbox: list[float] | None = None
+    equation_number_candidate_bbox: list[float] | None = None
+    equation_number_text: str | None = None
+    equation_number_auto_included: bool = False
+    parent_block_id: str | None = None
+    parent_bbox: list[float] | None = None
+    parent_source_hash: str | None = None
+    parent_signature: str | None = None
+    parts: list[BlockSplitPreviewPart] = Field(default_factory=list)
+    rejection_code: str | None = None
+    rejection_reason: str | None = None
+    retry_guidance: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+    will_invalidate_manual_edits: bool = False
+    affected_manual_block_ids: list[str] = Field(default_factory=list)
+    has_active_job: bool = False
+
+
 class Page(BaseModel):
     """Page metadata and coordinate box records (Section 8 & 15)."""
 
@@ -359,6 +490,7 @@ class Document(BaseModel):
     unsupported_reason: str | None = None
     protection_revision: int = Field(default=0, ge=0)
     edit_revision: int = Field(default=0, ge=0)
+    parse_revision: int = Field(default=0, ge=0)
     pages: list[Page] = Field(default_factory=list)
     created_at: str = Field(default_factory=utc_now_iso)
 
@@ -484,6 +616,8 @@ class Job(BaseModel):
     retypeset_revision: int = Field(default=0, ge=0)
     based_on_edit_revision: int = Field(default=0, ge=0)
     based_on_protection_revision: int = Field(default=0, ge=0)
+    outputs_stale: bool = False
+    outputs_stale_reason: str | None = None
     applied_block_revisions: dict[str, dict[str, Any]] = Field(default_factory=dict)
     execution_provenance: dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=utc_now_iso)

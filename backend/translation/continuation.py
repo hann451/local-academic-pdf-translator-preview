@@ -206,7 +206,14 @@ def _candidate_pairs(blocks: list[Block]) -> list[_CandidatePair]:
         left_tail = _boundary_blocks(page_blocks, column=1, first=False)
         right_head = _boundary_blocks(page_blocks, column=2, first=True)
         if left_tail is not None and right_head is not None:
-            if _is_body_paragraph(left_tail) and _is_body_paragraph(right_head):
+            same_split_barrier = bool(
+                left_tail.split_spec_id and left_tail.split_spec_id == right_head.split_spec_id
+            )
+            if (
+                not same_split_barrier
+                and _is_body_paragraph(left_tail)
+                and _is_body_paragraph(right_head)
+            ):
                 pairs.append(
                     _classify_pair(
                         left_tail,
@@ -243,9 +250,16 @@ def _candidate_pairs(blocks: list[Block]) -> list[_CandidatePair]:
             relation = "adjacent_pages_one_column"
             compare_indentation = True
 
+        same_split_barrier = bool(
+            previous is not None
+            and following is not None
+            and previous.split_spec_id
+            and previous.split_spec_id == following.split_spec_id
+        )
         if (
             previous is not None
             and following is not None
+            and not same_split_barrier
             and _is_body_paragraph(previous)
             and _is_body_paragraph(following)
         ):

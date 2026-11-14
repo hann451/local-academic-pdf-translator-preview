@@ -12,6 +12,9 @@ import type {
   ArtifactType,
   AuthSessionResponse,
   Block,
+  BlockSplitMutationResponse,
+  BlockSplitPreviewResult,
+  BlockSplitSpec,
   Document,
   ExportArtifact,
   Glossary,
@@ -292,6 +295,81 @@ export async function deleteProtectionRegion(
   return apiRequest<{ deleted: boolean }>(
     `/api/documents/${encodeURIComponent(documentId)}/protection-regions/${encodeURIComponent(
       regionId
+    )}`,
+    {
+      method: "DELETE",
+    }
+  );
+}
+
+// --- Drag Block Splitting (Formula / Prose Separation) ---
+export async function fetchBlockSplits(
+  documentId: string,
+  pageIndex?: number
+): Promise<BlockSplitSpec[]> {
+  const qs = pageIndex !== undefined ? `?page_index=${pageIndex}` : "";
+  return apiRequest<BlockSplitSpec[]>(
+    `/api/documents/${encodeURIComponent(documentId)}/block-splits${qs}`
+  );
+}
+
+export async function previewBlockSplit(
+  documentId: string,
+  payload: {
+    page_index: number;
+    requested_bbox: [number, number, number, number];
+    include_equation_number?: boolean;
+  }
+): Promise<BlockSplitPreviewResult> {
+  return apiRequest<BlockSplitPreviewResult>(
+    `/api/documents/${encodeURIComponent(documentId)}/block-splits/preview`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        page_index: payload.page_index,
+        requested_bbox: payload.requested_bbox,
+        include_equation_number: payload.include_equation_number ?? true,
+      }),
+    }
+  );
+}
+
+export async function createBlockSplit(
+  documentId: string,
+  payload: {
+    page_index: number;
+    requested_bbox: [number, number, number, number];
+    include_equation_number?: boolean;
+    note?: string | null;
+    expected_protection_revision?: number | null;
+    expected_parse_revision?: number | null;
+    expected_parent_signature?: string | null;
+  }
+): Promise<BlockSplitMutationResponse> {
+  return apiRequest<BlockSplitMutationResponse>(
+    `/api/documents/${encodeURIComponent(documentId)}/block-splits`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        page_index: payload.page_index,
+        requested_bbox: payload.requested_bbox,
+        include_equation_number: payload.include_equation_number ?? true,
+        note: payload.note ?? null,
+        expected_protection_revision: payload.expected_protection_revision ?? null,
+        expected_parse_revision: payload.expected_parse_revision ?? null,
+        expected_parent_signature: payload.expected_parent_signature ?? null,
+      }),
+    }
+  );
+}
+
+export async function deleteBlockSplit(
+  documentId: string,
+  splitId: string
+): Promise<BlockSplitMutationResponse> {
+  return apiRequest<BlockSplitMutationResponse>(
+    `/api/documents/${encodeURIComponent(documentId)}/block-splits/${encodeURIComponent(
+      splitId
     )}`,
     {
       method: "DELETE",

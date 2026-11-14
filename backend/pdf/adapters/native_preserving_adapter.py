@@ -32,6 +32,9 @@ from backend.config import AppConfig
 from backend.domain.models import (
     Block,
     BlockKind,
+    BlockSplitPreviewResult,
+    BlockSplitRole,
+    BlockSplitSpec,
     BlockStatus,
     Document,
     InlineMathSpan,
@@ -42,9 +45,16 @@ from backend.domain.models import (
     ProtectionRegion,
     TranslationJobConfig,
     ValidationIssue,
+    compute_source_text_hash,
 )
 from backend.pdf.adapters.base import PdfEngineAdapter
 from backend.pdf.coordinates import bbox_intersection_ratio, bbox_iou
+from backend.pdf.splitting import (
+    SplitExecutionOutcome,
+    build_raw_page_candidates,
+    evaluate_drag_split_candidate,
+    match_split_specs_to_page_candidates,
+)
 from backend.pdf.validation.preflight import verify_original_unchanged
 from backend.pdf.validation.visual_diff import (
     PageVisualComparisonReport,
@@ -1162,17 +1172,129 @@ class NativePreservingAdapter(PdfEngineAdapter):
     # ------------------------------------------------------------------
     # Stages 4 - 7: Parsing, Reading Order, Protection, Inline Masking
     # ------------------------------------------------------------------
+    def _build_text_block_from_lines(
+        self,
+        *,
+        block_id: str,
+        page_index: int,
+        bbox: list[float],
+        lines: list[dict],
+        drawings: list[dict],
+        page_w: float,
+        page_h: float,
+        body_font_size: float,
+        frontmatter_end_y: float,
+        drawing_boxes: list[list[float]],
+        in_references_section: bool,
+        page_manual: list[ProtectionRegion],
+        cfg: TranslationJobConfig,
+        spatial_fraction_equation: bool = False,
+        split_spec_id: str | None = None,
+        split_role: BlockSplitRole | None = None,
+        parent_block_id: str | None = None,
+        parent_bbox: list[float] | None = None,
+        parent_source_hash: str | None = None,
+    ) -> tuple[Block | None, bool]:
+        if not lines:
+            return None, in_references_section
+
+        text_lines, avg_font_size, has_math_font, has_sub_super = (
+            self._extract_lines_and_style(lines)
+        )
+        full_text = " ".join(t.strip() for t in text_lines if t.strip()).strip()
+        if not full_text:
+            return None, in_references_section
+
+        (
+            kind,
+            semantic_cat,
+            prot_reason,
+            prot_rule_id,
+            prot_conf,
+            is_uncertain,
+            in_references_section,
+        ) = self._classify_academic_block(
+            text=full_text,
+            line_count=len(text_lines),
+            p_idx=page_index,
+            bbox=bbox,
+            page_w=page_w,
+            page_h=page_h,
+            avg_font_size=avg_font_size,
+            body_font_size=body_font_size,
+            frontmatter_end_y=frontmatter_end_y,
+            has_math_font=has_math_font,
+            has_sub_super=has_sub_super,
+            drawing_boxes=drawing_boxes,
+            in_references_section=in_references_section,
+        )
+        if spatial_fraction_equation and split_role is None:
+            kind = BlockKind.ISOLATED_FORMULA
+            semantic_cat = "formula"
+            prot_reason = "自動：分数線・上下テキスト・式番号の幾何構造"
+            prot_rule_id = "RULE_SPATIAL_FRACTION_EQUATION"
+            prot_conf = "high"
+            is_uncertain = False
+
+        if split_role == "formula":
+            kind = BlockKind.ISOLATED_FORMULA
+            semantic_cat = "formula"
+            prot_reason = "手動分割：独立数式として原文保護"
+            prot_rule_id = "RULE_MANUAL_DRAG_SPLIT_FORMULA"
+            prot_conf = "high"
+            is_uncertain = False
+        elif split_role in ("top", "bottom") and (
+            kind == BlockKind.ISOLATED_FORMULA or is_uncertain
+        ):
+            # User explicitly split the display equation out; keep remaining prose translatable
+            kind = BlockKind.PARAGRAPH
+            semantic_cat = "body"
+            prot_reason = None
+            prot_rule_id = None
+            prot_conf = "high"
+            is_uncertain = False
+
+        inline_spans = extract_inline_math_spans(lines, drawings)
+        blk = Block(
+            id=block_id,
+            page_index=page_index,
+            bbox=[round(float(x), 2) for x in bbox],
+            kind=kind,
+            source_text=full_text,
+            source_text_hash=compute_source_text_hash(full_text),
+            inline_math_spans=inline_spans,
+            font_size_pt=round(avg_font_size, 2),
+            is_uncertain_region=is_uncertain,
+            semantic_category=semantic_cat,
+            protection_reason=prot_reason,
+            protection_rule_id=prot_rule_id,
+            protection_confidence=prot_conf,
+            split_spec_id=split_spec_id,
+            split_role=split_role,
+            parent_block_id=parent_block_id,
+            parent_bbox=list(parent_bbox) if parent_bbox else None,
+            parent_source_hash=parent_source_hash,
+        )
+        self._apply_protection_and_masking(blk, page_manual, cfg)
+        return blk, in_references_section
+
     def parse_and_extract_blocks(
         self,
         document: Document,
         page_indices: list[int],
         manual_regions: list[ProtectionRegion] | None = None,
         job_config: TranslationJobConfig | None = None,
+        split_specs: list[BlockSplitSpec] | None = None,
+        updated_split_specs_out: list[BlockSplitSpec] | None = None,
     ) -> list[Block]:
         cfg = job_config or TranslationJobConfig()
         manual_by_page: dict[int, list[ProtectionRegion]] = {}
         for reg in manual_regions or []:
             manual_by_page.setdefault(reg.page_index, []).append(reg)
+
+        splits_by_page: dict[int, list[BlockSplitSpec]] = {}
+        for sp in split_specs or []:
+            splits_by_page.setdefault(sp.page_index, []).append(sp)
 
         mupdf_doc = pymupdf.open(document.safe_storage_path)
         all_blocks: list[Block] = []
@@ -1188,6 +1310,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 page_w = float(mpage.cropbox.width)
                 page_h = float(mpage.cropbox.height)
                 page_manual = manual_by_page.get(p_idx, [])
+                page_splits = splits_by_page.get(p_idx, [])
 
                 raw_dict = mpage.get_text("dict")
                 raw_blocks = self._preprocess_page_raw_blocks(
@@ -1199,7 +1322,6 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 raw_blocks = self._group_spatial_fraction_equations(raw_blocks, drawings)
 
                 page_candidates: list[Block] = []
-                block_seq = 0
 
                 frontmatter_end_y = (
                     self._find_page1_frontmatter_boundary_y(raw_blocks, page_h, body_font_size)
@@ -1209,38 +1331,56 @@ class NativePreservingAdapter(PdfEngineAdapter):
 
                 # Extract vector drawing clusters as figure/table protection candidates
                 drawing_boxes = self._cluster_vector_drawings(drawings, page_w, page_h)
-                for d_box in drawing_boxes:
-                    block_seq += 1
-                    d_blk = Block(
-                        id=f"{document.id}:page-{p_idx + 1}:block-{block_seq}",
-                        page_index=p_idx,
-                        bbox=d_box,
-                        kind=BlockKind.FIGURE,
-                        source_text="[Vector Figure / Diagram]",
-                        masked_source_text="[Vector Figure / Diagram]",
-                        status=BlockStatus.PROTECTED_SKIP,
-                        protection_source="auto",
-                        semantic_category="figure",
-                        protection_reason="自動：図・ベクター要素",
-                        protection_rule_id="RULE_FIGURE_VECTOR",
-                        protection_confidence="high",
-                    )
-                    self._apply_protection_and_masking(d_blk, page_manual, cfg)
-                    page_candidates.append(d_blk)
+                raw_candidates = build_raw_page_candidates(
+                    document_id=document.id,
+                    page_index=p_idx,
+                    drawing_boxes=drawing_boxes,
+                    raw_blocks=raw_blocks,
+                    drawings=drawings,
+                    body_font_size=body_font_size,
+                    extract_text_fn=self._extract_lines_and_style,
+                )
 
-                for b_item in raw_blocks:
-                    b_type = b_item.get("type", 0)
-                    bbox = [round(float(x), 2) for x in b_item.get("bbox", [0, 0, 0, 0])]
-                    if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+                matched_splits: dict[str, tuple[BlockSplitSpec, SplitExecutionOutcome]] = {}
+                consumed_eq_ids: set[str] = set()
+                if page_splits:
+                    matched_splits, consumed_eq_ids, updated_specs = match_split_specs_to_page_candidates(
+                        document_id=document.id,
+                        page_index=p_idx,
+                        page_w=page_w,
+                        candidates=raw_candidates,
+                        page_specs=page_splits,
+                        drawings=drawings,
+                        extract_text_fn=self._extract_lines_and_style,
+                    )
+                    if updated_split_specs_out is not None:
+                        updated_split_specs_out.extend(updated_specs)
+
+                for cand in raw_candidates:
+                    if cand.item_type == "vector_drawing":
+                        d_blk = Block(
+                            id=cand.base_block_id,
+                            page_index=p_idx,
+                            bbox=list(cand.bbox),
+                            kind=BlockKind.FIGURE,
+                            source_text="[Vector Figure / Diagram]",
+                            masked_source_text="[Vector Figure / Diagram]",
+                            status=BlockStatus.PROTECTED_SKIP,
+                            protection_source="auto",
+                            semantic_category="figure",
+                            protection_reason="自動：図・ベクター要素",
+                            protection_rule_id="RULE_FIGURE_VECTOR",
+                            protection_confidence="high",
+                        )
+                        self._apply_protection_and_masking(d_blk, page_manual, cfg)
+                        page_candidates.append(d_blk)
                         continue
 
-                    if b_type == 1:
-                        # Raster image block -> protect as figure
-                        block_seq += 1
+                    if cand.item_type == "raster_image":
                         img_blk = Block(
-                            id=f"{document.id}:page-{p_idx + 1}:block-{block_seq}",
+                            id=cand.base_block_id,
                             page_index=p_idx,
-                            bbox=bbox,
+                            bbox=list(cand.bbox),
                             kind=BlockKind.FIGURE,
                             source_text="[Raster Image]",
                             masked_source_text="[Raster Image]",
@@ -1255,69 +1395,76 @@ class NativePreservingAdapter(PdfEngineAdapter):
                         page_candidates.append(img_blk)
                         continue
 
+                    if cand.base_block_id in consumed_eq_ids:
+                        continue
+
+                    split_entry = matched_splits.get(cand.base_block_id)
+                    if split_entry is not None:
+                        spec, outcome = split_entry
+                        child_specs: list[tuple[BlockSplitRole, list[float] | None, list[dict]]] = [
+                            (
+                                "top",
+                                outcome.top_bbox,
+                                outcome.top_lines,
+                            ),
+                            (
+                                "formula",
+                                outcome.formula_bbox,
+                                outcome.formula_lines,
+                            ),
+                            (
+                                "bottom",
+                                outcome.bottom_bbox,
+                                outcome.bottom_lines,
+                            ),
+                        ]
+                        for c_role, c_bbox, c_lines in child_specs:
+                            if not c_lines or c_bbox is None:
+                                continue
+                            child_blk, in_references_section = self._build_text_block_from_lines(
+                                block_id=f"{cand.base_block_id}:split-{spec.id}:{c_role}",
+                                page_index=p_idx,
+                                bbox=c_bbox,
+                                lines=c_lines,
+                                drawings=drawings,
+                                page_w=page_w,
+                                page_h=page_h,
+                                body_font_size=body_font_size,
+                                frontmatter_end_y=frontmatter_end_y,
+                                drawing_boxes=drawing_boxes,
+                                in_references_section=in_references_section,
+                                page_manual=page_manual,
+                                cfg=cfg,
+                                split_spec_id=spec.id,
+                                split_role=c_role,
+                                parent_block_id=cand.base_block_id,
+                                parent_bbox=cand.bbox,
+                                parent_source_hash=cand.source_text_hash,
+                            )
+                            if child_blk is not None:
+                                page_candidates.append(child_blk)
+                        continue
+
+                    b_item = cand.raw_item or {}
                     lines = b_item.get("lines", [])
-                    if not lines:
-                        continue
-
-                    text_lines, avg_font_size, has_math_font, has_sub_super = (
-                        self._extract_lines_and_style(lines)
-                    )
-                    full_text = " ".join(t.strip() for t in text_lines if t.strip()).strip()
-                    if not full_text:
-                        continue
-
-                    # Stage 4: Classify block kind & academic semantic category
-                    (
-                        kind,
-                        semantic_cat,
-                        prot_reason,
-                        prot_rule_id,
-                        prot_conf,
-                        is_uncertain,
-                        in_references_section,
-                    ) = self._classify_academic_block(
-                        text=full_text,
-                        line_count=len(text_lines),
-                        p_idx=p_idx,
-                        bbox=bbox,
+                    blk, in_references_section = self._build_text_block_from_lines(
+                        block_id=cand.base_block_id,
+                        page_index=p_idx,
+                        bbox=cand.bbox,
+                        lines=lines,
+                        drawings=drawings,
                         page_w=page_w,
                         page_h=page_h,
-                        avg_font_size=avg_font_size,
                         body_font_size=body_font_size,
                         frontmatter_end_y=frontmatter_end_y,
-                        has_math_font=has_math_font,
-                        has_sub_super=has_sub_super,
                         drawing_boxes=drawing_boxes,
                         in_references_section=in_references_section,
+                        page_manual=page_manual,
+                        cfg=cfg,
+                        spatial_fraction_equation=bool(b_item.get("_spatial_fraction_equation")),
                     )
-                    if b_item.get("_spatial_fraction_equation"):
-                        kind = BlockKind.ISOLATED_FORMULA
-                        semantic_cat = "formula"
-                        prot_reason = "自動：分数線・上下テキスト・式番号の幾何構造"
-                        prot_rule_id = "RULE_SPATIAL_FRACTION_EQUATION"
-                        prot_conf = "high"
-                        is_uncertain = False
-
-                    block_seq += 1
-                    inline_spans = extract_inline_math_spans(lines, drawings)
-                    blk = Block(
-                        id=f"{document.id}:page-{p_idx + 1}:block-{block_seq}",
-                        page_index=p_idx,
-                        bbox=bbox,
-                        kind=kind,
-                        source_text=full_text,
-                        inline_math_spans=inline_spans,
-                        font_size_pt=round(avg_font_size, 2),
-                        is_uncertain_region=is_uncertain,
-                        semantic_category=semantic_cat,
-                        protection_reason=prot_reason,
-                        protection_rule_id=prot_rule_id,
-                        protection_confidence=prot_conf,
-                    )
-
-                    # Stage 6: Apply protection rules & manual region overrides
-                    self._apply_protection_and_masking(blk, page_manual, cfg)
-                    page_candidates.append(blk)
+                    if blk is not None:
+                        page_candidates.append(blk)
 
                 # Reclassify vector drawing boxes and internal cells adjacent to Table captions as TABLE
                 table_captions = [
@@ -1366,6 +1513,70 @@ class NativePreservingAdapter(PdfEngineAdapter):
 
             attach_continuation_candidates(all_blocks)
             return all_blocks
+        finally:
+            mupdf_doc.close()
+
+    def preview_block_split(
+        self,
+        document: Document,
+        page_index: int,
+        drag_bbox: list[float],
+        *,
+        existing_splits: list[BlockSplitSpec] | None = None,
+        include_equation_number: bool = True,
+        manual_edit_block_ids: set[str] | None = None,
+    ) -> BlockSplitPreviewResult:
+        """Compute live drag-split snapping/rejection preview from immutable original PDF."""
+        mupdf_doc = pymupdf.open(document.safe_storage_path)
+        try:
+            if page_index < 0 or page_index >= len(mupdf_doc):
+                return BlockSplitPreviewResult(
+                    valid=False,
+                    document_id=document.id,
+                    page_index=page_index,
+                    requested_bbox=list(drag_bbox),
+                    rejection_code="INVALID_PAGE",
+                    rejection_reason=f"ページ番号 {page_index + 1} は範囲外です。",
+                    retry_guidance="有効なページ内で数式範囲をドラッグしてください。",
+                )
+            body_font_size = self._estimate_document_body_font_size(
+                mupdf_doc, list(range(len(mupdf_doc)))
+            )
+            mpage = mupdf_doc[page_index]
+            page_w = float(mpage.cropbox.width)
+            page_h = float(mpage.cropbox.height)
+            raw_dict = mpage.get_text("dict")
+            raw_blocks = self._preprocess_page_raw_blocks(
+                raw_dict.get("blocks", []),
+                p_idx=page_index,
+                page_w=page_w,
+            )
+            drawings = mpage.get_drawings()
+            raw_blocks = self._group_spatial_fraction_equations(raw_blocks, drawings)
+            drawing_boxes = self._cluster_vector_drawings(drawings, page_w, page_h)
+            candidates = build_raw_page_candidates(
+                document_id=document.id,
+                page_index=page_index,
+                drawing_boxes=drawing_boxes,
+                raw_blocks=raw_blocks,
+                drawings=drawings,
+                body_font_size=body_font_size,
+                extract_text_fn=self._extract_lines_and_style,
+            )
+            page_splits = [s for s in (existing_splits or []) if s.page_index == page_index]
+            preview, _ = evaluate_drag_split_candidate(
+                document_id=document.id,
+                page_index=page_index,
+                page_w=page_w,
+                candidates=candidates,
+                drag_bbox=drag_bbox,
+                existing_splits=page_splits,
+                drawings=drawings,
+                extract_text_fn=self._extract_lines_and_style,
+                include_equation_number=include_equation_number,
+                manual_edit_block_ids=manual_edit_block_ids,
+            )
+            return preview
         finally:
             mupdf_doc.close()
 
@@ -2245,6 +2456,20 @@ class NativePreservingAdapter(PdfEngineAdapter):
         page_manual_regions: list[ProtectionRegion],
         cfg: TranslationJobConfig,
     ) -> None:
+        # -1. Split formula child blocks stay strictly protected regardless of force_translate or TRANSLATE_AS_BODY
+        if block.split_role == "formula":
+            block.kind = BlockKind.ISOLATED_FORMULA
+            block.semantic_category = "formula"
+            block.status = BlockStatus.PROTECTED_SKIP
+            block.protection_source = "manual"
+            block.protection_reason = "手動分割：独立数式として原文保護"
+            block.protection_rule_id = "RULE_MANUAL_DRAG_SPLIT_FORMULA"
+            block.protection_confidence = "high"
+            block.masked_source_text = block.source_text
+            block.translation_provenance = "protected_skip"
+            block.user_protection_override = None
+            return
+
         # 0. Explicit block-level user override (`force_translate` or `force_protect`) takes top precedence
         if block.user_protection_override == "force_protect":
             block.status = BlockStatus.PROTECTED_SKIP
@@ -2744,7 +2969,12 @@ class NativePreservingAdapter(PdfEngineAdapter):
                         )
                         continue
 
-                    # Fit Japanese lines within bbox respecting min_font_size_pt (Section 12)
+                    # Fit Japanese lines within bbox respecting min_font_size_pt (Section 12).
+                    # For split siblings adjacent to a protected formula seam, shift line 1 baseline
+                    # down slightly (accounting for CJK ascender ~1.14em) and tighten vertical slack
+                    # so rendered glyph boxes never protrude across the seam into protected math.
+                    first_baseline_em = 1.20 if blk.split_role == "bottom" else 0.95
+                    vertical_slack_em = 0.15 if blk.split_role == "top" else 0.45
                     fitted_size, wrapped_lines, fits = fit_japanese_text_in_bbox(
                         text=render_ready_text,
                         bbox=blk.bbox,
@@ -2753,6 +2983,8 @@ class NativePreservingAdapter(PdfEngineAdapter):
                         ja_font=ja_font_obj,
                         math_font=math_font_obj,
                         inline_math_spans=active_math_spans,
+                        first_baseline_em=first_baseline_em,
+                        vertical_slack_em=vertical_slack_em,
                     )
                     if not fits:
                         # Section 12: Never shrink below min_font_size_pt, never delete text,
@@ -2882,7 +3114,8 @@ class NativePreservingAdapter(PdfEngineAdapter):
 
                     for blk, fitted_size, wrapped_lines, active_math_spans in approved_typeset_items:
                         line_height = fitted_size * 1.32
-                        cursor_y = blk.bbox[1] + fitted_size * 0.95
+                        first_baseline_em = 1.20 if blk.split_role == "bottom" else 0.95
+                        cursor_y = blk.bbox[1] + fitted_size * first_baseline_em
                         base_x = float(blk.bbox[0])
                         for line_str in wrapped_lines:
                             styled_runs, overbars, _, _, _ = _build_styled_line_plan(
@@ -3337,6 +3570,8 @@ def fit_japanese_text_in_bbox(
     ja_font: pymupdf.Font | None = None,
     math_font: pymupdf.Font | None = None,
     inline_math_spans: list[InlineMathSpan] | None = None,
+    first_baseline_em: float = 0.95,
+    vertical_slack_em: float = 0.45,
 ) -> tuple[float, list[str], bool]:
     """Find the largest font size in `[min_font_size, initial_font_size]` (step 0.5pt)
     such that the wrapped text (including any superscript/hat/radical top ascent,
@@ -3383,8 +3618,8 @@ def fit_japanese_text_in_bbox(
             )
             if last_bot_em > 0.25:
                 extra_bottom = (last_bot_em - 0.22) * sz
-        required_h = len(lines) * line_h + extra_bottom
-        vertical_fits = required_h <= box_h + sz * 0.45
+        required_h = max(0.0, first_baseline_em - 0.95) * sz + len(lines) * line_h + extra_bottom
+        vertical_fits = required_h <= box_h + sz * vertical_slack_em
         horizontal_fits = all(
             _measure_rendered_line_width(
                 line_str=line,

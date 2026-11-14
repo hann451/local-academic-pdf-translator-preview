@@ -229,7 +229,7 @@ describe("Full Application E2E Workflow (Screen 1 -> Screen 2 -> Screen 3 -> Scr
         );
       }
 
-      if (url.includes("/protection-regions")) {
+      if (url.includes("/protection-regions") || url.includes("/block-splits")) {
         return new Response(JSON.stringify([]), {
           status: 200,
           headers: { "Content-Type": "application/json" },
