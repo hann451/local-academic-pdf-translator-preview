@@ -670,6 +670,29 @@ def extract_inline_math_spans(
     return spans_out
 
 
+def _is_math_ident_continuation_char(ch: str) -> bool:
+    """Return True if `ch` can continue a Latin/Greek/numeric math token.
+
+    Used by `_build_styled_line_plan()` trailing boundary checks so that
+    ASCII/math/Greek alphanumerics (e.g., `20`, `abc`, `𝑙𝑠`, `β`) suppress
+    partial `InlineMathSpan` suffix matches, whereas directly following
+    Japanese particles or words (e.g., `は`, `の`, `および`, `個`) do not.
+    """
+    if not ch or not ch.isalnum():
+        return False
+    if ch.isascii():
+        return True
+    cp = ord(ch)
+    return (
+        cp in (0x00B2, 0x00B3, 0x00B9)
+        or (0x00C0 <= cp <= 0x024F)
+        or (0x0370 <= cp <= 0x03FF)
+        or (0x2070 <= cp <= 0x209F)
+        or (0x2100 <= cp <= 0x214F)
+        or (0x1D400 <= cp <= 0x1D7FF)
+    )
+
+
 def _build_styled_line_plan(
     line_str: str,
     font_size_pt: float,
@@ -738,8 +761,8 @@ def _build_styled_line_plan(
                         continue
                     if (
                         t1 < n
-                        and line_str[t1 - 1].isalnum()
-                        and line_str[t1].isalnum()
+                        and _is_math_ident_continuation_char(line_str[t1 - 1])
+                        and _is_math_ident_continuation_char(line_str[t1])
                         and char_role[t1] == "normal"
                     ):
                         continue
@@ -3309,8 +3332,12 @@ def fit_japanese_text_in_bbox(
     inside `bbox` width and height.
     Returns `(fitted_font_size, lines, fits_in_box)`.
     """
-    box_w = max(10.0, bbox[2] - bbox[0])
-    box_h = max(8.0, bbox[3] - bbox[1])
+    raw_w = float(bbox[2]) - float(bbox[0])
+    raw_h = float(bbox[3]) - float(bbox[1])
+    if raw_w <= 0.0 or raw_h <= 0.0:
+        return round(min_font_size, 2), [], False
+    box_w = raw_w
+    box_h = raw_h
     start_sz = max(min_font_size, initial_font_size)
 
     candidate_sizes: list[float] = []

@@ -2102,3 +2102,371 @@ def test_review_item5_overbar_whiteout_preserves_adjacent_protected_objects(tmp_
 
     assert "PROTECTED KEEP" in prot_txt
     assert has_dark_pixel, "Overbar whiteout painted white over protected graphic inside protected bbox"
+
+
+def test_fix_a_japanese_following_subscript_and_superscript_not_suppressed(tmp_path: Path) -> None:
+    """Issue A: Directly following Japanese particles/words must NOT suppress inline math
+    subscripts, superscripts, or hats, while partial matches before ASCII/math/Greek
+    alphanumerics remain suppressed, and manual-edit/ambiguous fallback remain intact.
+    """
+    cfg = AppConfig(runtime_dir=tmp_path / "rt")
+    ja_font = pymupdf.Font(fontfile=str(cfg.font_serif_path)) if cfg.font_serif_path else None
+    math_font = pymupdf.Font(fontfile=str(cfg.font_math_path)) if cfg.font_math_path else None
+
+    def _plan_roles(line_str: str, spans: list[InlineMathSpan], font_size: float = 10.0):
+        runs, _, _, _, _ = _build_styled_line_plan(
+            line_str,
+            font_size,
+            "F_JA",
+            ja_font,
+            "F_MATH",
+            math_font,
+            spans,
+        )
+        return [(text, round(run_sz, 3), round(dy_pt, 3)) for _, _, text, _, dy_pt, run_sz in runs]
+
+    # 1. Exact 5 DensePose subscript cases + superscript + Japanese + punctuation/space/newline
+    p5_p7_spans = [
+        InlineMathSpan(context_text="𝐿𝑡𝑟", target_text="𝑡𝑟", role="sub", scale=0.78, dy_em=0.18),
+        InlineMathSpan(context_text="𝐿𝑐𝑙𝑠", target_text="𝑐𝑙𝑠", role="sub", scale=0.78, dy_em=0.18),
+        InlineMathSpan(context_text="𝐿𝑏𝑜𝑥", target_text="𝑏𝑜𝑥", role="sub", scale=0.78, dy_em=0.18),
+        InlineMathSpan(context_text="𝑃𝑗", target_text="𝑗", role="sub", scale=0.78, dy_em=0.18),
+        InlineMathSpan(context_text="𝑖𝑝", target_text="𝑝", role="sub", scale=0.78, dy_em=0.18),
+        InlineMathSpan(context_text="ˆ𝑖", target_text="ˆ", role="hat", scale=1.0, dy_em=-0.23),
+        InlineMathSpan(context_text="𝑎2", target_text="2", role="super", scale=0.78, dy_em=-0.30),
+        InlineMathSpan(context_text="𝑥𝑛", target_text="𝑛", role="super", scale=0.78, dy_em=-0.30),
+    ]
+
+    for line, expected_sub in [
+        ("𝐿𝑡𝑟は小さい", "𝑡𝑟"),
+        ("分類損失𝐿𝑐𝑙𝑠および重み", "𝑐𝑙𝑠"),
+        ("𝑃𝑗は座標を表す", "𝑗"),
+        ("𝑖𝑝および点対", "𝑝"),
+        ("𝐿𝑐𝑙𝑠、次項", "𝑐𝑙𝑠"),
+        ("𝑃𝑗 次の値", "𝑗"),
+        ("𝐿𝑏𝑜𝑥\n改行後", "𝑏𝑜𝑥"),
+    ]:
+        runs = _plan_roles(line, p5_p7_spans)
+        sub_runs = [r for r in runs if r[0] == expected_sub and r[1] == 7.8 and r[2] == 1.8]
+        assert sub_runs, f"Expected subscript run {expected_sub!r} in {line!r}, got {runs}"
+
+    hat_sub_runs = _plan_roles("ˆ𝑖𝑝は指数", p5_p7_spans)
+    assert ("ˆ", 10.0, -2.3) in hat_sub_runs, f"Expected raised hat in {hat_sub_runs}"
+    assert ("𝑝", 7.8, 1.8) in hat_sub_runs, f"Expected lowered subscript '𝑝' in {hat_sub_runs}"
+
+    for line, expected_sup in [("𝑎2は正", "2"), ("𝑥𝑛である", "𝑛")]:
+        runs = _plan_roles(line, p5_p7_spans)
+        assert (expected_sup, 7.8, -3.0) in runs, f"Expected superscript {expected_sup!r} in {runs}"
+
+    # 2. Partial-match rejection before ASCII, math alphanumerics, and Greek continuation
+    partial_cases = [
+        ("𝑎20 は正", [InlineMathSpan(context_text="𝑎2", target_text="2", role="super", scale=0.78, dy_em=-0.30)], 7.8),
+        ("𝑥abc は変数", [InlineMathSpan(context_text="𝑥ab", target_text="ab", role="sub", scale=0.78, dy_em=0.18)], 7.8),
+        ("𝐿𝑐𝑙𝑠 は損失", [InlineMathSpan(context_text="𝐿𝑐", target_text="𝑐", role="sub", scale=0.78, dy_em=0.18)], 7.8),
+        ("Φαβは角度", [InlineMathSpan(context_text="Φα", target_text="α", role="sub", scale=0.78, dy_em=0.18)], 7.8),
+    ]
+    for line, spans, forbidden_sz in partial_cases:
+        runs = _plan_roles(line, spans)
+        assert all(r[1] != forbidden_sz and r[2] == 0.0 for r in runs), (
+            f"False partial math styling triggered for {line!r}: {runs}"
+        )
+
+    # 3. Repeated identical formula in one string with differing trailing characters
+    repeated_spans = [
+        InlineMathSpan(context_text="𝐿𝑐𝑙𝑠", target_text="𝑐𝑙𝑠", role="sub", scale=0.78, dy_em=0.18),
+    ]
+    repeated_line = "損失 𝐿𝑐𝑙𝑠は重要で、𝐿𝑐𝑙𝑠および次の𝐿𝑐𝑙𝑠。ただし 𝐿𝑐𝑙𝑠abc は部分一致しない。"
+    rep_runs = _plan_roles(repeated_line, repeated_spans)
+    styled_cls = [r for r in rep_runs if r[0] == "𝑐𝑙𝑠" and r[1] == 7.8 and r[2] == 1.8]
+    normal_cls_runs = [r for r in rep_runs if "𝑐𝑙𝑠" in r[0] and r[1] == 10.0 and r[2] == 0.0]
+    assert len(styled_cls) == 3, f"Expected 3 styled 𝑐𝑙𝑠 runs (は/および/。), got {rep_runs}"
+    assert len(normal_cls_runs) == 1, f"Expected 4th 𝑐𝑙𝑠 before abc to remain unstyled, got {rep_runs}"
+
+    # 4. End-to-end PDF span size and baseline verification across Mono and Dual outputs
+    # Includes TRANSLATED block, MANUALLY_EDITED block, and AMBIGUOUS_INLINE_MATH_FALLBACK block
+    pdf_path = tmp_path / "fix_a_e2e.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=520, height=340)
+    page.insert_text(
+        pymupdf.Point(40, 72),
+        "Loss L_tr and L_cls, P_j, i_p, hat i_p, a^2, x^n.",
+        fontsize=9.0,
+    )
+    page.insert_text(pymupdf.Point(40, 172), "Manual check P_j here.", fontsize=9.0)
+    page.insert_text(pymupdf.Point(40, 222), "Ambiguous x^2 and x_2 term.", fontsize=9.0)
+    doc.save(str(pdf_path))
+    doc.close()
+
+    doc_model = Document(
+        id="doc-fix-a",
+        original_filename="fix_a_e2e.pdf",
+        safe_storage_path=str(pdf_path),
+        sha256_hash=compute_sha256(pdf_path),
+        file_size_bytes=pdf_path.stat().st_size,
+        page_count=1,
+    )
+    blk_trans = Block(
+        id="doc-fix-a:page-1:block-1",
+        page_index=0,
+        bbox=[38.0, 58.0, 480.0, 145.0],
+        kind=BlockKind.PARAGRAPH,
+        reading_order=1,
+        source_text="Loss L_tr and L_cls, P_j, i_p, hat i_p, a^2, x^n.",
+        inline_math_spans=p5_p7_spans,
+        translation_text="損失𝐿𝑡𝑟は小さく、分類損失𝐿𝑐𝑙𝑠および𝑃𝑗は安定し、𝑖𝑝およびˆ𝑖𝑝は項𝑎2は正、𝑥𝑛である。",
+        status=BlockStatus.TRANSLATED,
+        font_size_pt=9.0,
+    )
+    blk_manual = Block(
+        id="doc-fix-a:page-1:block-2",
+        page_index=0,
+        bbox=[38.0, 158.0, 400.0, 195.0],
+        kind=BlockKind.PARAGRAPH,
+        reading_order=2,
+        source_text="Manual check 𝑃𝑗 here.",
+        inline_math_spans=[
+            InlineMathSpan(context_text="𝑃𝑗", target_text="𝑗", role="sub", scale=0.78, dy_em=0.18),
+        ],
+        translation_text="自動訳𝑃𝑗。",
+        manual_translation_text="手動確認：𝑃𝑗は維持する。",
+        status=BlockStatus.MANUALLY_EDITED,
+        font_size_pt=9.0,
+    )
+    blk_ambig = Block(
+        id="doc-fix-a:page-1:block-3",
+        page_index=0,
+        bbox=[38.0, 208.0, 400.0, 245.0],
+        kind=BlockKind.PARAGRAPH,
+        reading_order=3,
+        source_text="Ambiguous x^2 and x_2 term.",
+        inline_math_spans=[
+            InlineMathSpan(context_text="x2", target_text="2", role="super", scale=0.78, dy_em=-0.30, ambiguous=True),
+            InlineMathSpan(context_text="x2", target_text="2", role="sub", scale=0.78, dy_em=0.18, ambiguous=True),
+        ],
+        translation_text="曖昧な x2 と x2 の項。",
+        status=BlockStatus.TRANSLATED,
+        font_size_pt=9.0,
+    )
+
+    mono_out = tmp_path / "fix_a_mono.pdf"
+    dual_out = tmp_path / "fix_a_dual.pdf"
+    adapter = NativePreservingAdapter(config=cfg)
+    updated, _ = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=[blk_trans, blk_manual, blk_ambig],
+        page_indices=[0],
+        job_config=TranslationJobConfig(),
+        mono_output_path=mono_out,
+        dual_output_path=dual_out,
+        job_id="job-fix-a",
+    )
+    by_id = {b.id: b for b in updated}
+    assert by_id["doc-fix-a:page-1:block-1"].status == BlockStatus.TRANSLATED
+    assert by_id["doc-fix-a:page-1:block-2"].status == BlockStatus.MANUALLY_EDITED
+    assert by_id["doc-fix-a:page-1:block-3"].status == BlockStatus.FALLBACK_ORIGINAL
+    assert "AMBIGUOUS_INLINE_MATH_FALLBACK" in by_id["doc-fix-a:page-1:block-3"].warnings
+
+    for out_path, x_off in [(mono_out, 0.0), (dual_out, 520.0)]:
+        out_doc = pymupdf.open(str(out_path))
+        trans_clip = pymupdf.Rect(
+            blk_trans.bbox[0] + x_off,
+            blk_trans.bbox[1],
+            blk_trans.bbox[2] + x_off,
+            blk_trans.bbox[3],
+        )
+        manual_clip = pymupdf.Rect(
+            blk_manual.bbox[0] + x_off,
+            blk_manual.bbox[1],
+            blk_manual.bbox[2] + x_off,
+            blk_manual.bbox[3],
+        )
+        page_dict = out_doc[0].get_text("dict", clip=trans_clip)
+        manual_dict = out_doc[0].get_text("dict", clip=manual_clip)
+        out_doc.close()
+
+        spans = [
+            sp
+            for blk in page_dict["blocks"]
+            for ln in blk.get("lines", [])
+            for sp in ln.get("spans", [])
+            if sp["text"].strip()
+        ]
+        base_spans = [sp for sp in spans if "小さく" in sp["text"] or "損失" in sp["text"]]
+        assert base_spans, f"Missing base Japanese span in {out_path.name}: {spans}"
+        base_sz = base_spans[0]["size"]
+        base_y = base_spans[0]["origin"][1]
+
+        for expected_sub in ["𝑡𝑟", "𝑐𝑙𝑠", "𝑗"]:
+            hits = [sp for sp in spans if sp["text"] == expected_sub]
+            assert hits, f"Expected dedicated subscript span {expected_sub!r} in {out_path.name}: {spans}"
+            assert hits[0]["size"] < base_sz * 0.85
+            assert hits[0]["origin"][1] > base_y + base_sz * 0.10
+
+        p_hits = [sp for sp in spans if sp["text"] == "𝑝"]
+        assert len(p_hits) >= 2, f"Expected two subscript '𝑝' spans (𝑖𝑝および + ˆ𝑖𝑝は) in {out_path.name}: {spans}"
+        for ph in p_hits[:2]:
+            assert ph["size"] < base_sz * 0.85
+            assert ph["origin"][1] > base_y + base_sz * 0.10
+
+        hat_hits = [sp for sp in spans if sp["text"] == "ˆ"]
+        assert hat_hits, f"Expected dedicated hat span in {out_path.name}: {spans}"
+        assert hat_hits[0]["origin"][1] < base_y - base_sz * 0.12
+
+        for expected_sup in ["2", "𝑛"]:
+            sup_hits = [sp for sp in spans if sp["text"] == expected_sup]
+            assert sup_hits, f"Expected dedicated superscript span {expected_sup!r} in {out_path.name}: {spans}"
+            assert sup_hits[0]["size"] < base_sz * 0.85
+            assert sup_hits[0]["origin"][1] < base_y - base_sz * 0.15
+
+        manual_spans = [
+            sp
+            for blk in manual_dict["blocks"]
+            for ln in blk.get("lines", [])
+            for sp in ln.get("spans", [])
+            if sp["text"].strip()
+        ]
+        manual_base = [sp for sp in manual_spans if "手動" in sp["text"]][0]
+        manual_j = [sp for sp in manual_spans if sp["text"] == "𝑗"]
+        assert manual_j and manual_j[0]["size"] < manual_base["size"] * 0.85
+        assert manual_j[0]["origin"][1] > manual_base["origin"][1] + manual_base["size"] * 0.10
+
+
+def test_fix_b_narrow_bbox_subcaptions_fallback_without_overhang(tmp_path: Path) -> None:
+    """Issue B: Narrow bboxes (width < 10pt or height < 8pt, e.g. DensePose p.10 '(a)'-'d')
+    must be judged against their actual bbox width/height rather than a 10pt x 8pt floor,
+    triggering TYPESETTING_OVERFLOW_FALLBACK and keeping original text inside the box.
+    """
+    cfg = AppConfig(runtime_dir=tmp_path / "rt")
+    ja_font = pymupdf.Font(fontfile=str(cfg.font_serif_path)) if cfg.font_serif_path else None
+    math_font = pymupdf.Font(fontfile=str(cfg.font_math_path)) if cfg.font_math_path else None
+    assert ja_font is not None
+
+    # 1. Font-independent sub-10pt overflow test: '(i)' at 8pt is ~8.2-8.3pt (< 10pt, > 7.5pt)
+    # In unmodified code max(10.0, 7.5) inflated width to 10.0pt and wrongly returned fits=True!
+    narrow_w = ja_font.text_length("(i)", 8.0) - 0.8
+    assert narrow_w < 10.0
+    sz_sub10, _, fits_sub10 = fit_japanese_text_in_bbox(
+        "(i)",
+        [10.0, 20.0, 10.0 + narrow_w, 34.0],
+        initial_font_size=7.0,
+        min_font_size=8.0,
+        ja_font=ja_font,
+        math_font=math_font,
+    )
+    assert fits_sub10 is False
+    assert sz_sub10 == 8.0
+
+    # 2. Exact DensePose p.10 (a)-(d) bounding boxes MUST all fail fit (no 10pt width floor)
+    p10_boxes = [
+        ("(a)", [113.60, 230.79, 121.44, 237.76]),
+        ("(b)", [242.66, 230.79, 250.92, 237.76]),
+        ("(c)", [372.33, 230.79, 379.79, 237.76]),
+        ("(d)", [501.20, 230.79, 509.39, 237.76]),
+    ]
+    for label, box in p10_boxes:
+        fitted_sz, _, fits = fit_japanese_text_in_bbox(
+            label,
+            box,
+            initial_font_size=6.97,
+            min_font_size=8.0,
+            ja_font=ja_font,
+            math_font=math_font,
+        )
+        assert fits is False, f"{label} unexpectedly reported fits=True for width={box[2]-box[0]:.2f}"
+        assert fitted_sz == 8.0
+
+    # 3. Degenerate zero/negative dimension bboxes return fits=False cleanly; tiny valid bbox fits
+    for degen in ([10.0, 20.0, 10.0, 30.0], [10.0, 20.0, 5.0, 30.0], [10.0, 20.0, 50.0, 20.0]):
+        _, degen_lines, degen_fits = fit_japanese_text_in_bbox(
+            "a", degen, initial_font_size=8.0, min_font_size=8.0, ja_font=ja_font, math_font=math_font
+        )
+        assert degen_fits is False
+        assert degen_lines == []
+
+    tiny_w = ja_font.text_length("i", 8.0) + 1.0
+    assert tiny_w < 10.0
+    _, tiny_lines, tiny_fits = fit_japanese_text_in_bbox(
+        "i",
+        [10.0, 20.0, 10.0 + tiny_w, 34.0],
+        initial_font_size=8.0,
+        min_font_size=8.0,
+        ja_font=ja_font,
+        math_font=math_font,
+    )
+    assert tiny_fits is True
+    assert tiny_lines == ["i"]
+
+    # 4. End-to-end PDF typesetting reproduction of DensePose p.10 (a)-(d)
+    pdf_path = tmp_path / "fix_b_p10.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    for label, box in p10_boxes:
+        page.insert_text(pymupdf.Point(box[0], box[3] - 1.2), label, fontsize=6.0)
+    doc.save(str(pdf_path))
+    doc.close()
+
+    doc_model = Document(
+        id="doc-fix-b",
+        original_filename="fix_b_p10.pdf",
+        safe_storage_path=str(pdf_path),
+        sha256_hash=compute_sha256(pdf_path),
+        file_size_bytes=pdf_path.stat().st_size,
+        page_count=1,
+    )
+    blocks = [
+        Block(
+            id=f"doc-fix-b:page-1:block-{idx}",
+            page_index=0,
+            bbox=box,
+            kind=BlockKind.PARAGRAPH,
+            reading_order=idx,
+            source_text=label,
+            translation_text=label,
+            status=BlockStatus.TRANSLATED,
+            font_size_pt=6.97,
+        )
+        for idx, (label, box) in enumerate(p10_boxes, start=1)
+    ]
+
+    mono_out = tmp_path / "fix_b_mono.pdf"
+    dual_out = tmp_path / "fix_b_dual.pdf"
+    adapter = NativePreservingAdapter(config=cfg)
+    updated, issues = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=blocks,
+        page_indices=[0],
+        job_config=TranslationJobConfig(),
+        mono_output_path=mono_out,
+        dual_output_path=dual_out,
+        job_id="job-fix-b",
+    )
+    assert len(updated) == 4
+    for blk in updated:
+        assert blk.status == BlockStatus.FALLBACK_ORIGINAL
+        assert "TYPESETTING_OVERFLOW_FALLBACK" in blk.warnings
+    assert len([iss for iss in issues if iss.code == "TYPESETTING_OVERFLOW_FALLBACK"]) == 4
+
+    for out_path, x_off in [(mono_out, 0.0), (dual_out, 612.0)]:
+        out_pdf = pymupdf.open(str(out_path))
+        for label, box in p10_boxes:
+            clip = pymupdf.Rect(
+                box[0] + x_off - 1.0,
+                box[1] - 2.0,
+                box[2] + x_off + 5.0,
+                box[3] + 3.0,
+            )
+            spans = [
+                sp
+                for b in out_pdf[0].get_text("dict", clip=clip)["blocks"]
+                for ln in b.get("lines", [])
+                for sp in ln.get("spans", [])
+                if sp["text"].strip()
+            ]
+            assert spans, f"Missing preserved original text {label!r} in {out_path.name}"
+            for sp in spans:
+                assert sp["bbox"][2] <= box[2] + x_off + 0.5, (
+                    f"{label} span overflows original right edge in {out_path.name}: "
+                    f"span_x1={sp['bbox'][2]:.2f} > box_x1={box[2] + x_off:.2f}"
+                )
+        out_pdf.close()
+
