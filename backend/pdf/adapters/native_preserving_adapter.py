@@ -204,6 +204,27 @@ def normalize_for_pdf_rendering(text: str) -> str:
     return _KNOWN_TEX_OPERATOR_VS_RE.sub(r"\1", text.replace("\xa0", " "))
 
 
+def _is_math_preferred_codepoint(cp: int) -> bool:
+    """Return True for Unicode codepoints that should prefer the math fallback font
+    over the Japanese text font when available (avoids CJK ambiguous-width glyphs
+    and shared-GID ToUnicode collisions such as U+2212/U+FF0D or U+02C6/U+0302 in YuGothR).
+    """
+    return (
+        (0x1D400 <= cp <= 0x1D7FF)  # Mathematical Alphanumeric Symbols (SMP)
+        or (0x2200 <= cp <= 0x22FF)  # Mathematical Operators (−, √, ∑, ∏, ∫, ≤, ≥, ≠, ≈)
+        or (0x2A00 <= cp <= 0x2AFF)  # Supplemental Mathematical Operators
+        or (0x27C0 <= cp <= 0x27EF)  # Miscellaneous Mathematical Symbols-A
+        or (0x2980 <= cp <= 0x29FF)  # Miscellaneous Mathematical Symbols-B
+        or (0x2190 <= cp <= 0x21FF)  # Arrows
+        or (0x2100 <= cp <= 0x214F)  # Letterlike Symbols
+        or (0x2070 <= cp <= 0x209F)  # Superscripts and Subscripts
+        or (0x0370 <= cp <= 0x03FF)  # Greek and Coptic (Φ, π, φ, etc.)
+        or (0x0300 <= cp <= 0x036F)  # Combining Diacritical Marks
+        or (0x20D0 <= cp <= 0x20FF)  # Combining Diacritical Marks for Symbols
+        or cp in (0x02C6, 0x02DC, 0x2032, 0x2033, 0x2034, 0x00B1, 0x00D7, 0x00F7)
+    )
+
+
 def _select_char_font(
     ch: str,
     ja_font_tag: str,
@@ -218,9 +239,7 @@ def _select_char_font(
     cp = ord(ch)
     if cp <= 0x20 or ch.isspace():
         return (ja_font_tag, ja_font)
-    # Prefer math_font for SMP Mathematical Alphanumeric Symbols (U+1D400..U+1D7FF)
-    # and characters missing in ja_font
-    if 0x1D400 <= cp <= 0x1D7FF:
+    if _is_math_preferred_codepoint(cp):
         if math_font is not None and math_font_tag and math_font.has_glyph(cp) != 0:
             return (math_font_tag, math_font)
         if ja_font.has_glyph(cp) != 0:

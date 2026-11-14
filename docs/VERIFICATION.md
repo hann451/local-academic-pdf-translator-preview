@@ -2,23 +2,23 @@
 
 ## インライン数式保持・フォント統一・安全フォールバックの検証記録 — 2026-11-14
 
-> 注記：以下の過去履歴（`2026-11-12` およびそれ以前）は当時の記録のまま保持しています。本節はブランチ `fix/inline-math-preservation`（起点：`origin/main` `06b3fafbd684e5876a157e18dd11452f570897b9`、コード・テスト検証対象コミット：`bd52749312418fe52937adcff809b5cd5c9bd281`）におけるローカル実装と再検証の範囲のみを記録します（本節の追記自体は機能コードを変更しない文書コミットとしてその直後に追加しています）。
+> 注記：以下の過去履歴（`2026-11-12` およびそれ以前）は当時の記録のまま保持しています。本節はブランチ `fix/inline-math-preservation`（起点：`origin/main` `06b3fafbd684e5876a157e18dd11452f570897b9`）におけるローカル実装・CI環境フォールバック修正・再検証の範囲のみを記録します。
 
 - **ロックファイル準拠の分離検証環境（再検証環境）:**
   - 作業ディレクトリ：リポジトリルート（`uv sync --locked --extra dev` で新規作成した専用 `.venv`）
   - Python / PyMuPDF：`CPython 3.13.13`（`<repo>\.venv\Scripts\python.exe`）、`PyMuPDF 1.28.2`
-  - 使用したシステムフォント：`C:\Windows\Fonts\NotoSerifJP-VF.ttf`（`NotoSerifJP-ExtraLight`）、`C:\Windows\Fonts\NotoSansJP-VF.ttf`（`NotoSansJP-Thin`）、`C:\Windows\Fonts\cambria.ttc`（`Cambria`）
+  - 使用したシステムフォント：`C:\Windows\Fonts\NotoSerifJP-VF.ttf`（`NotoSerifJP-ExtraLight`）、`C:\Windows\Fonts\NotoSansJP-VF.ttf`（`NotoSansJP-Thin`）、`C:\Windows\Fonts\cambria.ttc`（`Cambria`）、および `NotoSerifJP-VF.ttf` 不在時フォールバック再現用の `C:\Windows\Fonts\YuGothR.ttc`
   - ランタイムデータ：`PAPERBRIDGE_RUNTIME_DIR` により既存の既定データ領域から分離したディレクトリを使用
 - **自動テスト結果（オフライン／モック・合成PDF中心の回帰テスト）:**
   - 実行コマンド：`& '.\.venv\Scripts\python.exe' -m pytest tests -q -rs`（`PYTHONPATH=""`、分離済み `PAPERBRIDGE_RUNTIME_DIR`）
-  - 結果：**`97 passed, 7 skipped, 1 warning`**（新規追加・拡充した `tests/unit/test_inline_math_preservation.py` の **24件すべて PASS** を含む）
+  - 結果：**`98 passed, 7 skipped, 1 warning`**（新規追加・拡充した `tests/unit/test_inline_math_preservation.py` の **25件すべて PASS** を含む。あわせて `NotoSerifJP-VF.ttf` 不在・`YuGothR.ttc` フォールバック再現環境でも `test_inline_math_preservation.py` 25件＋`test_visual_preservation.py` 3件の計 **28 passed** を確認）
   - skip 7件の理由：`tests/integration/test_real_plamo_phase2.py`（L51, L70, L100, L183, L224, L309, L384）は `--run-real-llm` / `-m real_llm` 明示時のみ実行される既定スキップ対象テストであり、pytest 実行内では実モデル推論を行っていないため。
 - **改善・検証した内容と残存制限の区別（別途実施した検証の基盤仕様）:**
-  - **数学用文字のグリフ欠落改善:** 計測・描画・埋め込み時のフォールバックフォント選択を統一し、`ToUnicode` CMap において MuPDF が補助平面文字（`U+10000`〜`U+10FFFF`、今回の数学用英数字記号 `U+1D400`〜`U+1D7FF` を含む）を UTF-16BE サロゲートペアへ変換せず 5〜6 桁の 16 進トークン（例：`𝑎` [`U+1D44E`] を `<1d44e>`、`𝑃` [`U+1D443`] を `<1d443>`）のまま出力するため再読込・コピー時に別文字へ化ける事象に対し、元PDFの既存 `ToUnicode` CMap（事前収集した xref）を除外して新規埋め込みの `F_JA` / `F_MATH` フォントに限定し、8桁サロゲートペア（例：`<D835DC4E>`）へ変換する `_fix_embedded_tounicode_smp()` を実装。`beginbfchar` / `beginbfrange` への適用、正常 8 桁サロゲートペア・4桁 BMP・8桁合字や `begincidchar` / `begincidrange` の非変更、べき等性、BMP+補助平面文字混在、および `mono` / `dual` 保存再読込後の抽出を単体テストで確認。
+  - **数学用文字のグリフ欠落・文字化け改善:** 計測・描画・埋め込み時のフォールバックフォント選択を統一し、`_select_char_font()` において SMP 数学用英数字記号（`U+1D400`〜`U+1D7FF`）に加え、数学演算子（`−` 等）・ギリシャ文字・矢印・修飾記号（`ˆ` 等）でも `F_MATH`（`Cambria` / `Segoe UI Symbol`）を優先するよう調整した（`NotoSerifJP-VF.ttf` 不在環境の `YuGothR.ttc` が `U+2212`/`U+FF0D` や `U+02C6`/`U+0302` で同一グリフIDを共有し `/ToUnicode` 抽出が `－`/`\u0302` へ化ける事象の回避）。また、`ToUnicode` CMap において MuPDF が補助平面文字（`U+10000`〜`U+10FFFF`、今回の数学用英数字記号 `U+1D400`〜`U+1D7FF` を含む）を UTF-16BE サロゲートペアへ変換せず 5〜6 桁の 16 進トークン（例：`𝑎` [`U+1D44E`] を `<1d44e>`、`𝑃` [`U+1D443`] を `<1d443>`）のまま出力するため再読込・コピー時に別文字へ化ける事象に対し、元PDFの既存 `ToUnicode` CMap（事前収集した xref）を除外して新規埋め込みの `F_JA` / `F_MATH` フォントに限定し、8桁サロゲートペア（例：`<D835DC4E>`）へ変換する `_fix_embedded_tounicode_smp()` を実装。`beginbfchar` / `beginbfrange` への適用、正常 8 桁サロゲートペア・4桁 BMP・8桁合字や `begincidchar` / `begincidrange` の非変更、べき等性、BMP+補助平面文字混在、および `mono` / `dual` 保存再読込後の抽出を単体テストで確認。
   - **検証した上付き・下付き・ハット・根号上線の保持:** 構造化 `InlineMathSpan` により、検証対象ブロックにおける上付き・下付き添字（例：`𝑎2 + 𝑏2`, `𝐿𝑐𝑙𝑠`, `𝐿𝑘𝑝`, `𝑃𝑗`, `𝑖𝑝`, `𝐸1`, `𝑅1`）、合成アクセント付き記号（例：`ˆ𝑖𝑝`, `ˆ𝑀`）、および根号上線ベクトル（例：`𝐴=√(𝑎2+𝑏2)`）の保持と、スパン間空白復元・NUL（`U+0000`）/ TeX演算子由来異体字セレクタ（`U+FE00` / `U+FE01`）混入防止・異常系8項目（プレースホルダ削除/複製/未知/改変、PUA衝突、同一変数の通常文字・添字混在、`MANUALLY_EDITED` 再組版、`FALLBACK_ORIGINAL` 周辺4方向の赤枠保護）を単体テストで確認。
   - **組版できず原文保持（`FALLBACK_ORIGINAL` / `PROTECTED_SKIP`）になった箇所:** 最小フォントサイズ `8.0pt` でも元の英語枠に収まらない狭小・高密度ブロックは `TYPESETTING_OVERFLOW_FALLBACK` で赤枠消去前に原文保持し、1つの段落が数式途中（上付き添字や縦分数）で2ブロックへ分割され深く重複している組は `TRANSLATED_BLOCK_OVERLAP_FALLBACK` で文字衝突を防いで原文保持し、表示数式内の孤立記号は `PROTECTED_SKIP` / `PROTECTED_REGION_OVERLAP_FALLBACK` として保護する動作を確認。
   - **残存制限:** 縦積み分数（`\frac{1}{10}` 等）を含む分割段落、1〜2行相当の極端に狭い枠に長い日本語訳が入る箇所、複雑な多段数式、およびブロックをまたぐ連結再配分には未対応であり、日本語組版ではなく安全な原文保持へフォールバックする場合がある（すべての数式やレイアウトを維持するものではない）。
-- **別途実施した実論文PDF（13ページ構成の英語論文の Pages 3–7）での検証（pytest 97件とは別実施）:**
+- **別途実施した実論文PDF（13ページ構成の英語論文の Pages 3–7）での検証（上記 pytest 98件とは別実施）:**
   - **補助テスト（前回の固定訳文・短縮訳による描画確認）との区別:** 初期の組版確認スクリプトでは、新規解析したプレースホルダ構造に対する描画確認としてスクリプト内の固定訳文および Page 4 狭小枠向けの短縮訳を使用していたため、これは**実モデルによる新規翻訳E2Eではない補助的な描画確認**として区別する。
   - **保存済み訳文を変更しない再組版（`retypeset`）の確認結果:** 既存の保存済みDBスナップショットの訳文を1文字も編集せず再組版を実行し、主要15ブロック（対象14箇所＋分割対1箇所）を確認：
     - `translated`（警告なし、`Cambria` + `NotoSerifJP-ExtraLight`、NUL [`U+0000`] および `U+FE00` / `U+FE01` 残存 `0`）：`page-3:block-14`, `page-3:block-16`, `page-3:block-20`, `page-5:block-19`, `page-7:block-12`（保存済みDB上の `"∑"` 描画）, `page-7:block-16`, `page-7:block-23`（計7ブロック）

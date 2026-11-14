@@ -1485,3 +1485,68 @@ def test_item6_case8_adjacent_fallback_and_protected_skip_not_erased_by_redactio
     assert "RIGHT SIDE PROTECTED TEXT" in out_txt
     assert "中央の翻訳済みテキスト" in out_txt
     assert "MIDDLE TRANSLATED LINE TO REPLACE" not in out_txt
+
+
+@pytest.mark.skipif(
+    not Path(r"C:\Windows\Fonts\YuGothR.ttc").exists()
+    or not Path(r"C:\Windows\Fonts\cambria.ttc").exists(),
+    reason="Requires Windows YuGothR.ttc and cambria.ttc fonts",
+)
+def test_yugothr_fallback_prefers_math_font_for_minus_and_hat(tmp_path: Path) -> None:
+    """When NotoSerifJP is absent and Japanese rendering falls back to YuGothR.ttc,
+    math operators (U+2212) and accents (U+02C6) must route to F_MATH (Cambria) so
+    YuGothR's shared-GID ToUnicode collisions (U+FF0D / U+0302) do not corrupt extraction.
+    """
+    pdf_path = tmp_path / "yugothr_math.pdf"
+    doc_model = _make_densepose_p3_block16_pdf(pdf_path)
+
+    src_text = "where ˆ𝜙𝑓 is the phase in −𝜋 to 𝜋."
+    masked, items = mask_inline_protected_elements(src_text)
+    blk = Block(
+        id="doc-yugothr:page-1:block-1",
+        page_index=0,
+        bbox=[318.0, 357.0, 560.0, 433.0],
+        kind=BlockKind.PARAGRAPH,
+        reading_order=1,
+        source_text=src_text,
+        masked_source_text=masked,
+        protected_items=items,
+        inline_math_spans=[
+            InlineMathSpan(context_text="ˆ𝜙", target_text="ˆ", role="hat", scale=1.0, dy_em=-0.23),
+            InlineMathSpan(context_text="𝜙𝑓", target_text="𝑓", role="sub", scale=0.78, dy_em=0.18),
+        ],
+        translation_text="ここで位相 {v1} の範囲は {v2} から {v3} までである。",
+        status=BlockStatus.TRANSLATED,
+        font_size_pt=8.97,
+    )
+
+    cfg = AppConfig(
+        runtime_dir=tmp_path / "rt",
+        font_serif_path=Path(r"C:\Windows\Fonts\YuGothR.ttc"),
+        font_sans_path=Path(r"C:\Windows\Fonts\YuGothR.ttc"),
+        font_math_path=Path(r"C:\Windows\Fonts\cambria.ttc"),
+    )
+    adapter = NativePreservingAdapter(config=cfg)
+    mono_out = tmp_path / "yugothr_mono.pdf"
+    updated, issues = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=[blk],
+        page_indices=[0],
+        job_config=TranslationJobConfig(),
+        mono_output_path=mono_out,
+        dual_output_path=None,
+        job_id="job-yugothr",
+    )
+
+    assert not issues
+    assert updated[0].status == BlockStatus.TRANSLATED
+
+    out_pdf = pymupdf.open(str(mono_out))
+    extracted = out_pdf[0].get_text("text", clip=pymupdf.Rect(blk.bbox)).replace("\xa0", " ")
+    out_pdf.close()
+
+    assert "−" in extracted
+    assert "－" not in extracted
+    assert "ˆ" in extracted
+    assert "𝜋" in extracted
+
