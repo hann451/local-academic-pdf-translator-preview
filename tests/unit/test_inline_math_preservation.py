@@ -1549,4 +1549,3 @@ def test_yugothr_fallback_prefers_math_font_for_minus_and_hat(tmp_path: Path) ->
     assert "－" not in extracted
     assert "ˆ" in extracted
     assert "𝜋" in extracted
-
