@@ -854,9 +854,9 @@ def test_unit_e_saved_job_retypeset_and_manual_edit_compatibility(tmp_path: Path
     pdf_path = tmp_path / "unit_e_saved.pdf"
     doc_model = _make_densepose_p3_block16_pdf(pdf_path)
 
-    # Exact legacy saved state from job-452527d817a7 block-16 (4 protected items, empty inline_math_spans)
+    # Synthetic legacy saved state (4 protected items, empty inline_math_spans)
     legacy_blk = Block(
-        id="doc-de2629afd986:page-3:block-16",
+        id="doc-sample000001:page-3:block-16",
         page_index=0,
         bbox=[318.0, 357.0, 560.0, 433.0],
         kind=BlockKind.PARAGRAPH,
@@ -905,11 +905,11 @@ def test_unit_e_saved_job_retypeset_and_manual_edit_compatibility(tmp_path: Path
         job_config=TranslationJobConfig(),
         mono_output_path=mono_out,
         dual_output_path=dual_out,
-        job_id="job-452527d817a7",
+        job_id="job-sample000001",
     )
 
     assert not issues
-    assert updated_blocks[0].id == "doc-de2629afd986:page-3:block-16"
+    assert updated_blocks[0].id == "doc-sample000001:page-3:block-16"
     assert updated_blocks[0].status == BlockStatus.MANUALLY_EDITED
     assert updated_blocks[0].user_protection_override == "force_translate"
     assert len(updated_blocks[0].inline_math_spans) >= 3
@@ -1485,8 +1485,3 @@ def test_item6_case8_adjacent_fallback_and_protected_skip_not_erased_by_redactio
     assert "RIGHT SIDE PROTECTED TEXT" in out_txt
     assert "中央の翻訳済みテキスト" in out_txt
     assert "MIDDLE TRANSLATED LINE TO REPLACE" not in out_txt
-
-
-
-
-
