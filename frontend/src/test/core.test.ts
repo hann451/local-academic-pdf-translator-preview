@@ -201,6 +201,40 @@ describe("Manual Edit Pre-save Validator & Security Helpers (Section 4 & 7)", ()
     expect(good.warnings).toHaveLength(0);
   });
 
+  it("detects fullwidth and malformed placeholder variants via token-level NFKC without altering math text", () => {
+    const mockBlock = {
+      source_text: "Given 𝑎² = β and literal [v2] in 100 steps.",
+      masked_source_text: "Given {v1} and literal [v2] in 100 steps.",
+      protected_items: [
+        {
+          placeholder: "{v1}",
+          kind: "inline_formula" as const,
+          original_text: "𝑎² = β",
+          bbox: null,
+          font_name: null,
+        },
+      ],
+    };
+
+    const alteredCases = ["｛ｖ１｝", "｛v１｝", "{ｖ1}", "［ｖ１］", "｛　Ｖ　１　｝", "{ V 1 }"];
+    for (const variant of alteredCases) {
+      const rep = validateManualEditClientSide(
+        mockBlock,
+        `100ステップで ${variant} および literal [v2] を確認した。`
+      );
+      const codes = rep.errors.map((e) => e.code);
+      expect(codes).toContain("PLACEHOLDER_ALTERED");
+      expect(codes).toContain("PLACEHOLDER_MISSING");
+    }
+
+    // Valid placeholder + untouched Unicode math & literal [v2] from source passes cleanly
+    const clean = validateManualEditClientSide(
+      mockBlock,
+      "100ステップで {v1}（図１、𝑎²）および [v2] を確認した。"
+    );
+    expect(clean.errors).toHaveLength(0);
+  });
+
   it("enforces loopback API base URL and revokes Blob URLs after artifact download", async () => {
     expect(() => setApiBaseUrl("https://evil.example.com")).toThrow();
     expect(() => setApiBaseUrl("http://127.0.0.1:8080")).not.toThrow();

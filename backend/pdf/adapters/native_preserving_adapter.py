@@ -49,6 +49,7 @@ from backend.domain.models import (
 )
 from backend.pdf.adapters.base import PdfEngineAdapter
 from backend.pdf.coordinates import bbox_intersection_ratio, bbox_iou
+from backend.translation.validation.validator import find_placeholder_variant_tokens
 from backend.pdf.splitting import (
     SplitExecutionOutcome,
     build_raw_page_candidates,
@@ -185,10 +186,6 @@ _INLINE_MATH_EXPR_RE = re.compile(
     r")"
 )
 _EQUATION_NUM_ONLY_RE = re.compile(r"^\s*\(\d+(?:\.\d+)*[a-z]?\)\s*$")
-_UNRESOLVED_PH_CHECK_RE = re.compile(
-    r"(?:\{\s*v\s*\d+[A-Za-z0-9_]*\s*\}|［\s*v\s*\d+[A-Za-z0-9_]*\s*］|｛\s*v\s*\d+[A-Za-z0-9_]*\s*｝|\[\s*v\s*\d+[A-Za-z0-9_]*\s*\])",
-    re.IGNORECASE,
-)
 # Known TeX extension font (e.g. txexs) operator + Variation Selector-1/2 pairs where
 # U+FE00/U+FE01 selects operator display/text size in TeX but has no standalone PDF glyph.
 _KNOWN_TEX_OPERATOR_VS_RE = re.compile(r"([√∑∏∐∫∬∭∮⋀⋁⋂⋃])[\ufe00\ufe01]")
@@ -1084,12 +1081,12 @@ def _fix_embedded_tounicode_smp(
 
 def _find_unresolved_placeholders(restored_text: str, source_text: str) -> list[str]:
     """Return any placeholder-like tokens remaining in restored_text that were not
-    literally present in the original source_text.
+    literally present in the original source_text (detecting fullwidth/space variants).
     """
-    found = _UNRESOLVED_PH_CHECK_RE.findall(restored_text)
+    found = find_placeholder_variant_tokens(restored_text)
     if not found:
         return []
-    src_tokens = _UNRESOLVED_PH_CHECK_RE.findall(source_text or "")
+    src_tokens = find_placeholder_variant_tokens(source_text or "")
     unresolved: list[str] = []
     remaining_src = list(src_tokens)
     for tok in found:

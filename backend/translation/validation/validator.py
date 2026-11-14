@@ -21,6 +21,7 @@ in ValidationIssues (`completed_with_warnings`).
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 
 from backend.domain.models import IssueSeverity, ProtectedItem, ProtectedItemKind
@@ -44,8 +45,11 @@ TRANSLATION_VALIDATION_ISSUE_CODES: frozenset[str] = frozenset(
 )
 
 _PLACEHOLDER_RE = re.compile(r"\{v\d+\}")
-_MALFORMED_PLACEHOLDER_RE = re.compile(
-    r"(?:\{\s*v\s*\d+[A-Za-z0-9_]*\s*\}|［\s*v\s*\d+[A-Za-z0-9_]*\s*］|｛\s*v\s*\d+[A-Za-z0-9_]*\s*｝|\[\s*v\s*\d+[A-Za-z0-9_]*\s*\])",
+_PLACEHOLDER_CANDIDATE_RE = re.compile(
+    r"[\{\｛\[\［][^\{\｛\[\［\}\｝\]\］\r\n]{1,32}[\}\｝\]\］]"
+)
+_NFKC_PLACEHOLDER_VARIANT_RE = re.compile(
+    r"^[\{\[]\s*v\s*[0-9]+[A-Za-z0-9_]*\s*[\}\]]$",
     re.IGNORECASE,
 )
 _PLAMO_SPECIAL_RE = re.compile(r"<\|plamo:[^|>]+\|>")
@@ -103,6 +107,24 @@ def normalize_numeric_strings(text: str) -> list[str]:
         except ValueError:
             continue
     return normalized
+
+
+def find_placeholder_variant_tokens(text: str) -> list[str]:
+    """Extract exact or malformed placeholder-like bracketed tokens via token-level NFKC.
+
+    Only each candidate bracketed token itself is NFKC-normalized for detection (`｛ｖ１｝`,
+    `{ v1 }`, `［Ｖ１］`, mixed half/fullwidth braces, etc.); surrounding prose and
+    mathematical Unicode expressions are never globally normalized or altered.
+    """
+    if not text:
+        return []
+    variants: list[str] = []
+    for match in _PLACEHOLDER_CANDIDATE_RE.finditer(text):
+        raw_tok = match.group(0)
+        nfkc_tok = unicodedata.normalize("NFKC", raw_tok)
+        if _NFKC_PLACEHOLDER_VARIANT_RE.match(nfkc_tok):
+            variants.append(raw_tok)
+    return variants
 
 
 def validate_translation_output(
@@ -164,10 +186,20 @@ def validate_translation_output(
         expected_placeholders = _PLACEHOLDER_RE.findall(masked_source_text)
 
     actual_exact_placeholders = _PLACEHOLDER_RE.findall(out)
-    all_malformed_or_exact = _MALFORMED_PLACEHOLDER_RE.findall(out)
+    all_placeholder_variants = find_placeholder_variant_tokens(out)
+    src_literal_variants = find_placeholder_variant_tokens(source_text or "")
+    remaining_src_variants = list(src_literal_variants)
+    altered_variants: list[str] = []
+    for tok in all_placeholder_variants:
+        if _PLACEHOLDER_RE.fullmatch(tok):
+            continue
+        if tok in remaining_src_variants:
+            remaining_src_variants.remove(tok)
+        else:
+            altered_variants.append(tok)
 
-    # Check if fullwidth or whitespace-corrupted placeholders like `｛v1｝` or `{ v1 }` occurred
-    if len(all_malformed_or_exact) != len(actual_exact_placeholders):
+    # Check if fullwidth (`｛ｖ１｝`), whitespace (`{ v1 }`), or bracket-corrupted placeholders occurred
+    if altered_variants:
         findings.append(
             ValidationFinding(
                 code="PLACEHOLDER_ALTERED",
@@ -175,7 +207,8 @@ def validate_translation_output(
                 message="保護記号（プレースホルダー）の書式が改変されています（全角化・空白混入等）。",
                 details={
                     "expected": expected_placeholders,
-                    "found_raw": all_malformed_or_exact,
+                    "found_raw": all_placeholder_variants,
+                    "altered": altered_variants,
                 },
             )
         )

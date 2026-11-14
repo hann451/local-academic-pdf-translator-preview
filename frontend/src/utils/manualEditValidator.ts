@@ -5,6 +5,7 @@
  * - Errors:
  *   - `EMPTY_TRANSLATION`: Empty manual translation string
  *   - `CONTROL_TOKEN_RESIDUE`: `<|plamo:...` control token mixed in
+ *   - `PLACEHOLDER_ALTERED`: Fullwidth / whitespace-altered placeholder such as `｛ｖ１｝`
  *   - `PLACEHOLDER_MISSING`: Required `{v1}`..`{vN}` missing
  *   - `PLACEHOLDER_COUNT_MISMATCH`: Duplicate `{v1}`
  *   - `PLACEHOLDER_UNDEFINED`: Undefined `{v99}` introduced
@@ -26,8 +27,36 @@ export interface ManualEditValidationReport {
 }
 
 const PLACEHOLDER_RE = /\{v(\d+)\}/g;
+const PLACEHOLDER_CANDIDATE_RE = /[\{\uFF5B\[\uFF3B][^\{\uFF5B\[\uFF3B\}\uFF5D\]\uFF3D\r\n]{1,32}[\}\uFF5D\]\uFF3D]/g;
+const NFKC_PLACEHOLDER_VARIANT_RE = /^[\{\[]\s*v\s*[0-9]+[A-Za-z0-9_]*\s*[\}\]]$/i;
+const EXACT_PLACEHOLDER_FULL_RE = /^\{v\d+\}$/;
 const CITATION_BRACKET_RE = /\[\d+(?:\s*[,–-]\s*\d+)*\]/g;
 const NUMBER_RE = /(?<![A-Za-z0-9_])-?\d+(?:\.\d+)?%?(?![A-Za-z0-9_])/g;
+
+function extractNonExactPlaceholderVariants(text: string): string[] {
+  const variants: string[] = [];
+  for (const m of text.matchAll(PLACEHOLDER_CANDIDATE_RE)) {
+    const tok = m[0];
+    if (!EXACT_PLACEHOLDER_FULL_RE.test(tok) && NFKC_PLACEHOLDER_VARIANT_RE.test(tok.normalize("NFKC"))) {
+      variants.push(tok);
+    }
+  }
+  return variants;
+}
+
+function findAlteredPlaceholderTokens(candidateText: string, sourceText: string): string[] {
+  const remainingSrc = extractNonExactPlaceholderVariants(sourceText);
+  const altered: string[] = [];
+  for (const rawTok of extractNonExactPlaceholderVariants(candidateText)) {
+    const idx = remainingSrc.indexOf(rawTok);
+    if (idx >= 0) {
+      remainingSrc.splice(idx, 1);
+    } else {
+      altered.push(rawTok);
+    }
+  }
+  return altered;
+}
 
 export function validateManualEditClientSide(
   block: Pick<Block, "source_text" | "masked_source_text" | "protected_items">,
@@ -57,6 +86,14 @@ export function validateManualEditClientSide(
   const maskedSrc = block.masked_source_text || block.source_text;
   for (const m of maskedSrc.matchAll(PLACEHOLDER_RE)) {
     expectedPlaceholders.add(`{v${m[1]}}`);
+  }
+
+  const alteredTokens = findAlteredPlaceholderTokens(candidateText, block.source_text || "");
+  if (alteredTokens.length > 0) {
+    errors.push({
+      code: "PLACEHOLDER_ALTERED",
+      message: `保護記号の書式が改変されています（${alteredTokens.join(", ")}）。半角の {vN} を使用してください。`,
+    });
   }
 
   const foundCounts = new Map<string, number>();
