@@ -245,6 +245,9 @@ class JobManager:
             ):
                 pb.translation_text = old_b.translation_text
                 pb.manual_translation_text = old_b.manual_translation_text
+                if old_b.masked_source_text is not None:
+                    pb.masked_source_text = old_b.masked_source_text
+                    pb.protected_items = list(old_b.protected_items)
                 pb.status = old_b.status
                 pb.translation_provenance = (
                     "manual_edit"
@@ -254,6 +257,11 @@ class JobManager:
             else:
                 pb.translation_text = old_b.translation_text
                 pb.manual_translation_text = old_b.manual_translation_text
+                if (
+                    old_b.translation_text is not None or old_b.manual_translation_text is not None
+                ) and old_b.masked_source_text is not None:
+                    pb.masked_source_text = old_b.masked_source_text
+                    pb.protected_items = list(old_b.protected_items)
 
     def parse_document_blocks(
         self,
@@ -985,6 +993,8 @@ class JobManager:
                 blk.warnings = []
                 saved_trans = blk.translation_text
                 saved_manual = blk.manual_translation_text
+                saved_masked = blk.masked_source_text
+                saved_items = list(blk.protected_items)
 
                 if protection_changed and isinstance(self.pdf_adapter, NativePreservingAdapter):
                     self.pdf_adapter._apply_protection_and_masking(
@@ -994,6 +1004,9 @@ class JobManager:
                     )
                     blk.translation_text = saved_trans
                     blk.manual_translation_text = saved_manual
+                    if (saved_trans is not None or saved_manual is not None) and saved_masked is not None:
+                        blk.masked_source_text = saved_masked
+                        blk.protected_items = saved_items
                     if blk.status != BlockStatus.PROTECTED_SKIP:
                         if saved_manual is not None:
                             blk.status = BlockStatus.MANUALLY_EDITED

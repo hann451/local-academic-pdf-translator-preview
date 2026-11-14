@@ -1311,7 +1311,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
             prev_span: dict | None = None
 
             for s in spans:
-                t = str(s.get("text", ""))
+                t = str(s.get("text", "")).replace("\xa0", " ")
                 if not t:
                     continue
                 sz = float(s.get("size", 10.0))
@@ -1325,7 +1325,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
                     has_sub_super = True
 
                 if prev_span is not None:
-                    prev_t = str(prev_span.get("text", ""))
+                    prev_t = str(prev_span.get("text", "")).replace("\xa0", " ")
                     prev_bbox = prev_span.get("bbox")
                     cur_bbox = s.get("bbox")
                     if (
@@ -1481,9 +1481,18 @@ class NativePreservingAdapter(PdfEngineAdapter):
             ):
                 sep = "/" if re.search(r"=\s*[A-Za-z0-9α-ωΑ-Ω]+\s*$", prev_text) else ""
                 if prev_lines[-1].get("spans"):
-                    prev_lines[-1]["spans"][-1]["text"] = (
-                        str(prev_lines[-1]["spans"][-1].get("text", "")).rstrip() + sep + cur_text
-                    )
+                    if not sep:
+                        for cl in cur_lines:
+                            cl_spans = [
+                                dict(s) for s in cl.get("spans", []) if str(s.get("text", ""))
+                            ]
+                            prev_lines[-1]["spans"].extend(cl_spans)
+                    else:
+                        prev_lines[-1]["spans"][-1]["text"] = (
+                            str(prev_lines[-1]["spans"][-1].get("text", "")).rstrip()
+                            + sep
+                            + cur_text
+                        )
                 prev["bbox"] = [
                     min(p_bbox[0], c_bbox[0]),
                     min(p_bbox[1], c_bbox[1]),
@@ -2261,7 +2270,8 @@ class NativePreservingAdapter(PdfEngineAdapter):
                             ]
                             if raw_clip_lines:
                                 blk.inline_math_spans = extract_inline_math_spans(
-                                    raw_clip_lines, src_page.get_drawings()
+                                    _merge_horizontal_visual_lines(raw_clip_lines),
+                                    src_page.get_drawings(),
                                 )
                         except Exception:
                             pass

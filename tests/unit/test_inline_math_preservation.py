@@ -83,7 +83,13 @@ def _make_densepose_p3_block16_pdf(pdf_path: Path) -> Document:
     )
     page.insert_text(
         pymupdf.Point(373, 387),
-        "are computed using the formulation 𝐴=√",
+        "are computed using the formulation ",
+        fontsize=8.97,
+        fontname="tiro",
+    )
+    page.insert_text(
+        pymupdf.Point(510, 387),
+        "𝐴=√",
         fontsize=8.97,
         fontname=mfont,
     )
@@ -139,12 +145,18 @@ def _make_densepose_p3_block16_pdf(pdf_path: Path) -> Document:
     )
     page.insert_text(
         pymupdf.Point(351, 409),
-        "to 𝜋",
+        "to ",
+        fontsize=8.97,
+        fontname="tiro",
+    )
+    page.insert_text(
+        pymupdf.Point(360, 409),
+        "𝜋",
         fontsize=8.97,
         fontname=mfont,
     )
     page.insert_text(
-        pymupdf.Point(368, 409),
+        pymupdf.Point(369, 409),
         "and the phase values outside this range get wrapped.",
         fontsize=8.97,
         fontname="tiro",
@@ -827,6 +839,118 @@ def test_unit_d_non_radical_lines_and_plain_text_not_misclassified() -> None:
     ]
     spans = extract_inline_math_spans(raw_lines, unrelated_drawings)
     assert spans == []
+
+
+# ==============================================================================
+# Unit E: Compatibility with Saved Jobs (`retypeset`), Manual Edits, and New Jobs
+# ==============================================================================
+def test_unit_e_saved_job_retypeset_and_manual_edit_compatibility(tmp_path: Path) -> None:
+    """Section 7 (Path ②): Verify that an already-saved job block from the database
+    (which has legacy 4-item `protected_items`, empty `inline_math_spans=[]`, and either
+    `translation_text` or `manual_translation_text` with `user_protection_override`)
+    can be retypeset cleanly without re-running LLM inference or breaking block IDs,
+    recovering missing SMP glyphs, superscripts, and radical overbar from the original PDF.
+    """
+    pdf_path = tmp_path / "unit_e_saved.pdf"
+    doc_model = _make_densepose_p3_block16_pdf(pdf_path)
+
+    # Exact legacy saved state from job-452527d817a7 block-16 (4 protected items, empty inline_math_spans)
+    legacy_blk = Block(
+        id="doc-de2629afd986:page-3:block-16",
+        page_index=0,
+        bbox=[318.0, 357.0, 560.0, 433.0],
+        kind=BlockKind.PARAGRAPH,
+        reading_order=15,
+        source_text=(
+            "In raw CSI samples (5 consecutive samples visualized in Fig- ure 3(a-b)), "
+            "the amplitude (𝐴) and phase (Φ) of each complex ele- ment 𝑧= 𝑎+𝑏𝑖are computed "
+            "using the formulation 𝐴=√︁(𝑎2 + 𝑏2) and Φ = 𝑎𝑟𝑐𝑡𝑎𝑛(𝑏/𝑎). Note that the range "
+            "of the arctan function is from −𝜋to 𝜋and the phase values outside this range "
+            "get wrapped."
+        ),
+        masked_source_text=(
+            "In raw CSI samples (5 consecutive samples visualized in Fig- ure 3(a-b)), "
+            "the amplitude (𝐴) and phase ({v1}) of each complex ele- ment 𝑧= 𝑎+𝑏𝑖are computed "
+            "using the formulation 𝐴={v2}︁(𝑎2 + 𝑏2) and {v3} = 𝑎𝑟𝑐𝑡𝑎𝑛(𝑏/𝑎). Note that the range "
+            "of the arctan function is from {v4}𝜋to 𝜋and the phase values outside this range "
+            "get wrapped."
+        ),
+        protected_items=[
+            ProtectedItem(placeholder="{v1}", kind=ProtectedItemKind.INLINE_FORMULA, original_text="Φ"),
+            ProtectedItem(placeholder="{v2}", kind=ProtectedItemKind.INLINE_FORMULA, original_text="√"),
+            ProtectedItem(placeholder="{v3}", kind=ProtectedItemKind.INLINE_FORMULA, original_text="Φ"),
+            ProtectedItem(placeholder="{v4}", kind=ProtectedItemKind.INLINE_FORMULA, original_text="−"),
+        ],
+        inline_math_spans=[],
+        translation_text=(
+            "生のCSIサンプルでは、各複素要素 𝑧= 𝑎+𝑏𝑖 の振幅 (𝐴) と位相 ({v1}) は、"
+            "式 𝐴={v2}︁(𝑎2 + 𝑏2) と {v3} = 𝑎𝑟𝑐𝑡𝑎𝑛(𝑏/𝑎) で計算され、範囲は {v4}𝜋 から 𝜋 である。"
+        ),
+        manual_translation_text=(
+            "【手動修正】各複素要素 𝑧= 𝑎+𝑏𝑖 の振幅 (𝐴) と位相 ({v1}) は、"
+            "式 𝐴={v2}︁(𝑎2 + 𝑏2) および {v3} = 𝑎𝑟𝑐𝑡𝑎𝑛(𝑏/𝑎)（範囲 {v4}𝜋〜𝜋）で算出される。"
+        ),
+        status=BlockStatus.MANUALLY_EDITED,
+        user_protection_override="force_translate",
+        font_size_pt=8.97,
+    )
+
+    adapter = NativePreservingAdapter()
+    mono_out = tmp_path / "unit_e_saved_mono.pdf"
+    dual_out = tmp_path / "unit_e_saved_dual.pdf"
+    updated_blocks, issues = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=[legacy_blk],
+        page_indices=[0],
+        job_config=TranslationJobConfig(),
+        mono_output_path=mono_out,
+        dual_output_path=dual_out,
+        job_id="job-452527d817a7",
+    )
+
+    assert not issues
+    assert updated_blocks[0].id == "doc-de2629afd986:page-3:block-16"
+    assert updated_blocks[0].status == BlockStatus.MANUALLY_EDITED
+    assert updated_blocks[0].user_protection_override == "force_translate"
+    assert len(updated_blocks[0].inline_math_spans) >= 3
+
+    out_pdf = pymupdf.open(str(mono_out))
+    txt = out_pdf[0].get_text("text", clip=pymupdf.Rect(legacy_blk.bbox))
+    out_pdf.close()
+
+    assert "【手動修正】" in txt
+    for token in ("𝑧", "𝑎", "𝑏", "𝑖", "𝐴", "Φ", "√", "𝑎𝑟𝑐𝑡𝑎𝑛", "−", "𝜋"):
+        assert token in txt
+
+
+def test_unit_e_new_job_parse_and_typeset_end_to_end(tmp_path: Path) -> None:
+    """Section 7 (Path ①): Verify that extracting blocks from a new PDF populates
+    recovered inter-span spaces, full inline math masking (`{v1}..{v7}`), and
+    structured `inline_math_spans` right at `parse_and_extract_blocks` time.
+    """
+    pdf_path = tmp_path / "unit_e_new.pdf"
+    doc_model = _make_densepose_p3_block16_pdf(pdf_path)
+
+    adapter = NativePreservingAdapter()
+    blocks = adapter.parse_and_extract_blocks(
+        document=doc_model,
+        page_indices=[0],
+        job_config=TranslationJobConfig(),
+    )
+    b16 = next(b for b in blocks if "amplitude" in b.source_text)
+    assert "𝑧= 𝑎+𝑏𝑖 are" in b16.source_text
+    assert "−𝜋 to 𝜋 and" in b16.source_text
+    origs = [it.original_text for it in b16.protected_items]
+    assert "𝑧= 𝑎+𝑏𝑖" in origs
+    assert "𝐴=√(𝑎2 + 𝑏2)" in origs
+    assert "Φ = 𝑎𝑟𝑐𝑡𝑎𝑛(𝑏/𝑎)" in origs
+    assert "−𝜋" in origs
+    assert "𝜋" in origs
+    roles = {(m.role, m.context_text, m.target_text) for m in b16.inline_math_spans}
+    assert ("radicand", "√(𝑎2 + 𝑏2)", "(𝑎2 + 𝑏2)") in roles
+    assert ("super", "𝑎2", "2") in roles
+    assert ("super", "𝑏2", "2") in roles
+
 
 
 
