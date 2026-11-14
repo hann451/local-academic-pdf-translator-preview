@@ -170,7 +170,7 @@ def _make_densepose_p3_block16_pdf(pdf_path: Path) -> Document:
         fontname=mfont,
     )
 
-    _fix_embedded_tounicode_smp(doc)
+    _fix_embedded_tounicode_smp(doc, target_font_tags=("F_ORIG_MATH",))
     doc.save(str(pdf_path))
     doc.close()
 
@@ -950,6 +950,542 @@ def test_unit_e_new_job_parse_and_typeset_end_to_end(tmp_path: Path) -> None:
     assert ("radicand", "√(𝑎2 + 𝑏2)", "(𝑎2 + 𝑏2)") in roles
     assert ("super", "𝑎2", "2") in roles
     assert ("super", "𝑏2", "2") in roles
+
+
+def test_item4_tounicode_smp_minimal_repro_and_idempotence(tmp_path: Path) -> None:
+    """Item 4: Demonstrate minimal reproduction of MuPDF's 5-digit hex `<1xxxx>`
+    ToUnicode bug before `_fix_embedded_tounicode_smp`, verify that the fix restores exact
+    SMP characters (`𝑃` U+1D443, `𝜙` U+1D719) alongside BMP characters (`A`), and
+    verify idempotence when applied twice.
+    """
+    from backend.pdf.adapters.native_preserving_adapter import (
+        _fix_embedded_tounicode_smp,
+    )
+
+    math_fp = AppConfig(runtime_dir=tmp_path / "rt_cfg").font_math_path
+    assert math_fp is not None and math_fp.exists()
+
+    # 1. Minimal failing reproduction BEFORE fix
+    raw_doc = pymupdf.open()
+    p0 = raw_doc.new_page(width=300, height=120)
+    p0.insert_font(fontname="F_MATH", fontfile=str(math_fp))
+    p0.insert_text(pymupdf.Point(20, 50), "A 𝑃 𝜙", fontsize=12.0, fontname="F_MATH")
+    unfixed_pdf = tmp_path / "unfixed_smp.pdf"
+    raw_doc.save(str(unfixed_pdf), garbage=2, deflate=True)
+    raw_doc.close()
+
+    reopened_unfixed = pymupdf.open(str(unfixed_pdf))
+    unfixed_text = reopened_unfixed[0].get_text("text")
+    reopened_unfixed.close()
+    # Before fix, MuPDF writes <1d443> in /ToUnicode and reads back a corrupted BMP char instead of U+1D443 ('𝑃')
+    assert "𝑃" not in unfixed_text
+    assert "𝜙" not in unfixed_text
+
+    # 2. Apply scoped `_fix_embedded_tounicode_smp` once and then a second time (idempotence)
+    fix_doc = pymupdf.open(str(unfixed_pdf))
+    updated_first = _fix_embedded_tounicode_smp(fix_doc, target_font_tags=("F_JA", "F_MATH"))
+    assert updated_first == 1
+    updated_second = _fix_embedded_tounicode_smp(fix_doc, target_font_tags=("F_JA", "F_MATH"))
+    assert updated_second == 0
+
+    fixed_pdf = tmp_path / "fixed_smp.pdf"
+    fix_doc.save(str(fixed_pdf), garbage=2, deflate=True)
+    fix_doc.close()
+
+    reopened_fixed = pymupdf.open(str(fixed_pdf))
+    fixed_text = reopened_fixed[0].get_text("text")
+    reopened_fixed.close()
+    assert "A" in fixed_text
+    assert "𝑃" in fixed_text
+    assert "𝜙" in fixed_text
+
+
+def test_item4_tounicode_cmap_formats_and_original_font_protection(tmp_path: Path) -> None:
+    """Item 4: Verify `_rewrite_tounicode_cmap_smp_bytes` on valid surrogate pairs, mixed
+    BMP+SMP lines, `beginbfrange`, and unsupported CMap sections (`begincidchar`), and
+    verify that original PDF font `/ToUnicode` streams are never modified.
+    """
+    from backend.pdf.adapters.native_preserving_adapter import (
+        _collect_document_tounicode_xrefs,
+        _fix_embedded_tounicode_smp,
+        _rewrite_tounicode_cmap_smp_bytes,
+    )
+
+    sample_cmap = (
+        b"/CIDInit /ProcSet findresource begin\n"
+        b"4 beginbfchar\n"
+        b"<0001> <0041> <0002> <1d443>\n"
+        b"<0003> <D835DC43>\n"
+        b"<0004> <00660069>\n"
+        b"endbfchar\n"
+        b"2 beginbfrange\n"
+        b"<0010> <0010> <1d719>\n"
+        b"<0020> <0021> [<0042> <1d44e>]\n"
+        b"endbfrange\n"
+        b"1 begincidchar\n"
+        b"<0030> <1d443>\n"
+        b"endcidchar\n"
+    )
+    rewritten = _rewrite_tounicode_cmap_smp_bytes(sample_cmap)
+    # BMP <0041>, valid surrogate <D835DC43>, ligature <00660069>, and begincidchar <1d443> untouched
+    assert b"<0001> <0041> <0002> <D835DC43>" in rewritten
+    assert b"<0003> <D835DC43>" in rewritten
+    assert b"<0004> <00660069>" in rewritten
+    # bfrange SMP entries converted to UTF-16BE surrogate pairs
+    assert b"<0010> <0010> <D835DF19>" in rewritten
+    assert b"<0020> <0021> [<0042> <D835DC4E>]" in rewritten
+    # Unsupported begincidchar section left untouched
+    assert b"1 begincidchar\n<0030> <1d443>\nendcidchar" in rewritten
+    # Idempotent on second application
+    assert _rewrite_tounicode_cmap_smp_bytes(rewritten) == rewritten
+
+    # Verify original PDF font CMap is never modified when protected or not named F_JA / F_MATH
+    math_fp = AppConfig(runtime_dir=tmp_path / "rt_cfg").font_math_path
+    assert math_fp is not None
+    orig_doc = pymupdf.open()
+    page = orig_doc.new_page(width=200, height=100)
+    page.insert_font(fontname="F_ORIG_FONT", fontfile=str(math_fp))
+    page.insert_text(pymupdf.Point(10, 40), "𝑃", fontsize=11.0, fontname="F_ORIG_FONT")
+    orig_pdf = tmp_path / "orig_font.pdf"
+    orig_doc.save(str(orig_pdf), garbage=2, deflate=True)
+    orig_doc.close()
+
+    check_doc = pymupdf.open(str(orig_pdf))
+    orig_tu_xrefs = _collect_document_tounicode_xrefs(check_doc)
+    assert len(orig_tu_xrefs) == 1
+    tu_xref = next(iter(orig_tu_xrefs))
+    before_bytes = check_doc.xref_stream(tu_xref)
+    assert b"<1d411>" in before_bytes.lower()
+
+    updated = _fix_embedded_tounicode_smp(
+        check_doc,
+        target_font_tags=("F_JA", "F_MATH"),
+        protected_tounicode_xrefs=orig_tu_xrefs,
+    )
+    assert updated == 0
+    assert check_doc.xref_stream(tu_xref) == before_bytes
+    check_doc.close()
+
+
+def test_item5_overlapping_translated_blocks_fallback_to_original(tmp_path: Path) -> None:
+    """Item 5: When two translatable blocks on the same page deeply overlap vertically
+    (such as `page-5:block-13`..`14` or `page-7:block-26`..`27`), both blocks must safely
+    fall back to `BlockStatus.FALLBACK_ORIGINAL` with `TRANSLATED_BLOCK_OVERLAP_FALLBACK`
+    before redaction so rendered Japanese lines never collide and split fractions stay intact.
+    """
+    pdf_path = tmp_path / "overlap_blocks.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_text(pymupdf.Point(318, 450), "Upper split paragraph line with {P*_2, ..., P*_14}", fontsize=9.0)
+    page.insert_text(pymupdf.Point(318, 468), "Lower split paragraph continuation line in original PDF", fontsize=9.0)
+    doc.save(str(pdf_path))
+    doc.close()
+
+    doc_model = Document(
+        id="doc-overlap-test",
+        original_filename="overlap_blocks.pdf",
+        safe_storage_path=str(pdf_path),
+        sha256_hash=compute_sha256(pdf_path),
+        file_size_bytes=pdf_path.stat().st_size,
+        page_count=1,
+    )
+
+    b1 = Block(
+        id="doc-overlap-test:page-0:block-13",
+        page_index=0,
+        reading_order=0,
+        bbox=[317.62, 435.59, 559.71, 468.49],
+        kind=BlockKind.PARAGRAPH,
+        source_text="Upper split paragraph line with {P*_2, ..., P*_14}",
+        masked_source_text="Upper split paragraph line with {v1}",
+        translation_text="上側の分割段落の日本語訳であり、下側ブロックと大きく重複しています。",
+        status=BlockStatus.TRANSLATED,
+        font_size_pt=9.0,
+    )
+    b2 = Block(
+        id="doc-overlap-test:page-0:block-14",
+        page_index=0,
+        reading_order=1,
+        bbox=[317.95, 457.01, 558.20, 479.45],
+        kind=BlockKind.PARAGRAPH,
+        source_text="Lower split paragraph continuation line in original PDF",
+        masked_source_text="Lower split paragraph continuation line in original PDF",
+        translation_text="下側の分割段落の日本語訳です。",
+        status=BlockStatus.TRANSLATED,
+        font_size_pt=9.0,
+    )
+
+    adapter = NativePreservingAdapter(config=AppConfig(runtime_dir=tmp_path / "rt"))
+    mono_out = tmp_path / "overlap_mono.pdf"
+    updated_blocks, issues = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=[b1, b2],
+        page_indices=[0],
+        mono_output_path=mono_out,
+        dual_output_path=None,
+        job_id="job-overlap",
+        job_config=TranslationJobConfig(),
+    )
+
+    assert updated_blocks[0].status == BlockStatus.FALLBACK_ORIGINAL
+    assert updated_blocks[1].status == BlockStatus.FALLBACK_ORIGINAL
+    assert "TRANSLATED_BLOCK_OVERLAP_FALLBACK" in updated_blocks[0].warnings
+    assert "TRANSLATED_BLOCK_OVERLAP_FALLBACK" in updated_blocks[1].warnings
+    assert sum(1 for iss in issues if iss.code == "TRANSLATED_BLOCK_OVERLAP_FALLBACK") == 2
+
+    out_doc = pymupdf.open(str(mono_out))
+    out_txt = out_doc[0].get_text("text")
+    out_doc.close()
+    assert "Upper split paragraph line" in out_txt
+    assert "Lower split paragraph continuation line" in out_txt
+    assert "上側の分割段落" not in out_txt
+
+
+def test_item6_case1_placeholder_missing_dup_unknown_altered(tmp_path: Path) -> None:
+    """Item 6 (Case 1): Verify missing, duplicated, unknown (`{v99}`), and altered
+    (`[v1]`, `{v1_mod}`, `｛v1｝`, `{ v1 }`) placeholders are caught by validation and
+    trigger safe `FALLBACK_ORIGINAL` before redaction.
+    """
+    from backend.pdf.adapters.native_preserving_adapter import (
+        _find_unresolved_placeholders,
+    )
+
+    p_items = [
+        ProtectedItem(placeholder="{v1}", kind=ProtectedItemKind.INLINE_FORMULA, original_text="𝛼 = 1"),
+    ]
+    # 1. Missing placeholder
+    res_missing = validate_translation_output(
+        source_text="Where 𝛼 = 1 holds.",
+        masked_source_text="Where {v1} holds.",
+        translated_text="ここで成り立つ。",
+        protected_items=p_items,
+        finish_reason="stop",
+    )
+    assert not res_missing.is_valid
+    assert any(f.code == "PLACEHOLDER_MISSING" for f in res_missing.findings)
+
+    # 2. Duplicated placeholder
+    res_dup = validate_translation_output(
+        source_text="Where 𝛼 = 1 holds.",
+        masked_source_text="Where {v1} holds.",
+        translated_text="{v1} と {v1} が成り立つ。",
+        protected_items=p_items,
+        finish_reason="stop",
+    )
+    assert not res_dup.is_valid
+    assert any(f.code == "PLACEHOLDER_DUPLICATED" for f in res_dup.findings)
+
+    # 3. Unknown placeholder {v99}
+    res_unk = validate_translation_output(
+        source_text="Where 𝛼 = 1 holds.",
+        masked_source_text="Where {v1} holds.",
+        translated_text="{v1} と {v99} が成り立つ。",
+        protected_items=p_items,
+        finish_reason="stop",
+    )
+    assert not res_unk.is_valid
+    assert any(f.code == "PLACEHOLDER_HALLUCINATED" for f in res_unk.findings)
+
+    # 4. Altered placeholders ([v1], {v1_mod}, ｛v1｝, { v1 }) caught both by validator and typeset pre-check
+    for altered in ("[v1] が成り立つ。", "{v1} と {v1_mod} が成り立つ。", "｛v1｝ が成り立つ。", "{ v1 } が成り立つ。"):
+        res_alt = validate_translation_output(
+            source_text="Where 𝛼 = 1 holds.",
+            masked_source_text="Where {v1} holds.",
+            translated_text=altered,
+            protected_items=p_items,
+            finish_reason="stop",
+        )
+        assert not res_alt.is_valid
+        assert any(f.code in ("PLACEHOLDER_ALTERED", "PLACEHOLDER_MISSING") for f in res_alt.findings)
+        unresolved = _find_unresolved_placeholders(
+            unmask_inline_protected_elements(altered, p_items),
+            "Where 𝛼 = 1 holds.",
+        )
+        assert len(unresolved) >= 1, f"Expected altered placeholder in {altered!r} to be detected"
+
+
+def test_item6_case2_and_3_literal_placeholder_and_pua_collision() -> None:
+    """Item 6 (Cases 2 & 3): Verify that pre-existing literal `{v1}` AND pre-existing
+    literal Private Use Area characters (`\\uE100`, `\\uE101`) in `source_text` never
+    collide with generated sentinels or chain-expand during unmasking.
+    """
+    src = "Literal {v1} and PUA \ue100 \ue101 with math 𝛼 = 𝛽 + 1 in text."
+    masked, items = mask_inline_protected_elements(src)
+    # Literal PUA characters must still be intact in masked text
+    assert "\ue100" in masked
+    assert "\ue101" in masked
+    # Both literal {v1} and math 𝛼 = 𝛽 + 1 are protected as distinct placeholders
+    assert len(items) == 2
+    assert items[0].original_text == "{v1}"
+    assert items[1].original_text == "𝛼 = 𝛽 + 1"
+
+    restored = unmask_inline_protected_elements(masked, items)
+    assert restored == src
+
+
+def test_item6_case4_repeated_identical_math_string_with_conflicting_roles() -> None:
+    """Item 6 (Case 4): When the exact same string (e.g. `𝑥2` or `𝑎1`) appears multiple
+    times within the same block with different sub/superscript structures (e.g. `x^2` and
+    `x_2`, or `a_1` and baseline `a1`), `extract_inline_math_spans` must detect the
+    conflict and exclude the ambiguous span so neither occurrence gets mis-styled.
+    """
+    raw_lines = [
+        {
+            "bbox": [10.0, 10.0, 220.0, 22.0],
+            "spans": [
+                # First occurrence: x^2 (superscript 2, origin y=15.0 < baseline 18.0)
+                {"text": "𝑥", "size": 10.0, "origin": [10.0, 18.0], "bbox": [10.0, 10.0, 16.0, 20.0]},
+                {"text": "2", "size": 7.0, "origin": [16.2, 15.0], "bbox": [16.2, 9.0, 20.0, 16.0]},
+                {"text": " and ", "size": 10.0, "origin": [21.0, 18.0], "bbox": [21.0, 10.0, 42.0, 20.0]},
+                # Second occurrence: x_2 (subscript 2, origin y=20.5 > baseline 18.0)
+                {"text": "𝑥", "size": 10.0, "origin": [43.0, 18.0], "bbox": [43.0, 10.0, 49.0, 20.0]},
+                {"text": "2", "size": 7.0, "origin": [49.2, 20.5], "bbox": [49.2, 14.0, 53.0, 22.0]},
+                {"text": " plus ", "size": 10.0, "origin": [54.0, 18.0], "bbox": [54.0, 10.0, 80.0, 20.0]},
+                # Third occurrence: a_1 (subscript 1) followed by baseline normal "𝑎1"
+                {"text": "𝑎", "size": 10.0, "origin": [81.0, 18.0], "bbox": [81.0, 10.0, 87.0, 20.0]},
+                {"text": "1", "size": 7.0, "origin": [87.2, 20.5], "bbox": [87.2, 14.0, 91.0, 22.0]},
+                {"text": " vs 𝑎1", "size": 10.0, "origin": [92.0, 18.0], "bbox": [92.0, 10.0, 125.0, 20.0]},
+                # Unambiguous control: y^3 (only appears as superscript)
+                {"text": " 𝑦", "size": 10.0, "origin": [126.0, 18.0], "bbox": [126.0, 10.0, 134.0, 20.0]},
+                {"text": "3", "size": 7.0, "origin": [134.2, 15.0], "bbox": [134.2, 9.0, 138.0, 16.0]},
+            ],
+        }
+    ]
+    spans = extract_inline_math_spans(raw_lines)
+    ctx_set = {(s.context_text, s.target_text, s.role) for s in spans}
+    # Conflicting "𝑥2" (super vs sub) and "𝑎1" (sub vs normal) must be excluded
+    assert not any(s.context_text == "𝑥2" for s in spans)
+    assert not any(s.context_text == "𝑎1" for s in spans)
+    # Unambiguous "𝑦3" (super) is preserved
+    assert ("𝑦3", "3", "super") in ctx_set
+
+
+def test_item6_case5_and_6_manual_edit_reordering_and_no_false_span_application(tmp_path: Path) -> None:
+    """Item 6 (Cases 5 & 6): Verify that manual edits can reorder/duplicate `{vN}`
+    placeholders while retaining their math spans, and that deleting `{vN}` and typing
+    plain text (e.g. `x2` or `Modelx2`) never falsely triggers source `inline_math_spans`.
+    """
+    pdf_path = tmp_path / "manual_edit_case56.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=400, height=200)
+    page.insert_text(pymupdf.Point(20, 40), "Values x2 and y3 are used.", fontsize=10.0)
+    doc.save(str(pdf_path))
+    doc.close()
+
+    doc_model = Document(
+        id="doc-man-56",
+        original_filename="manual_edit_case56.pdf",
+        safe_storage_path=str(pdf_path),
+        sha256_hash=compute_sha256(pdf_path),
+        file_size_bytes=pdf_path.stat().st_size,
+        page_count=1,
+    )
+
+    # Case 5: Reordered {v2} before {v1}, and {v1} used while {v2} is kept
+    # Case 6: If {v1} ("x2") is omitted by user and user writes plain "x2", x2 is NOT styled as subscript
+    blk = Block(
+        id="doc-man-56:page-0:block-1",
+        page_index=0,
+        reading_order=0,
+        bbox=[20.0, 25.0, 360.0, 80.0],
+        kind=BlockKind.PARAGRAPH,
+        source_text="Values x2 and y3 are used.",
+        masked_source_text="Values {v1} and {v2} are used.",
+        protected_items=[
+            ProtectedItem(placeholder="{v1}", kind=ProtectedItemKind.INLINE_FORMULA, original_text="x2"),
+            ProtectedItem(placeholder="{v2}", kind=ProtectedItemKind.INLINE_FORMULA, original_text="y3"),
+        ],
+        inline_math_spans=[
+            InlineMathSpan(context_text="x2", target_text="2", role="sub", scale=0.78, dy_em=0.18),
+            InlineMathSpan(context_text="y3", target_text="3", role="super", scale=0.78, dy_em=-0.29),
+        ],
+        translation_text="値 {v1} と {v2} を使用する。",
+        # User removed {v1} and typed plain identifier "x2" manually, while keeping {v2} twice
+        manual_translation_text="手動で {v2}（もう一度 {v2}）および普通の文字列 x2 を記述した。",
+        status=BlockStatus.MANUALLY_EDITED,
+        font_size_pt=10.0,
+    )
+
+    adapter = NativePreservingAdapter(config=AppConfig(runtime_dir=tmp_path / "rt"))
+    mono_out = tmp_path / "manual_56_mono.pdf"
+    updated_blocks, issues = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=[blk],
+        page_indices=[0],
+        mono_output_path=mono_out,
+        dual_output_path=None,
+        job_id="job-man-56",
+        job_config=TranslationJobConfig(),
+    )
+    assert not issues
+    assert updated_blocks[0].status == BlockStatus.MANUALLY_EDITED
+
+    out_doc = pymupdf.open(str(mono_out))
+    raw_dict = out_doc[0].get_text("dict")
+    out_doc.close()
+    spans = [
+        s
+        for b in raw_dict["blocks"]
+        if b.get("type", 0) == 0
+        for ln in b["lines"]
+        for s in ln["spans"]
+    ]
+    # "3" in {v2} ("y3") was rendered at superscript scale (< 9.0pt), whereas "x2" was rendered as normal baseline text
+    three_spans = [s for s in spans if "3" in s["text"]]
+    x2_spans = [s for s in spans if "x2" in s["text"] or s["text"].strip() == "2"]
+    assert three_spans and all(float(s["size"]) < 9.0 for s in three_spans)
+    assert x2_spans and all(float(s["size"]) >= 9.5 for s in x2_spans)
+
+
+def test_item6_case7_missing_math_font_triggers_safe_fallback(tmp_path: Path) -> None:
+    """Item 6 (Case 7): When `font_math_path` is unavailable (`None`), a block containing
+    SMP mathematical symbols (`𝑃` U+1D443) that `NotoSerifJP` lacks must safely fall back
+    to `FALLBACK_ORIGINAL` with `UNRENDERABLE_GLYPH_FALLBACK` before redaction.
+    """
+    pdf_path = tmp_path / "no_math_font.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=400, height=150)
+    page.insert_text(pymupdf.Point(20, 50), "Original English with math P.", fontsize=10.0)
+    doc.save(str(pdf_path))
+    doc.close()
+
+    doc_model = Document(
+        id="doc-nomath",
+        original_filename="no_math_font.pdf",
+        safe_storage_path=str(pdf_path),
+        sha256_hash=compute_sha256(pdf_path),
+        file_size_bytes=pdf_path.stat().st_size,
+        page_count=1,
+    )
+    blk = Block(
+        id="doc-nomath:page-0:block-1",
+        page_index=0,
+        reading_order=0,
+        bbox=[20.0, 35.0, 300.0, 75.0],
+        kind=BlockKind.PARAGRAPH,
+        source_text="Original English with math 𝑃.",
+        masked_source_text="Original English with math {v1}.",
+        protected_items=[
+            ProtectedItem(placeholder="{v1}", kind=ProtectedItemKind.INLINE_FORMULA, original_text="𝑃"),
+        ],
+        translation_text="数式 {v1} を含む翻訳。",
+        status=BlockStatus.TRANSLATED,
+        font_size_pt=10.0,
+    )
+
+    cfg = AppConfig(runtime_dir=tmp_path / "rt", font_math_path=None)
+    adapter = NativePreservingAdapter(config=cfg)
+    mono_out = tmp_path / "nomath_mono.pdf"
+    updated_blocks, issues = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=[blk],
+        page_indices=[0],
+        mono_output_path=mono_out,
+        dual_output_path=None,
+        job_id="job-nomath",
+        job_config=TranslationJobConfig(),
+    )
+    assert updated_blocks[0].status == BlockStatus.FALLBACK_ORIGINAL
+    assert "UNRENDERABLE_GLYPH_FALLBACK" in updated_blocks[0].warnings
+    assert any(iss.code == "UNRENDERABLE_GLYPH_FALLBACK" for iss in issues)
+
+    out_doc = pymupdf.open(str(mono_out))
+    out_txt = out_doc[0].get_text("text")
+    out_doc.close()
+    assert "Original English with math P." in out_txt
+
+
+def test_item6_case8_adjacent_fallback_and_protected_skip_not_erased_by_redaction(tmp_path: Path) -> None:
+    """Item 6 (Case 8): When a `TRANSLATED` block's bbox is flush against an adjacent
+    `FALLBACK_ORIGINAL` block above/below or a `PROTECTED_SKIP` block on the left/right,
+    redacting the `TRANSLATED` block must never erase glyphs in the adjacent blocks.
+    """
+    pdf_path = tmp_path / "adj_redaction.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=500, height=300)
+    page.insert_text(pymupdf.Point(30, 48), "TOP FALLBACK ORIGINAL LINE", fontsize=10.0)
+    page.insert_text(pymupdf.Point(30, 68), "MIDDLE TRANSLATED LINE TO REPLACE", fontsize=10.0)
+    page.insert_text(pymupdf.Point(30, 92), "BOTTOM PROTECTED SKIP FORMULA E=mc2", fontsize=10.0)
+    page.insert_text(pymupdf.Point(280, 68), "RIGHT SIDE PROTECTED TEXT", fontsize=10.0)
+    doc.save(str(pdf_path))
+    doc.close()
+
+    doc_model = Document(
+        id="doc-adj",
+        original_filename="adj_redaction.pdf",
+        safe_storage_path=str(pdf_path),
+        sha256_hash=compute_sha256(pdf_path),
+        file_size_bytes=pdf_path.stat().st_size,
+        page_count=1,
+    )
+
+    b_top = Block(
+        id="doc-adj:page-0:block-1",
+        page_index=0,
+        reading_order=0,
+        bbox=[28.0, 36.0, 260.0, 53.0],
+        kind=BlockKind.PARAGRAPH,
+        source_text="TOP FALLBACK ORIGINAL LINE",
+        status=BlockStatus.FALLBACK_ORIGINAL,
+        font_size_pt=10.0,
+    )
+    b_mid = Block(
+        id="doc-adj:page-0:block-2",
+        page_index=0,
+        reading_order=1,
+        # Flush within 0.2pt of b_top, b_bot, and b_right
+        bbox=[28.0, 52.8, 278.2, 79.2],
+        kind=BlockKind.PARAGRAPH,
+        source_text="MIDDLE TRANSLATED LINE TO REPLACE",
+        masked_source_text="MIDDLE TRANSLATED LINE TO REPLACE",
+        translation_text="中央の翻訳済みテキスト",
+        status=BlockStatus.TRANSLATED,
+        font_size_pt=10.0,
+    )
+    b_bot = Block(
+        id="doc-adj:page-0:block-3",
+        page_index=0,
+        reading_order=2,
+        bbox=[28.0, 79.0, 260.0, 98.0],
+        kind=BlockKind.ISOLATED_FORMULA,
+        source_text="BOTTOM PROTECTED SKIP FORMULA E=mc2",
+        status=BlockStatus.PROTECTED_SKIP,
+        font_size_pt=10.0,
+    )
+    b_right = Block(
+        id="doc-adj:page-0:block-4",
+        page_index=0,
+        reading_order=3,
+        bbox=[278.0, 54.0, 460.0, 78.0],
+        kind=BlockKind.PARAGRAPH,
+        source_text="RIGHT SIDE PROTECTED TEXT",
+        status=BlockStatus.FALLBACK_ORIGINAL,
+        font_size_pt=10.0,
+    )
+
+    adapter = NativePreservingAdapter(config=AppConfig(runtime_dir=tmp_path / "rt"))
+    mono_out = tmp_path / "adj_mono.pdf"
+    updated_blocks, issues = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=[b_top, b_mid, b_bot, b_right],
+        page_indices=[0],
+        mono_output_path=mono_out,
+        dual_output_path=None,
+        job_id="job-adj",
+        job_config=TranslationJobConfig(),
+    )
+    assert not issues
+    assert updated_blocks[1].status == BlockStatus.TRANSLATED
+
+    out_doc = pymupdf.open(str(mono_out))
+    out_txt = out_doc[0].get_text("text")
+    out_doc.close()
+    assert "TOP FALLBACK ORIGINAL LINE" in out_txt
+    assert "BOTTOM PROTECTED SKIP FORMULA E=mc2" in out_txt
+    assert "RIGHT SIDE PROTECTED TEXT" in out_txt
+    assert "中央の翻訳済みテキスト" in out_txt
+    assert "MIDDLE TRANSLATED LINE TO REPLACE" not in out_txt
+
 
 
 

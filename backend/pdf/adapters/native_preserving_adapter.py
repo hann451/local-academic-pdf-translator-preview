@@ -175,11 +175,22 @@ _INLINE_MATH_EXPR_RE = re.compile(
     r")"
 )
 _EQUATION_NUM_ONLY_RE = re.compile(r"^\s*\(\d+(?:\.\d+)*[a-z]?\)\s*$")
-_UNRESOLVED_PH_CHECK_RE = re.compile(r"\{\s*v\s*\d+\s*\}|［v\d+］|｛v\d+｝", re.IGNORECASE)
+_UNRESOLVED_PH_CHECK_RE = re.compile(
+    r"(?:\{\s*v\s*\d+[A-Za-z0-9_]*\s*\}|［\s*v\s*\d+[A-Za-z0-9_]*\s*］|｛\s*v\s*\d+[A-Za-z0-9_]*\s*｝|\[\s*v\s*\d+[A-Za-z0-9_]*\s*\])",
+    re.IGNORECASE,
+)
 # Known TeX extension font (e.g. txexs) operator + Variation Selector-1/2 pairs where
 # U+FE00/U+FE01 selects operator display/text size in TeX but has no standalone PDF glyph.
 _KNOWN_TEX_OPERATOR_VS_RE = re.compile(r"([√∑∏∐∫∬∭∮⋀⋁⋂⋃])[\ufe00\ufe01]")
 _SMP_TOUNICODE_HEX_RE = re.compile(rb"<([0-9a-fA-F]{5,6})>")
+_BFCHAR_SECTION_RE = re.compile(rb"(beginbfchar\b)(.*?)(\bendbfchar)", re.DOTALL)
+_BFRANGE_SECTION_RE = re.compile(rb"(beginbfrange\b)(.*?)(\bendbfrange)", re.DOTALL)
+_BFCHAR_PAIR_RE = re.compile(rb"(<[0-9A-Fa-f]+>)(\s*)(<[0-9A-Fa-f]+>)")
+_BFRANGE_TRIPLE_RE = re.compile(
+    rb"(<[0-9A-Fa-f]+>)(\s*)(<[0-9A-Fa-f]+>)(\s*)(<[0-9A-Fa-f]+>|\[[^\]]*\])",
+    re.DOTALL,
+)
+_HEX_TOKEN_RE = re.compile(rb"<([0-9A-Fa-f]+)>")
 
 
 def normalize_for_pdf_rendering(text: str) -> str:
@@ -498,6 +509,89 @@ def extract_inline_math_spans(
                                 )
                             )
 
+    # Filter out any super/sub InlineMathSpan whose (context_text, target_text) appears multiple
+    # times in the same block with conflicting roles (e.g. both super and sub, or sub/super and normal).
+    if spans_out:
+        roles_by_ctx: dict[tuple[str, str], set[str]] = {}
+        for item in spans_out:
+            if item.role in ("super", "sub"):
+                roles_by_ctx.setdefault((item.context_text, item.target_text), set()).add(
+                    item.role
+                )
+        if roles_by_ctx:
+            normal_chunks: list[str] = []
+            for line in lines:
+                spans = line["spans"]
+                line_sizes = [
+                    float(s.get("size", 10.0))
+                    for s in spans
+                    if str(s.get("text", "")).strip()
+                ]
+                if not line_sizes:
+                    continue
+                max_sz = max(line_sizes)
+                base_origins = [
+                    float(s["origin"][1])
+                    for s in spans
+                    if isinstance(s.get("origin"), (list, tuple))
+                    and len(s["origin"]) >= 2
+                    and float(s.get("size", 10.0)) >= max_sz * 0.86
+                    and str(s.get("text", "")).strip() != "ˆ"
+                ]
+                baseline_y = (
+                    statistics.median(base_origins)
+                    if base_origins
+                    else (
+                        float(spans[0]["origin"][1])
+                        if isinstance(spans[0].get("origin"), (list, tuple))
+                        and len(spans[0]["origin"]) >= 2
+                        else 0.0
+                    )
+                )
+                cur_normal: list[str] = []
+                for s in spans:
+                    raw_t = normalize_for_pdf_rendering(str(s.get("text", "")))
+                    st = raw_t.strip()
+                    if not st:
+                        continue
+                    sz = float(s.get("size", 10.0))
+                    s_orig = s.get("origin")
+                    oy = (
+                        float(s_orig[1])
+                        if (isinstance(s_orig, (list, tuple)) and len(s_orig) >= 2)
+                        else baseline_y
+                    )
+                    is_sup = st != "ˆ" and (
+                        sz < max_sz * 0.86 and oy < baseline_y - max_sz * 0.10
+                    )
+                    is_sub = (
+                        st != "ˆ"
+                        and not is_sup
+                        and (sz < max_sz * 0.86 and oy > baseline_y + max_sz * 0.08)
+                    )
+                    if is_sup or is_sub or st == "ˆ":
+                        if cur_normal:
+                            normal_chunks.append("".join(cur_normal))
+                            cur_normal = []
+                    else:
+                        cur_normal.append(raw_t)
+                if cur_normal:
+                    normal_chunks.append("".join(cur_normal))
+
+            for (ctx, tgt), rset in roles_by_ctx.items():
+                pat = re.compile(re.escape(ctx) + r"(?![A-Za-z0-9\U0001d400-\U0001d7ff])")
+                for chunk in normal_chunks:
+                    if pat.search(chunk):
+                        rset.add("normal")
+                        break
+
+            spans_out = [
+                item
+                for item in spans_out
+                if item.role not in ("super", "sub")
+                or len(roles_by_ctx.get((item.context_text, item.target_text), set())) <= 1
+            ]
+
     return spans_out
 
 
@@ -550,6 +644,14 @@ def _build_styled_line_plan(
                 elif mspan.role in ("super", "sub") and ctx.endswith(tgt):
                     t1 = pos + len(ctx)
                     t0 = t1 - len(tgt)
+                    if (
+                        pos > 0
+                        and line_str[pos].isascii()
+                        and line_str[pos].isalpha()
+                        and line_str[pos - 1].isascii()
+                        and line_str[pos - 1].isalnum()
+                    ):
+                        continue
                     if (
                         t1 < n
                         and line_str[t1 - 1].isalnum()
@@ -665,18 +767,60 @@ def _build_styled_line_plan(
     return styled_runs, overbars, cursor_x, top_em, bot_em
 
 
-def _fix_embedded_tounicode_smp(doc: pymupdf.Document) -> None:
-    """Fix MuPDF's 5-digit hex `<1xxxx>` entries for SMP codepoints (`U+10000`..`U+10FFFF`)
-    in embedded `/ToUnicode` CMap streams into valid PDF 8-digit UTF-16BE surrogate pairs
-    (`<D8xxDCxx>`) so extracted/copied text preserves exact Mathematical Unicode codepoints.
+def _rewrite_tounicode_cmap_smp_bytes(raw: bytes) -> bytes:
+    """Rewrite 5- or 6-hex-digit SMP Unicode scalar values (`<10000>`..`<10FFFF>`) emitted by
+    MuPDF 1.27.x inside `beginbfchar ... endbfchar` and `beginbfrange ... endbfrange` sections
+    of a `/ToUnicode` CMap stream into PDF-compliant 8-digit UTF-16BE surrogate pairs (`<D8xxDCxx>`).
+
+    Guarantees:
+    - 4-digit BMP targets (`<0041>`, `<3042>`) are never modified.
+    - 8-digit valid UTF-16BE surrogate pairs (`<D835DC43>`) or BMP ligatures are never modified.
+    - Source glyph codes (`<src>` in `bfchar` and `<src_lo> <src_hi>` in `bfrange`) are never modified.
+    - Unsupported CMap sections (`begincidchar`, `begincidrange`, headers/footers) are never modified.
+    - Idempotent: applying this function two or more times produces the exact same bytes.
     """
-    def _repl(m: re.Match) -> bytes:
-        cp = int(m.group(1), 16)
-        if 0x10000 <= cp <= 0x10FFFF:
-            u16 = chr(cp).encode("utf-16-be").hex().upper().encode("ascii")
-            return b"<" + u16 + b">"
+    if not raw or (b"beginbfchar" not in raw and b"beginbfrange" not in raw):
+        return raw
+
+    def _fix_dst_hex_token(m: re.Match) -> bytes:
+        hex_bytes = m.group(1)
+        if len(hex_bytes) in (5, 6):
+            cp = int(hex_bytes, 16)
+            if 0x10000 <= cp <= 0x10FFFF:
+                u16 = chr(cp).encode("utf-16-be").hex().upper().encode("ascii")
+                return b"<" + u16 + b">"
         return m.group(0)
 
+    def _fix_bfchar_section(sec_match: re.Match) -> bytes:
+        prefix, body, suffix = sec_match.group(1), sec_match.group(2), sec_match.group(3)
+        fixed_body = _BFCHAR_PAIR_RE.sub(
+            lambda pm: pm.group(1) + pm.group(2) + _HEX_TOKEN_RE.sub(_fix_dst_hex_token, pm.group(3)),
+            body,
+        )
+        return prefix + fixed_body + suffix
+
+    def _fix_bfrange_section(sec_match: re.Match) -> bytes:
+        prefix, body, suffix = sec_match.group(1), sec_match.group(2), sec_match.group(3)
+        fixed_body = _BFRANGE_TRIPLE_RE.sub(
+            lambda rm: (
+                rm.group(1)
+                + rm.group(2)
+                + rm.group(3)
+                + rm.group(4)
+                + _HEX_TOKEN_RE.sub(_fix_dst_hex_token, rm.group(5))
+            ),
+            body,
+        )
+        return prefix + fixed_body + suffix
+
+    out = _BFCHAR_SECTION_RE.sub(_fix_bfchar_section, raw)
+    out = _BFRANGE_SECTION_RE.sub(_fix_bfrange_section, out)
+    return out
+
+
+def _collect_document_tounicode_xrefs(doc: pymupdf.Document) -> set[int]:
+    """Return the set of all `/ToUnicode` stream xrefs currently referenced anywhere in `doc`."""
+    tu_xrefs: set[int] = set()
     for xref in range(1, doc.xref_length()):
         try:
             obj = doc.xref_object(xref)
@@ -685,13 +829,58 @@ def _fix_embedded_tounicode_smp(doc: pymupdf.Document) -> None:
         if "/ToUnicode " in obj:
             try:
                 tu_xref = int(obj.split("/ToUnicode ")[1].split()[0])
-                raw = doc.xref_stream(tu_xref)
-                if raw:
-                    fixed = _SMP_TOUNICODE_HEX_RE.sub(_repl, raw)
-                    if fixed != raw:
-                        doc.update_stream(tu_xref, fixed)
+                tu_xrefs.add(tu_xref)
             except Exception:
                 continue
+    return tu_xrefs
+
+
+def _fix_embedded_tounicode_smp(
+    doc: pymupdf.Document,
+    target_font_tags: tuple[str, ...] = ("F_JA", "F_MATH"),
+    protected_tounicode_xrefs: set[int] | None = None,
+) -> int:
+    """Fix MuPDF's 5-digit hex `<1xxxx>` entries for SMP codepoints (`U+10000`..`U+10FFFF`)
+    in embedded `/ToUnicode` CMap streams of newly inserted translation/math fonts (`F_JA`, `F_MATH`)
+    into valid PDF 8-digit UTF-16BE surrogate pairs (`<D8xxDCxx>`), without touching any original
+    PDF font CMap streams. Returns the number of `/ToUnicode` streams updated.
+    """
+    target_tag_set = set(target_font_tags)
+    candidate_font_xrefs: set[int] = set()
+    for p_idx in range(len(doc)):
+        try:
+            for f_entry in doc.get_page_fonts(p_idx):
+                # f_entry = (xref, ext, type, basefont, name, encoding, ...)
+                if len(f_entry) >= 5 and f_entry[4] in target_tag_set:
+                    candidate_font_xrefs.add(int(f_entry[0]))
+        except Exception:
+            continue
+
+    seen_tu_xrefs: set[int] = set()
+    updated_count = 0
+    for font_xref in sorted(candidate_font_xrefs):
+        try:
+            obj = doc.xref_object(font_xref)
+        except Exception:
+            continue
+        if "/ToUnicode " not in obj:
+            continue
+        try:
+            tu_xref = int(obj.split("/ToUnicode ")[1].split()[0])
+            if tu_xref in seen_tu_xrefs:
+                continue
+            seen_tu_xrefs.add(tu_xref)
+            if protected_tounicode_xrefs and tu_xref in protected_tounicode_xrefs:
+                continue
+            raw = doc.xref_stream(tu_xref)
+            if raw:
+                fixed = _rewrite_tounicode_cmap_smp_bytes(raw)
+                if fixed != raw:
+                    doc.update_stream(tu_xref, fixed)
+                    updated_count += 1
+        except Exception:
+            continue
+    return updated_count
 
 
 def _find_unresolved_placeholders(restored_text: str, source_text: str) -> list[str]:
@@ -2126,6 +2315,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
 
         try:
             out_doc.insert_pdf(src_doc)
+            orig_tounicode_xrefs = _collect_document_tounicode_xrefs(out_doc)
             target_set = set(page_indices)
 
             for p_idx in sorted(target_set):
@@ -2134,6 +2324,58 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 mpage = out_doc[p_idx]
                 page_blocks = blocks_by_page.get(p_idx, [])
                 page_manual = manual_by_page.get(p_idx, [])
+
+                # Pre-check 0: Detect translatable block pairs whose bounding boxes deeply overlap
+                # (e.g. when PyMuPDF split a single paragraph mid-line across an inline math stack
+                # or stacked fraction like 1/10). Fall back both colliding blocks to original before
+                # redaction so they never render overlapping Japanese text or distort split fractions.
+                candidate_trans_blocks = [
+                    b
+                    for b in page_blocks
+                    if b.status in (BlockStatus.TRANSLATED, BlockStatus.MANUALLY_EDITED)
+                    and b.effective_translation
+                ]
+                colliding_block_ids: dict[str, list[str]] = {}
+                for i_b, b1 in enumerate(candidate_trans_blocks):
+                    for b2 in candidate_trans_blocks[i_b + 1 :]:
+                        x_ov = min(float(b1.bbox[2]), float(b2.bbox[2])) - max(
+                            float(b1.bbox[0]), float(b2.bbox[0])
+                        )
+                        y_ov = min(float(b1.bbox[3]), float(b2.bbox[3])) - max(
+                            float(b1.bbox[1]), float(b2.bbox[1])
+                        )
+                        if x_ov > 5.0 and y_ov >= 4.5:
+                            ir1 = bbox_intersection_ratio(b1.bbox, b2.bbox)
+                            ir2 = bbox_intersection_ratio(b2.bbox, b1.bbox)
+                            if max(ir1, ir2) >= 0.20 or bbox_iou(b1.bbox, b2.bbox) >= 0.08:
+                                colliding_block_ids.setdefault(b1.id, []).append(b2.id)
+                                colliding_block_ids.setdefault(b2.id, []).append(b1.id)
+
+                for b_col in candidate_trans_blocks:
+                    if b_col.id in colliding_block_ids:
+                        peer_ids = colliding_block_ids[b_col.id]
+                        b_col.status = BlockStatus.FALLBACK_ORIGINAL
+                        b_col.translation_provenance = "fallback_original"
+                        if "TRANSLATED_BLOCK_OVERLAP_FALLBACK" not in b_col.warnings:
+                            b_col.warnings.append("TRANSLATED_BLOCK_OVERLAP_FALLBACK")
+                        issues.append(
+                            ValidationIssue(
+                                id=f"iss-{uuid.uuid4().hex[:10]}",
+                                job_id=job_id,
+                                document_id=document.id,
+                                page_index=p_idx,
+                                block_id=b_col.id,
+                                bbox=b_col.bbox,
+                                code="TRANSLATED_BLOCK_OVERLAP_FALLBACK",
+                                severity=IssueSeverity.WARNING,
+                                message=(
+                                    f"隣接する翻訳ブロック（{peer_ids}）と矩形が大きく重複しているため、"
+                                    "行の重なりや分割数式の崩れを防ぎ原文要素を保持しました。"
+                                ),
+                                details={"colliding_block_ids": peer_ids},
+                                fallback_applied=True,
+                            )
+                        )
 
                 # Collect all protected bounding boxes on this page so we NEVER draw over them
                 protected_boxes: list[list[float]] = [
@@ -2150,7 +2392,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
                     ):
                         protected_boxes.append(reg.bbox)
 
-                approved_typeset_items: list[tuple[Block, float, list[str]]] = []
+                approved_typeset_items: list[tuple[Block, float, list[str], list[InlineMathSpan]]] = []
 
                 for blk in page_blocks:
                     if blk.status not in (BlockStatus.TRANSLATED, BlockStatus.MANUALLY_EDITED):
@@ -2276,6 +2518,44 @@ class NativePreservingAdapter(PdfEngineAdapter):
                         except Exception:
                             pass
 
+                    # For MANUALLY_EDITED blocks, only apply InlineMathSpan items that belong to
+                    # protected `{vN}` placeholders still present in the manual translation text
+                    # (or legacy unmasked math already in `blk.translation_text`), and never apply
+                    # source inline_math_spans onto new plain text typed outside `{vN}`.
+                    if blk.status == BlockStatus.MANUALLY_EDITED:
+                        all_prot_texts = [
+                            normalize_for_pdf_rendering(it.original_text)
+                            for it in blk.protected_items
+                        ]
+                        kept_orig_texts = [
+                            normalize_for_pdf_rendering(it.original_text)
+                            for it in blk.protected_items
+                            if it.placeholder in effective_txt
+                        ]
+                        stripped_manual = normalize_for_pdf_rendering(
+                            re.sub(
+                                r"\{v\d+\}",
+                                " ",
+                                effective_txt,
+                            )
+                        )
+                        norm_orig_trans = normalize_for_pdf_rendering(blk.translation_text or "")
+                        active_math_spans = [
+                            ms
+                            for ms in blk.inline_math_spans
+                            if (
+                                any(ms.context_text in orig_t for orig_t in kept_orig_texts)
+                                and ms.context_text not in stripped_manual
+                            )
+                            or (
+                                not any(ms.context_text in orig_t for orig_t in all_prot_texts)
+                                and bool(norm_orig_trans)
+                                and ms.context_text in norm_orig_trans
+                            )
+                        ]
+                    else:
+                        active_math_spans = list(blk.inline_math_spans)
+
                     # Fit Japanese lines within bbox respecting min_font_size_pt (Section 12)
                     fitted_size, wrapped_lines, fits = fit_japanese_text_in_bbox(
                         text=render_ready_text,
@@ -2284,7 +2564,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
                         min_font_size=job_config.min_font_size_pt,
                         ja_font=ja_font_obj,
                         math_font=math_font_obj,
-                        inline_math_spans=blk.inline_math_spans,
+                        inline_math_spans=active_math_spans,
                     )
                     if not fits:
                         # Section 12: Never shrink below min_font_size_pt, never delete text,
@@ -2317,11 +2597,11 @@ class NativePreservingAdapter(PdfEngineAdapter):
                         continue
 
                     blk.fitted_font_size_pt = fitted_size
-                    approved_typeset_items.append((blk, fitted_size, wrapped_lines))
+                    approved_typeset_items.append((blk, fitted_size, wrapped_lines, active_math_spans))
 
                 if approved_typeset_items:
                     # Redact ONLY the approved translated text bounding boxes while preserving 100% of images & vector line art
-                    for blk, _, _ in approved_typeset_items:
+                    for blk, _, _, _ in approved_typeset_items:
                         rx0, ry0, rx1, ry1 = (
                             float(blk.bbox[0]),
                             float(blk.bbox[1]),
@@ -2329,13 +2609,20 @@ class NativePreservingAdapter(PdfEngineAdapter):
                             float(blk.bbox[3]),
                         )
                         # Ensure redaction rect never clips the border of any adjacent protected box
+                        # (top, bottom, left, right) so adjacent FALLBACK_ORIGINAL / PROTECTED_SKIP
+                        # glyphs are never erased by MuPDF's apply_redactions.
                         for pb in protected_boxes:
                             px0, py0, px1, py1 = float(pb[0]), float(pb[1]), float(pb[2]), float(pb[3])
                             if min(rx1, px1) - max(rx0, px0) > 0:
-                                if py0 >= ry0 and py0 <= ry1 + 1.0 and py0 > (ry0 + ry1) / 2.0:
-                                    ry1 = min(ry1, py0 - 0.5)
-                                elif py1 <= ry1 and py1 >= ry0 - 1.0 and py1 < (ry0 + ry1) / 2.0:
-                                    ry0 = max(ry0, py1 + 0.5)
+                                if py0 >= ry0 and py0 <= ry1 + 1.2 and py0 > (ry0 + ry1) / 2.0:
+                                    ry1 = min(ry1, py0 - 1.0)
+                                elif py1 <= ry1 and py1 >= ry0 - 1.2 and py1 < (ry0 + ry1) / 2.0:
+                                    ry0 = max(ry0, py1 + 1.0)
+                            if min(ry1, py1) - max(ry0, py0) > 0:
+                                if px0 >= rx0 and px0 <= rx1 + 1.2 and px0 > (rx0 + rx1) / 2.0:
+                                    rx1 = min(rx1, px0 - 1.0)
+                                elif px1 <= rx1 and px1 >= rx0 - 1.2 and px1 < (rx0 + rx1) / 2.0:
+                                    rx0 = max(rx0, px1 + 1.0)
                         if rx1 > rx0 and ry1 > ry0:
                             rect = pymupdf.Rect(rx0, ry0, rx1, ry1)
                             mpage.add_redact_annot(rect, fill=(1, 1, 1))
@@ -2346,8 +2633,8 @@ class NativePreservingAdapter(PdfEngineAdapter):
 
                     # Clear any inline radical vinculum bar from the original English position
                     # for blocks that are being re-typeset so orphan bars do not remain over prose
-                    for blk, _, _ in approved_typeset_items:
-                        for mspan in blk.inline_math_spans:
+                    for blk, _, _, active_math_spans in approved_typeset_items:
+                        for mspan in active_math_spans:
                             if mspan.orig_overbar_bbox and len(mspan.orig_overbar_bbox) == 4:
                                 ox0, oy0, ox1, oy1 = (
                                     float(mspan.orig_overbar_bbox[0]),
@@ -2369,7 +2656,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
                     if math_font_tag and math_font_path and Path(math_font_path).exists():
                         mpage.insert_font(fontname=math_font_tag, fontfile=str(math_font_path))
 
-                    for blk, fitted_size, wrapped_lines in approved_typeset_items:
+                    for blk, fitted_size, wrapped_lines, active_math_spans in approved_typeset_items:
                         line_height = fitted_size * 1.32
                         cursor_y = blk.bbox[1] + fitted_size * 0.95
                         base_x = float(blk.bbox[0])
@@ -2381,7 +2668,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
                                 ja_font=ja_font_obj,
                                 math_font_tag=math_font_tag,
                                 math_font=math_font_obj,
-                                inline_math_spans=blk.inline_math_spans,
+                                inline_math_spans=active_math_spans,
                             )
                             for r_tag, _r_font, r_text, x_off, y_off, r_fs in styled_runs:
                                 mpage.insert_text(
@@ -2402,7 +2689,11 @@ class NativePreservingAdapter(PdfEngineAdapter):
                                 )
                             cursor_y += line_height
 
-            _fix_embedded_tounicode_smp(out_doc)
+            _fix_embedded_tounicode_smp(
+                out_doc,
+                target_font_tags=("F_JA", "F_MATH"),
+                protected_tounicode_xrefs=orig_tounicode_xrefs,
+            )
 
             if mono_output_path:
                 mono_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2572,15 +2863,22 @@ def mask_inline_protected_elements(text: str) -> tuple[str, list[ProtectedItem]]
     """Detect inline formulas, Greek/math symbols, sub/superscripts, and URLs/DOIs,
     replacing them with `{v1}`, `{v2}`, ... while leaving `[1]` citation brackets visible
     (or protected) for validation. Also safely protects any pre-existing literal `{vN}`
-    in the source text so it cannot collide with generated placeholders.
+    or Private Use Area (PUA) characters in the source text so they cannot collide with
+    generated placeholders or internal sentinels.
     """
     pending_items: list[tuple[ProtectedItemKind, str]] = []
-    sentinel_re = re.compile(r"[\ue100-\ue8ff]")
+    existing_cps = {ord(ch) for ch in text if ord(ch) >= 0xE000}
+    base_cp = 0xE100
+    for candidate_base in list(range(0xE100, 0xF800, 256)) + list(range(0xF0000, 0xFF000, 256)):
+        if not any(candidate_base <= cp < candidate_base + 256 for cp in existing_cps):
+            base_cp = candidate_base
+            break
+    sentinel_re = re.compile(f"[{chr(base_cp)}-{chr(base_cp + 255)}]")
 
     def _alloc_sentinel(kind: ProtectedItemKind, orig_text: str) -> str:
         idx = len(pending_items)
         pending_items.append((kind, orig_text))
-        return chr(0xE100 + idx)
+        return chr(base_cp + idx)
 
     # Protect any pre-existing literal `{v1}`, `{v2}`, ... in source text first
     working = re.sub(
@@ -2630,7 +2928,7 @@ def mask_inline_protected_elements(text: str) -> tuple[str, list[ProtectedItem]]
 
     def _finalize_sentinel(match: re.Match) -> str:
         nonlocal counter
-        idx = ord(match.group(0)) - 0xE100
+        idx = ord(match.group(0)) - base_cp
         kind, orig_text = pending_items[idx]
         counter += 1
         ph = f"{{v{counter}}}"

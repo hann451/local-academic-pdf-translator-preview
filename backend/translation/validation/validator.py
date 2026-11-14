@@ -26,7 +26,10 @@ from dataclasses import dataclass, field
 from backend.domain.models import IssueSeverity, ProtectedItem, ProtectedItemKind
 
 _PLACEHOLDER_RE = re.compile(r"\{v\d+\}")
-_MALFORMED_PLACEHOLDER_RE = re.compile(r"\{\s*v\s*\d+\s*\}|［v\d+］|｛v\d+｝", re.IGNORECASE)
+_MALFORMED_PLACEHOLDER_RE = re.compile(
+    r"(?:\{\s*v\s*\d+[A-Za-z0-9_]*\s*\}|［\s*v\s*\d+[A-Za-z0-9_]*\s*］|｛\s*v\s*\d+[A-Za-z0-9_]*\s*｝|\[\s*v\s*\d+[A-Za-z0-9_]*\s*\])",
+    re.IGNORECASE,
+)
 _PLAMO_SPECIAL_RE = re.compile(r"<\|plamo:[^|>]+\|>")
 _CITATION_BRACKET_RE = re.compile(r"\[\d+(?:\s*[-,–]\s*\d+)*\]")
 _NUMBER_TOKEN_RE = re.compile(r"(?<![a-zA-Z_{])[-+]?\d+(?:,\d{3})*(?:\.\d+)?(?:[eE][-+]?\d+)?(?![a-zA-Z_}])")
