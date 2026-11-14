@@ -16,12 +16,15 @@ from backend.domain.models import (
     BlockKind,
     BlockStatus,
     Document,
+    InlineMathSpan,
     ProtectedItem,
     ProtectedItemKind,
     TranslationJobConfig,
 )
 from backend.pdf.adapters.native_preserving_adapter import (
     NativePreservingAdapter,
+    _fix_embedded_tounicode_smp,
+    extract_inline_math_spans,
     mask_inline_protected_elements,
     unmask_inline_protected_elements,
 )
@@ -155,6 +158,7 @@ def _make_densepose_p3_block16_pdf(pdf_path: Path) -> Document:
         fontname=mfont,
     )
 
+    _fix_embedded_tounicode_smp(doc)
     doc.save(str(pdf_path))
     doc.close()
 
@@ -647,5 +651,182 @@ def test_unit_c_inter_span_space_recovery() -> None:
     assert has_sub is True
     assert text_lines[0] == "ment 𝑧= 𝑎+𝑏𝑖 are computed using 𝐴=√︁(𝑎2 + 𝑏2)"
     assert text_lines[1] == "from −𝜋 to 𝜋 and rate 1𝑒−5."
+
+
+# ==============================================================================
+# Unit D: Structured Inline Math (Superscripts, Subscripts, Hats, Radical Overbar)
+# ==============================================================================
+def test_unit_d_superscript_and_radical_overbar_extraction_and_rendering(tmp_path: Path) -> None:
+    """Section 5: Verify that `extract_inline_math_spans` and `typeset_and_export` preserve:
+    1. Superscripts (`𝑎2`, `𝑏2`) at smaller font size (`0.78 * fitted_size`) and elevated `origin_y`.
+    2. Radical vinculum overbar (`√(𝑎2 + 𝑏2)`) redrawn above the translated `(𝑎2 + 𝑏2)` span.
+    """
+    pdf_path = tmp_path / "unit_d_b16.pdf"
+    doc_model = _make_densepose_p3_block16_pdf(pdf_path)
+
+    src_text = (
+        "In raw CSI samples (5 consecutive samples visualized in Fig- ure 3(a-b)), "
+        "the amplitude (𝐴) and phase (Φ) of each complex ele- ment 𝑧= 𝑎+𝑏𝑖 are computed "
+        "using the formulation 𝐴=√︁(𝑎2 + 𝑏2) and Φ = 𝑎𝑟𝑐𝑡𝑎𝑛(𝑏/𝑎). Note that the range "
+        "of the arctan function is from −𝜋 to 𝜋 and the phase values outside this range "
+        "get wrapped."
+    )
+    masked, items = mask_inline_protected_elements(src_text)
+    blk = Block(
+        id="doc-repro16:page-1:block-16",
+        page_index=0,
+        bbox=[318.0, 357.0, 560.0, 433.0],
+        kind=BlockKind.PARAGRAPH,
+        reading_order=1,
+        source_text=src_text,
+        masked_source_text=masked,
+        protected_items=items,
+        translation_text=(
+            "生のCSIサンプル（図3(a-b)）では、各複素要素 {v3} の振幅 ({v1}) と位相 ({v2}) は、"
+            "式 {v4} と {v5} を用いて計算される。arctanの範囲は {v6} から {v7} である。"
+        ),
+        status=BlockStatus.TRANSLATED,
+        font_size_pt=8.97,
+    )
+
+    adapter = NativePreservingAdapter()
+    mono_out = tmp_path / "unit_d_b16_out.pdf"
+    _, issues = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=[blk],
+        page_indices=[0],
+        job_config=TranslationJobConfig(),
+        mono_output_path=mono_out,
+        dual_output_path=None,
+        job_id="job-unit-d-b16",
+    )
+
+    assert blk.status == BlockStatus.TRANSLATED
+    assert not issues
+    roles = {(m.role, m.context_text, m.target_text) for m in blk.inline_math_spans}
+    assert ("radicand", "√(𝑎2 + 𝑏2)", "(𝑎2 + 𝑏2)") in roles
+    assert ("super", "𝑎2", "2") in roles
+    assert ("super", "𝑏2", "2") in roles
+
+    out_pdf = pymupdf.open(str(mono_out))
+    page = out_pdf[0]
+    d = page.get_text("dict", clip=pymupdf.Rect(blk.bbox))
+    all_spans = [s for b in d["blocks"] if b.get("type") == 0 for ln in b["lines"] for s in ln["spans"]]
+    sup_spans = [s for s in all_spans if s["text"].strip() == "2"]
+    normal_spans = [s for s in all_spans if "𝑎" in s["text"] or "𝑏" in s["text"]]
+    assert len(sup_spans) >= 2
+    assert normal_spans
+    for ss in sup_spans:
+        assert ss["size"] < blk.fitted_font_size_pt * 0.85
+        # Find normal span on the same line
+        same_line_norm = [
+            ns for ns in normal_spans if abs(ns["origin"][1] - ss["origin"][1]) < 6.0
+        ]
+        assert same_line_norm
+        assert ss["origin"][1] < same_line_norm[0]["origin"][1] - 1.5
+
+    # Verify that a horizontal radical overbar line was drawn in the output PDF
+    horiz_lines = [
+        dr["rect"]
+        for dr in page.get_drawings()
+        if dr.get("rect")
+        and abs(dr["rect"].y1 - dr["rect"].y0) <= 1.2
+        and (dr["rect"].x1 - dr["rect"].x0) >= 15.0
+    ]
+    assert len(horiz_lines) >= 2  # Original (covered by white rect) + new translated radical bar
+    out_pdf.close()
+
+
+def test_unit_d_circumflex_hat_and_subscript_positioning(tmp_path: Path) -> None:
+    """Section 5: Verify that circumflex hats (`ˆ𝜙𝑓`, `ˆ𝑖𝑝`, `ˆ𝑀`) are centered over the base
+    character and raised vertically, and subscripts (`𝑓`, `𝑐𝑙𝑠`, `𝑑𝑝`) are rendered at smaller
+    size and lowered `origin_y`.
+    """
+    pdf_path = tmp_path / "unit_d_hat_sub.pdf"
+    doc_model = _make_densepose_p3_block16_pdf(pdf_path)
+
+    src_text = "where ˆ𝜙𝑓 is the phase and 𝐿𝑐𝑙𝑠, 𝐿𝑑𝑝 are losses."
+    masked, items = mask_inline_protected_elements(src_text)
+    blk = Block(
+        id="doc-repro16:page-1:block-18",
+        page_index=0,
+        bbox=[318.0, 357.0, 560.0, 433.0],
+        kind=BlockKind.PARAGRAPH,
+        reading_order=1,
+        source_text=src_text,
+        masked_source_text=masked,
+        protected_items=items,
+        inline_math_spans=[
+            InlineMathSpan(context_text="ˆ𝜙", target_text="ˆ", role="hat", scale=1.0, dy_em=-0.23),
+            InlineMathSpan(context_text="𝜙𝑓", target_text="𝑓", role="sub", scale=0.78, dy_em=0.18),
+            InlineMathSpan(context_text="𝐿𝑐𝑙𝑠", target_text="𝑐𝑙𝑠", role="sub", scale=0.78, dy_em=0.18),
+            InlineMathSpan(context_text="𝐿𝑑𝑝", target_text="𝑑𝑝", role="sub", scale=0.78, dy_em=0.18),
+        ],
+        translation_text="ここで {v1} は位相であり、{v2}、{v3} は損失である。",
+        status=BlockStatus.TRANSLATED,
+        font_size_pt=8.97,
+    )
+
+    adapter = NativePreservingAdapter()
+    mono_out = tmp_path / "unit_d_hat_sub_out.pdf"
+    _, issues = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=[blk],
+        page_indices=[0],
+        job_config=TranslationJobConfig(),
+        mono_output_path=mono_out,
+        dual_output_path=None,
+        job_id="job-unit-d-hat",
+    )
+
+    assert blk.status == BlockStatus.TRANSLATED
+    assert not issues
+
+    out_pdf = pymupdf.open(str(mono_out))
+    d = out_pdf[0].get_text("dict", clip=pymupdf.Rect(blk.bbox))
+    all_spans = [s for b in d["blocks"] if b.get("type") == 0 for ln in b["lines"] for s in ln["spans"]]
+    out_pdf.close()
+
+    hat_span = next(s for s in all_spans if "ˆ" in s["text"])
+    phi_span = next(s for s in all_spans if "𝜙" in s["text"])
+    sub_f_span = next(s for s in all_spans if "𝑓" in s["text"])
+    sub_cls_span = next(s for s in all_spans if "𝑐𝑙𝑠" in s["text"])
+
+    # Hat is raised above phi and overlaps horizontally with phi
+    assert hat_span["origin"][1] < phi_span["origin"][1] - 1.2
+    assert abs(hat_span["origin"][0] - phi_span["origin"][0]) < 4.0
+
+    # Subscripts are lowered below baseline and have smaller font size
+    assert sub_f_span["size"] < phi_span["size"] * 0.85
+    assert sub_f_span["origin"][1] > phi_span["origin"][1] + 1.0
+    assert sub_cls_span["size"] < phi_span["size"] * 0.85
+    assert sub_cls_span["origin"][1] > phi_span["origin"][1] + 1.0
+
+
+def test_unit_d_non_radical_lines_and_plain_text_not_misclassified() -> None:
+    """Section 5: Horizontal rules that do not start at `√` or do not end at an expression
+    boundary must NOT be classified as radical overbars, and normal-baseline alphanumeric
+    tokens (`𝐸1`, `1𝑒−5`) must NOT be guessed as subscripts/superscripts.
+    """
+    raw_lines = [
+        {
+            "bbox": [50.0, 200.0, 300.0, 210.0],
+            "spans": [
+                {"text": "For instance, ", "size": 9.0, "origin": [50.0, 208.0], "bbox": [50.0, 200.0, 110.0, 210.0]},
+                {"text": "𝐸", "size": 9.0, "origin": [110.0, 208.0], "bbox": [110.0, 200.0, 116.0, 210.0]},
+                {"text": "1", "size": 9.0, "origin": [116.5, 208.0], "bbox": [116.5, 200.0, 121.0, 210.0]},
+                {"text": " and rate 1𝑒−5 with √", "size": 9.0, "origin": [121.0, 208.0], "bbox": [121.0, 200.0, 210.0, 210.0]},
+                {"text": "(x + y) in text", "size": 9.0, "origin": [210.0, 208.0], "bbox": [210.0, 200.0, 290.0, 210.0]},
+            ],
+        }
+    ]
+    # A full-width table/underline rule from x=50 to x=300 (does not start at √ x1=210)
+    unrelated_drawings = [
+        {"rect": pymupdf.Rect(50.0, 200.5, 300.0, 200.5), "width": 0.5},
+        {"rect": pymupdf.Rect(210.0, 200.5, 350.0, 200.5), "width": 0.5},
+    ]
+    spans = extract_inline_math_spans(raw_lines, unrelated_drawings)
+    assert spans == []
+
 
 

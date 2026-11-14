@@ -172,6 +172,36 @@ class ProtectedItem(BaseModel):
         return [float(x) for x in v]
 
 
+class InlineMathSpan(BaseModel):
+    """Structured geometric/typographic annotation for an inline mathematical element
+    (superscript, subscript, circumflex hat over base symbol, or radical vinculum overbar)
+    extracted from the original PDF's span coordinates and vector drawings.
+    """
+
+    context_text: str = Field(
+        ...,
+        description="Normalized substring context in the block text (e.g. '𝑎2', '𝐿𝑐𝑙𝑠', 'ˆ𝜙', '√(𝑎2 + 𝑏2)')",
+    )
+    target_text: str = Field(
+        ...,
+        description="The specific substring within context_text that receives this styling (e.g. '2', '𝑐𝑙𝑠', 'ˆ', '(𝑎2 + 𝑏2)')",
+    )
+    role: Literal["super", "sub", "hat", "radicand"]
+    scale: float = Field(default=1.0, gt=0)
+    dy_em: float = Field(
+        default=0.0,
+        description="Vertical offset relative to font_size_pt (negative = up, positive = down)",
+    )
+    overbar: bool = Field(
+        default=False,
+        description="Whether to draw a horizontal radical vinculum over target_text",
+    )
+    orig_overbar_bbox: list[float] | None = Field(
+        default=None,
+        description="Original PDF bbox [x0, y0, x1, y1] of the inline radical vinculum bar to clear on redaction",
+    )
+
+
 class ContinuationCandidate(BaseModel):
     counterpart_block_id: str
     direction: Literal["previous", "next"]
@@ -197,6 +227,7 @@ class Block(BaseModel):
     source_text: str
     masked_source_text: str | None = None
     protected_items: list[ProtectedItem] = Field(default_factory=list)
+    inline_math_spans: list[InlineMathSpan] = Field(default_factory=list)
     continuation_candidates: list[ContinuationCandidate] = Field(default_factory=list)
     translation_text: str | None = None
     manual_translation_text: str | None = None
