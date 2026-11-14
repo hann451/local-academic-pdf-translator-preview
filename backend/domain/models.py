@@ -200,6 +200,10 @@ class InlineMathSpan(BaseModel):
         default=None,
         description="Original PDF bbox [x0, y0, x1, y1] of the inline radical vinculum bar to clear on redaction",
     )
+    ambiguous: bool = Field(
+        default=False,
+        description="True when conflicting super/sub/normal roles exist for this context in the block",
+    )
 
 
 class ContinuationCandidate(BaseModel):

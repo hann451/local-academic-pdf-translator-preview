@@ -19,14 +19,19 @@ from backend.domain.models import (
     InlineMathSpan,
     ProtectedItem,
     ProtectedItemKind,
+    ProtectionMode,
+    ProtectionRegion,
     TranslationJobConfig,
 )
 from backend.pdf.adapters.native_preserving_adapter import (
     NativePreservingAdapter,
+    _build_styled_line_plan,
     _fix_embedded_tounicode_smp,
     extract_inline_math_spans,
+    fit_japanese_text_in_bbox,
     mask_inline_protected_elements,
     unmask_inline_protected_elements,
+    wrap_japanese_kinsoku,
 )
 from backend.translation.validation.validator import validate_translation_output
 
@@ -1252,10 +1257,15 @@ def test_item6_case4_repeated_identical_math_string_with_conflicting_roles() -> 
         }
     ]
     spans = extract_inline_math_spans(raw_lines)
-    ctx_set = {(s.context_text, s.target_text, s.role) for s in spans}
-    # Conflicting "𝑥2" (super vs sub) and "𝑎1" (sub vs normal) must be excluded
-    assert not any(s.context_text == "𝑥2" for s in spans)
-    assert not any(s.context_text == "𝑎1" for s in spans)
+    non_ambiguous_spans = [s for s in spans if not s.ambiguous]
+    ambiguous_spans = [s for s in spans if s.ambiguous]
+    ctx_set = {(s.context_text, s.target_text, s.role) for s in non_ambiguous_spans}
+    # Conflicting "𝑥2" (super vs sub) and "𝑎1" (sub vs normal) must not be kept as unambiguous,
+    # and must instead be propagated explicitly with ambiguous=True.
+    assert not any(s.context_text == "𝑥2" for s in non_ambiguous_spans)
+    assert not any(s.context_text == "𝑎1" for s in non_ambiguous_spans)
+    assert any(s.context_text == "𝑥2" and s.ambiguous for s in ambiguous_spans)
+    assert any(s.context_text == "𝑎1" and s.ambiguous for s in ambiguous_spans)
     # Unambiguous "𝑦3" (super) is preserved
     assert ("𝑦3", "3", "super") in ctx_set
 
@@ -1549,3 +1559,523 @@ def test_yugothr_fallback_prefers_math_font_for_minus_and_hat(tmp_path: Path) ->
     assert "－" not in extracted
     assert "ˆ" in extracted
     assert "𝜋" in extracted
+
+
+def test_review_item1_conflicting_math_roles_e2e_fallback_and_warning(tmp_path: Path) -> None:
+    """PR review #1: A block containing x^2 (super), x_2 (sub), and normal x2 must NOT
+    silently drop InlineMathSpans and flatten everything to plain 'x2'. It must either
+    preserve each role unambiguously or safely fall back to original + warning before redaction.
+    """
+    pdf_path = tmp_path / "item1_ambiguous_math.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=400)
+    # Build one paragraph block [40, 40, 420, 80] with x^2, x_2, and baseline x2
+    page.insert_text(pymupdf.Point(40, 60), "Consider x", fontsize=10.0)
+    page.insert_text(pymupdf.Point(89, 55), "2", fontsize=6.5)  # superscript
+    page.insert_text(pymupdf.Point(94, 60), ", x", fontsize=10.0)
+    page.insert_text(pymupdf.Point(108, 63), "2", fontsize=6.5)  # subscript
+    page.insert_text(pymupdf.Point(114, 60), ", and model x2 here.", fontsize=10.0)
+    doc.save(str(pdf_path))
+    doc.close()
+
+    doc_model = Document(
+        id="doc-rev-item1",
+        original_filename="item1_ambiguous_math.pdf",
+        safe_storage_path=str(pdf_path),
+        sha256_hash=compute_sha256(pdf_path),
+        file_size_bytes=pdf_path.stat().st_size,
+        page_count=1,
+    )
+
+    adapter = NativePreservingAdapter(config=AppConfig(runtime_dir=tmp_path / "rt"))
+    blocks = adapter.parse_and_extract_blocks(
+        document=doc_model,
+        page_indices=[0],
+        job_config=TranslationJobConfig(),
+    )
+    assert len(blocks) == 1
+    blk = blocks[0]
+    blk.translation_text = "x2 と x2 と通常モデル x2 を考える。"
+    blk.status = BlockStatus.TRANSLATED
+
+    mono_out = tmp_path / "item1_mono.pdf"
+    updated, issues = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=[blk],
+        page_indices=[0],
+        job_config=TranslationJobConfig(),
+        mono_output_path=mono_out,
+        dual_output_path=None,
+        job_id="job-rev-item1",
+    )
+
+    assert updated[0].status == BlockStatus.FALLBACK_ORIGINAL
+    assert "AMBIGUOUS_INLINE_MATH_FALLBACK" in updated[0].warnings
+    assert any(iss.code == "AMBIGUOUS_INLINE_MATH_FALLBACK" for iss in issues)
+
+    out_pdf = pymupdf.open(str(mono_out))
+    d = out_pdf[0].get_text("dict")
+    spans = [s for b in d["blocks"] if b.get("type") == 0 for ln in b["lines"] for s in ln["spans"]]
+    out_txt = out_pdf[0].get_text("text")
+    out_pdf.close()
+
+    # Original PDF math roles (super 2 raised, sub 2 lowered, normal x2 retained) must survive intact
+    assert "Consider x" in out_txt
+    assert "考える" not in out_txt
+    assert any(s["text"].strip() == "2" and s["size"] < 8.0 and s["origin"][1] < 58.0 for s in spans)
+    assert any(s["text"].strip() == "2" and s["size"] < 8.0 and s["origin"][1] > 61.5 for s in spans)
+
+
+def test_review_item2_fit_checks_horizontal_width_including_long_tokens_and_kinsoku(tmp_path: Path) -> None:
+    """PR review #2: fit_japanese_text_in_bbox and wrap_japanese_kinsoku must verify
+    horizontal extent of every rendered line against bbox width: long formulas, long URLs/words,
+    mixed Japanese+math, and kinsoku line-end punctuation must never overflow horizontally.
+    """
+    cfg = AppConfig(runtime_dir=tmp_path / "rt")
+    ja_font = pymupdf.Font(fontfile=str(cfg.font_serif_path)) if cfg.font_serif_path and cfg.font_serif_path.exists() else pymupdf.Font("japan-s")
+    math_font = pymupdf.Font(fontfile=str(cfg.font_math_path)) if cfg.font_math_path and cfg.font_math_path.exists() else None
+    math_tag = "F_MATH" if math_font is not None else None
+
+    narrow_bbox = [20.0, 20.0, 110.0, 220.0]  # 90pt wide, very tall (200pt)
+    box_w = narrow_bbox[2] - narrow_bbox[0]
+
+    # 1. Long unbreakable inline formula wider than 90pt even at 8.0pt
+    long_formula = "𝑎_1+𝑎_2+𝑎_3+𝑎_4+𝑎_5+𝑎_6+𝑎_7+𝑎_8=∑_𝑖^𝑁 𝑏_𝑖"
+    _, _, fits_formula = fit_japanese_text_in_bbox(
+        long_formula,
+        narrow_bbox,
+        initial_font_size=10.0,
+        min_font_size=8.0,
+        ja_font=ja_font,
+        math_font=math_font,
+    )
+    assert fits_formula is False
+
+    # 2. Long English word & long URL wider than 90pt even at 8.0pt
+    for long_tok in (
+        "https://example.org/very/long/academic/supplement/appendix/dataset_v2.json",
+        "Pneumonoultramicroscopicsilicovolcanoconiosis",
+    ):
+        _, _, fits_tok = fit_japanese_text_in_bbox(
+            long_tok,
+            narrow_bbox,
+            initial_font_size=10.0,
+            min_font_size=8.0,
+            ja_font=ja_font,
+            math_font=math_font,
+        )
+        assert fits_tok is False
+
+    # 3. Japanese before & after math that fits only if wrapped cleanly, never overflowing bbox width
+    mixed_text = "この解析では 𝑎+𝑏+𝑐=𝑑 を用いて結果を計算する。"
+    fitted_sz, wrapped, fits_mixed = fit_japanese_text_in_bbox(
+        mixed_text,
+        narrow_bbox,
+        initial_font_size=10.0,
+        min_font_size=8.0,
+        ja_font=ja_font,
+        math_font=math_font,
+    )
+    assert fits_mixed is True
+    for ln in wrapped:
+        _, _, line_w, _, _ = _build_styled_line_plan(
+            line_str=ln,
+            font_size_pt=fitted_sz,
+            ja_font_tag="F_JA",
+            ja_font=ja_font,
+            math_font_tag=math_tag,
+            math_font=math_font,
+        )
+        assert line_w <= box_w + 1e-3
+
+    # 4. Kinsoku overhang check: punctuation near right edge must neither start next line nor overflow box_w
+    kinsoku_text = "日本語の文章を狭い枠へ配置するテストです。"
+    k_sz, k_lines, k_fits = fit_japanese_text_in_bbox(
+        kinsoku_text,
+        [20.0, 20.0, 120.0, 220.0],  # 100pt wide (close to 10 chars at 10pt)
+        initial_font_size=10.0,
+        min_font_size=8.0,
+        ja_font=ja_font,
+        math_font=math_font,
+    )
+    assert k_fits is True
+    for ln in k_lines:
+        assert not ln.startswith(("。", "、", "）", "」"))
+        _, _, lw, _, _ = _build_styled_line_plan(
+            line_str=ln,
+            font_size_pt=k_sz,
+            ja_font_tag="F_JA",
+            ja_font=ja_font,
+            math_font_tag=math_tag,
+            math_font=math_font,
+        )
+        assert lw <= 100.0 + 1e-3
+
+    # Fractional initial font size stepping (e.g. 8.97 -> 8.47 -> 8.0) must still test min_font_size=8.0
+    frac_sz, frac_lines, frac_fits = fit_japanese_text_in_bbox(
+        "本手法の総損失は、次のように計算される。",
+        [317.69, 538.49, 486.13, 547.46],
+        initial_font_size=8.97,
+        min_font_size=8.0,
+        ja_font=ja_font,
+        math_font=math_font,
+    )
+    assert frac_fits is True
+    assert frac_sz == 8.0
+    assert len(frac_lines) == 1
+
+    # Also verify end-to-end typeset triggers TYPESETTING_OVERFLOW_FALLBACK on long URL
+    pdf_path = tmp_path / "item2_overflow.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=300, height=300)
+    page.insert_text(pymupdf.Point(20, 40), "Short src.", fontsize=9.0)
+    doc.save(str(pdf_path))
+    doc.close()
+    doc_model = Document(
+        id="doc-rev-item2",
+        original_filename="item2_overflow.pdf",
+        safe_storage_path=str(pdf_path),
+        sha256_hash=compute_sha256(pdf_path),
+        file_size_bytes=pdf_path.stat().st_size,
+        page_count=1,
+    )
+    blk = Block(
+        id="doc-rev-item2:page-1:block-1",
+        page_index=0,
+        bbox=[20.0, 25.0, 110.0, 225.0],
+        kind=BlockKind.PARAGRAPH,
+        source_text="Short src.",
+        translation_text="https://example.org/very/long/academic/supplement/appendix/dataset_v2.json",
+        status=BlockStatus.TRANSLATED,
+        font_size_pt=9.0,
+    )
+    mono_out = tmp_path / "item2_mono.pdf"
+    updated, issues = NativePreservingAdapter(config=cfg).typeset_and_export(
+        document=doc_model,
+        blocks=[blk],
+        page_indices=[0],
+        job_config=TranslationJobConfig(),
+        mono_output_path=mono_out,
+        dual_output_path=None,
+        job_id="job-rev-item2",
+    )
+    assert updated[0].status == BlockStatus.FALLBACK_ORIGINAL
+    assert "TYPESETTING_OVERFLOW_FALLBACK" in updated[0].warnings
+    assert any(iss.code == "TYPESETTING_OVERFLOW_FALLBACK" for iss in issues)
+
+
+def test_review_item3_stacked_multi_char_super_and_sub_coordinates(tmp_path: Path) -> None:
+    """PR review #3: Multi-char stacked super/subscripts (P^{abc}_{i}, P^{*}_{index}, P^{ab}_{cd})
+    followed by '+ Q' or Japanese must align subscript start x0 with superscript GROUP start x0,
+    keep subscript characters contiguous, and start following text at max(sup_x1, sub_x1).
+    """
+    pdf_path = tmp_path / "item3_stacked.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=400)
+    page.insert_text(pymupdf.Point(40, 60), "Base text to replace", fontsize=10.0)
+    doc.save(str(pdf_path))
+    doc.close()
+
+    doc_model = Document(
+        id="doc-rev-item3",
+        original_filename="item3_stacked.pdf",
+        safe_storage_path=str(pdf_path),
+        sha256_hash=compute_sha256(pdf_path),
+        file_size_bytes=pdf_path.stat().st_size,
+        page_count=1,
+    )
+
+    spans_list = [
+        # Case 1: P^{abc}_{i} + Q  (super 'abc' wider than sub 'i')
+        InlineMathSpan(context_text="𝑃abc", target_text="abc", role="super", scale=0.78, dy_em=-0.29),
+        InlineMathSpan(context_text="𝑃abc i", target_text="i", role="sub", scale=0.78, dy_em=0.18),
+        # Case 2: P^{*}_{index} は (sub 'index' wider than super '∗')
+        InlineMathSpan(context_text="𝑃∗", target_text="∗", role="super", scale=0.78, dy_em=-0.29),
+        InlineMathSpan(context_text="𝑃∗ index", target_text="index", role="sub", scale=0.78, dy_em=0.18),
+        # Case 3: P^{ab}_{cd} + Q
+        InlineMathSpan(context_text="𝑃ab", target_text="ab", role="super", scale=0.78, dy_em=-0.29),
+        InlineMathSpan(context_text="𝑃ab cd", target_text="cd", role="sub", scale=0.78, dy_em=0.18),
+    ]
+    trn = "式 𝑃abc i + 𝑄、𝑃∗ index は係数、𝑃ab cd + 𝑄 である。"
+    blk = Block(
+        id="doc-rev-item3:page-1:block-1",
+        page_index=0,
+        bbox=[40.0, 40.0, 560.0, 120.0],
+        kind=BlockKind.PARAGRAPH,
+        source_text="Base text to replace",
+        inline_math_spans=spans_list,
+        translation_text=trn,
+        status=BlockStatus.TRANSLATED,
+        font_size_pt=10.0,
+    )
+
+    mono_out = tmp_path / "item3_mono.pdf"
+    adapter = NativePreservingAdapter(config=AppConfig(runtime_dir=tmp_path / "rt"))
+    updated, issues = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=[blk],
+        page_indices=[0],
+        job_config=TranslationJobConfig(),
+        mono_output_path=mono_out,
+        dual_output_path=None,
+        job_id="job-rev-item3",
+    )
+    assert not issues
+    assert updated[0].status == BlockStatus.TRANSLATED
+
+    out_pdf = pymupdf.open(str(mono_out))
+    d = out_pdf[0].get_text("dict")
+    pdf_spans = [s for b in d["blocks"] if b.get("type") == 0 for ln in b["lines"] for s in ln["spans"]]
+    out_pdf.close()
+
+    # Check P^{abc}_{i} + Q (with space and without space)
+    spans_list_nospace = [
+        InlineMathSpan(context_text="𝑃abc", target_text="abc", role="super", scale=0.78, dy_em=-0.29),
+        InlineMathSpan(context_text="𝑃abci", target_text="i", role="sub", scale=0.78, dy_em=0.18),
+    ]
+    _, _, w_nospace, _, _ = _build_styled_line_plan(
+        "𝑃abci + 𝑄",
+        font_size_pt=10.0,
+        ja_font_tag="F_JA",
+        ja_font=None,
+        inline_math_spans=spans_list_nospace,
+    )
+    assert w_nospace > 0
+
+    s_abc = next(s for s in pdf_spans if "abc" in s["text"])
+    s_i = next(s for s in pdf_spans if s["text"].strip() == "i" and s["size"] < 8.5)
+    assert abs(s_i["bbox"][0] - s_abc["bbox"][0]) < 1.0, f"sub 'i' x0={s_i['bbox'][0]} != super 'abc' x0={s_abc['bbox'][0]}"
+    # Trailing '+' (ja_font) and '𝑄' (math_font) are rendered in adjacent spans after max(sup, sub)
+    after_abc_plus = [s for s in pdf_spans if s["bbox"][0] > s_abc["bbox"][0] and abs(s["origin"][1] - (s_abc["origin"][1] + 2.9)) < 10.0 and s["text"].strip() == "+"]
+    after_abc_q = [s for s in pdf_spans if s["bbox"][0] > s_abc["bbox"][0] and "𝑄" in s["text"]]
+    assert after_abc_plus and after_abc_plus[0]["bbox"][0] >= s_abc["bbox"][2] - 0.5
+    assert after_abc_q and after_abc_q[0]["bbox"][0] > after_abc_plus[0]["bbox"][2] - 0.5
+
+    # Check P^{*}_{index} followed by Japanese 'は係数'
+    s_star = next(s for s in pdf_spans if "∗" in s["text"])
+    s_index = next(s for s in pdf_spans if "index" in s["text"])
+    assert abs(s_index["bbox"][0] - s_star["bbox"][0]) < 1.0, f"sub 'index' x0={s_index['bbox'][0]} != super '*' x0={s_star['bbox'][0]}"
+    after_index = next(s for s in pdf_spans if "は係数" in s["text"])
+    assert after_index["bbox"][0] >= s_index["bbox"][2] - 0.5, f"'は係数' x0={after_index['bbox'][0]} overlaps 'index' x1={s_index['bbox'][2]}"
+
+    # Check P^{ab}_{cd} + Q
+    s_ab = next(s for s in pdf_spans if s["text"].strip() == "ab" and s["size"] < 8.5)
+    s_cd = next(s for s in pdf_spans if s["text"].strip() == "cd" and s["size"] < 8.5)
+    assert abs(s_cd["bbox"][0] - s_ab["bbox"][0]) < 1.0
+    after_cd_plus = [s for s in pdf_spans if s["bbox"][0] > s_ab["bbox"][0] and abs(s["origin"][1] - (s_ab["origin"][1] + 2.9)) < 10.0 and s["text"].strip() == "+"]
+    assert after_cd_plus and after_cd_plus[0]["bbox"][0] >= max(s_ab["bbox"][2], s_cd["bbox"][2]) - 0.5
+
+    # Also verify extraction handles multi-char stacked super/sub spans (P^{abc}_{i}, P^{*}_{index}, P^{ab}_{cd})
+    extracted_stacked = extract_inline_math_spans(
+        [
+            {
+                "spans": [
+                    {"text": "𝑃", "size": 10.0, "origin": [40.0, 60.0], "bbox": [40.0, 50.0, 46.0, 62.0]},
+                    {"text": "abc", "size": 7.0, "origin": [46.0, 56.0], "bbox": [46.0, 49.0, 58.0, 57.0]},
+                    {"text": "i", "size": 7.0, "origin": [46.2, 63.0], "bbox": [46.2, 57.0, 49.0, 64.0]},
+                    {"text": " and 𝑃", "size": 10.0, "origin": [60.0, 60.0], "bbox": [60.0, 50.0, 82.0, 62.0]},
+                    {"text": "ab", "size": 7.0, "origin": [82.0, 56.0], "bbox": [82.0, 49.0, 90.0, 57.0]},
+                    {"text": "cd", "size": 7.0, "origin": [82.2, 63.0], "bbox": [82.2, 57.0, 90.2, 64.0]},
+                ]
+            }
+        ]
+    )
+    ex_pairs = {(s.context_text, s.target_text, s.role) for s in extracted_stacked if not s.ambiguous}
+    assert ("𝑃abc", "abc", "super") in ex_pairs
+    assert ("𝑃abci", "i", "sub") in ex_pairs
+    assert ("𝑃ab", "ab", "super") in ex_pairs
+    assert ("𝑃abcd", "cd", "sub") in ex_pairs
+
+
+def test_review_item4_order_independent_protection_convergence(tmp_path: Path) -> None:
+    """PR review #4: Reordering blocks on a page must produce identical protection status,
+    warnings, and visual PDF output even when a later block triggers fallback after
+    overlapping an earlier candidate block.
+    """
+    pdf_path = tmp_path / "item4_order.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=400, height=300)
+    page.insert_text(pymupdf.Point(40, 60), "FIRST BLOCK CONTENT HERE", fontsize=10.0)
+    page.insert_text(pymupdf.Point(40, 74), "SECOND OVERFLOW BLOCK CONTENT", fontsize=10.0)
+    doc.save(str(pdf_path))
+    doc.close()
+
+    doc_model = Document(
+        id="doc-rev-item4",
+        original_filename="item4_order.pdf",
+        safe_storage_path=str(pdf_path),
+        sha256_hash=compute_sha256(pdf_path),
+        file_size_bytes=pdf_path.stat().st_size,
+        page_count=1,
+    )
+
+    def _make_pair() -> tuple[Block, Block]:
+        # Mild overlap: A=[40, 48, 240, 78] (h=30, area=6000), B=[40, 72, 240, 88] (h=16, area=3200)
+        # Overlap height=6, x=200 => area=1200 => ir(B)=0.375? Keep 0.05 < ir < 0.20 so Pre-check 0 does NOT fire:
+        # A=[40, 45, 240, 75] (area=6000), B=[40, 72, 240, 102] (area=6000): overlap y=3.0 < 4.5 (Pre-check 0 y_ov>=4.5 skips),
+        # area=600 => ir=0.10 > 0.05 (Phase 2 PROTECTED_REGION_OVERLAP_FALLBACK DOES fire!)
+        blk_a = Block(
+            id="doc-rev-item4:page-1:block-1",
+            page_index=0,
+            bbox=[40.0, 45.0, 240.0, 75.0],
+            kind=BlockKind.PARAGRAPH,
+            reading_order=1,
+            source_text="FIRST BLOCK CONTENT HERE",
+            translation_text="最初のブロックの翻訳文です。",
+            status=BlockStatus.TRANSLATED,
+            font_size_pt=10.0,
+        )
+        blk_b = Block(
+            id="doc-rev-item4:page-1:block-2",
+            page_index=0,
+            bbox=[40.0, 72.0, 240.0, 102.0],
+            kind=BlockKind.PARAGRAPH,
+            reading_order=2,
+            source_text="SECOND OVERFLOW BLOCK CONTENT",
+            # Deliberately overflows blk_b bbox -> TYPESETTING_OVERFLOW_FALLBACK
+            translation_text="とても長い日本語訳文を狭い枠へ詰め込もうとして最小フォントサイズでも必ず溢れるテスト文です。" * 4,
+            status=BlockStatus.TRANSLATED,
+            font_size_pt=10.0,
+        )
+        return blk_a, blk_b
+
+    adapter = NativePreservingAdapter(config=AppConfig(runtime_dir=tmp_path / "rt"))
+    a1, b1 = _make_pair()
+    out_ab = tmp_path / "item4_ab.pdf"
+    res_ab, _ = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=[a1, b1],
+        page_indices=[0],
+        job_config=TranslationJobConfig(),
+        mono_output_path=out_ab,
+        dual_output_path=None,
+        job_id="job-item4-ab",
+    )
+
+    a2, b2 = _make_pair()
+    out_ba = tmp_path / "item4_ba.pdf"
+    res_ba, _ = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=[b2, a2],
+        page_indices=[0],
+        job_config=TranslationJobConfig(),
+        mono_output_path=out_ba,
+        dual_output_path=None,
+        job_id="job-item4-ba",
+    )
+
+    by_id_ab = {b.id: (b.status, tuple(b.warnings)) for b in res_ab}
+    by_id_ba = {b.id: (b.status, tuple(b.warnings)) for b in res_ba}
+    assert by_id_ab == by_id_ba
+    assert by_id_ab["doc-rev-item4:page-1:block-1"][0] == BlockStatus.FALLBACK_ORIGINAL
+    assert "PROTECTED_REGION_OVERLAP_FALLBACK" in by_id_ab["doc-rev-item4:page-1:block-1"][1]
+    assert by_id_ab["doc-rev-item4:page-1:block-2"][0] == BlockStatus.FALLBACK_ORIGINAL
+    assert "TYPESETTING_OVERFLOW_FALLBACK" in by_id_ab["doc-rev-item4:page-1:block-2"][1]
+
+    d1, d2 = pymupdf.open(str(out_ab)), pymupdf.open(str(out_ba))
+    pix1 = d1[0].get_pixmap(dpi=100).tobytes("png")
+    pix2 = d2[0].get_pixmap(dpi=100).tobytes("png")
+    txt1 = d1[0].get_text("text")
+    txt2 = d2[0].get_text("text")
+    d1.close()
+    d2.close()
+    assert txt1 == txt2
+    assert pix1 == pix2
+
+
+def test_review_item5_overbar_whiteout_preserves_adjacent_protected_objects(tmp_path: Path) -> None:
+    """PR review #5: Clearing an approved block's `orig_overbar_bbox` with white rect must
+    respect `protected_boxes` (PROTECTED_SKIP / FALLBACK_ORIGINAL / manual ProtectionRegion)
+    and never paint white over adjacent protected text or vector lines.
+    """
+    pdf_path = tmp_path / "item5_overbar_prot.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=400, height=220)
+    # Translatable block bbox=[40, 60, 220, 100] with radical overbar at [120, 61.0, 160, 61.5]
+    page.insert_text(pymupdf.Point(40, 74), "Formula A=√(a2+b2) ends.", fontsize=9.0)
+    page.draw_line(pymupdf.Point(120, 61.2), pymupdf.Point(160, 61.2), color=(0, 0, 0), width=0.8)
+    # Adjacent PROTECTED_SKIP block directly above overbar padding ([115, 48, 220, 60.4]):
+    # Note expanded whiteout rect `oy0 - 1.0 = 60.0` reaches 0.4pt INTO protected bbox [48..60.4]!
+    page.insert_text(pymupdf.Point(122, 59.0), "PROTECTED KEEP", fontsize=9.0, color=(0, 0, 0))
+    page.draw_line(pymupdf.Point(120, 60.2), pymupdf.Point(160, 60.2), color=(0, 0, 0), width=1.0)
+    doc.save(str(pdf_path))
+    doc.close()
+
+    doc_model = Document(
+        id="doc-rev-item5",
+        original_filename="item5_overbar_prot.pdf",
+        safe_storage_path=str(pdf_path),
+        sha256_hash=compute_sha256(pdf_path),
+        file_size_bytes=pdf_path.stat().st_size,
+        page_count=1,
+    )
+
+    blk_trans = Block(
+        id="doc-rev-item5:page-1:block-1",
+        page_index=0,
+        bbox=[40.0, 60.6, 220.0, 100.0],
+        kind=BlockKind.PARAGRAPH,
+        reading_order=1,
+        source_text="Formula 𝐴=√(𝑎2+𝑏2) ends.",
+        inline_math_spans=[
+            InlineMathSpan(
+                context_text="√(𝑎2+𝑏2)",
+                target_text="(𝑎2+𝑏2)",
+                role="radicand",
+                scale=1.0,
+                dy_em=0.0,
+                overbar=True,
+                orig_overbar_bbox=[120.0, 61.0, 160.0, 61.5],
+            )
+        ],
+        translation_text="式 𝐴=√(𝑎2+𝑏2) である。",
+        status=BlockStatus.TRANSLATED,
+        font_size_pt=9.0,
+    )
+    blk_prot = Block(
+        id="doc-rev-item5:page-1:block-2",
+        page_index=0,
+        bbox=[115.0, 48.0, 220.0, 60.4],
+        kind=BlockKind.ISOLATED_FORMULA,
+        reading_order=2,
+        source_text="PROTECTED KEEP",
+        status=BlockStatus.PROTECTED_SKIP,
+        font_size_pt=9.0,
+    )
+    manual_reg = ProtectionRegion(
+        id="reg-item5",
+        document_id=doc_model.id,
+        page_index=0,
+        bbox=[115.0, 48.0, 220.0, 60.4],
+        mode=ProtectionMode.PROTECT_AS_FORMULA,
+    )
+
+    mono_out = tmp_path / "item5_mono.pdf"
+    adapter = NativePreservingAdapter(config=AppConfig(runtime_dir=tmp_path / "rt"))
+    updated, issues = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=[blk_trans, blk_prot],
+        page_indices=[0],
+        manual_regions=[manual_reg],
+        job_config=TranslationJobConfig(),
+        mono_output_path=mono_out,
+        dual_output_path=None,
+        job_id="job-rev-item5",
+    )
+    assert not issues
+    assert updated[0].status == BlockStatus.TRANSLATED
+
+    out_pdf = pymupdf.open(str(mono_out))
+    # Verify protected line at y=60.2 (inside [60.15..60.35] inside protected bbox) is NOT painted white
+    prot_pix = out_pdf[0].get_pixmap(clip=pymupdf.Rect(125, 60.15, 155, 60.35), dpi=288)
+    samples = prot_pix.samples
+    n_comp = prot_pix.n
+    has_dark_pixel = any(
+        samples[i] < 200 or samples[i + 1] < 200 or samples[i + 2] < 200
+        for i in range(0, len(samples), n_comp)
+    )
+    prot_txt = out_pdf[0].get_text("text", clip=pymupdf.Rect(115.0, 48.0, 220.0, 60.5))
+    out_pdf.close()
+
+    assert "PROTECTED KEEP" in prot_txt
+    assert has_dark_pixel, "Overbar whiteout painted white over protected graphic inside protected bbox"

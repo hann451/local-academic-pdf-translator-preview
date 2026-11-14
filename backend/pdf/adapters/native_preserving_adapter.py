@@ -361,6 +361,8 @@ def extract_inline_math_spans(
                 else 0.0
             )
 
+        script_base_by_idx: dict[int, tuple[str, Literal["super", "sub"]]] = {}
+
         for idx, s in enumerate(spans):
             raw_t = normalize_for_pdf_rendering(str(s.get("text", "")))
             st = raw_t.strip()
@@ -475,17 +477,50 @@ def extract_inline_math_spans(
                 and (sz < max_sz * 0.86 and oy > baseline_y + max_sz * 0.08)
             )
             if (is_sup or is_sub) and idx > 0:
-                ps = spans[idx - 1]
+                ps_idx = idx - 1
+                ps = spans[ps_idx]
+                crossed_ws = False
+                if ps_idx >= 1 and not normalize_for_pdf_rendering(str(ps.get("text", ""))).strip():
+                    ws_raw = str(ps.get("text", ""))
+                    if len(ws_raw) <= 2:
+                        ps_idx -= 1
+                        ps = spans[ps_idx]
+                        crossed_ws = True
                 ps_bbox = ps.get("bbox")
                 if not (isinstance(ps_bbox, (list, tuple)) and len(ps_bbox) == 4):
                     continue
                 dx = float(s_bbox[0]) - float(ps_bbox[2])
-                if dx <= 2.0:
+                max_dx = max(2.0, max_sz * 0.40) if crossed_ws else 2.0
+                if dx <= max_dx:
                     pt = normalize_for_pdf_rendering(str(ps.get("text", "")))
                     role_lit: Literal["super", "sub"] = "super" if is_sup else "sub"
                     dy_val = -0.29 if is_sup else 0.18
-                    if pt.strip() == "∗" and idx >= 2:
-                        ppt = normalize_for_pdf_rendering(str(spans[idx - 2].get("text", "")))
+                    prev_script = script_base_by_idx.get(ps_idx)
+                    if prev_script is not None and prev_script[1] != role_lit:
+                        base_tok = prev_script[0] + pt.strip()
+                        _add(
+                            InlineMathSpan(
+                                context_text=f"{base_tok} {st}",
+                                target_text=st,
+                                role=role_lit,
+                                scale=0.78,
+                                dy_em=dy_val,
+                            )
+                        )
+                        _add(
+                            InlineMathSpan(
+                                context_text=f"{base_tok}{st}",
+                                target_text=st,
+                                role=role_lit,
+                                scale=0.78,
+                                dy_em=dy_val,
+                            )
+                        )
+                    elif pt.strip() == "∗" and ps_idx >= 1:
+                        pps_idx = ps_idx - 1
+                        if pps_idx >= 1 and not normalize_for_pdf_rendering(str(spans[pps_idx].get("text", ""))).strip():
+                            pps_idx -= 1
+                        ppt = normalize_for_pdf_rendering(str(spans[pps_idx].get("text", "")))
                         p_parts = [
                             tok for tok in re.split(r"[\s(\[{,=+\-−*/√]+", ppt) if tok
                         ]
@@ -518,6 +553,7 @@ def extract_inline_math_spans(
                         if is_sub and base_tok.isdigit():
                             continue
                         if base_tok:
+                            script_base_by_idx[idx] = (base_tok, role_lit)
                             _add(
                                 InlineMathSpan(
                                     context_text=f"{base_tok}{st}",
@@ -528,8 +564,10 @@ def extract_inline_math_spans(
                                 )
                             )
 
-    # Filter out any super/sub InlineMathSpan whose (context_text, target_text) appears multiple
+    # Detect any super/sub InlineMathSpan whose (context_text, target_text) appears multiple
     # times in the same block with conflicting roles (e.g. both super and sub, or sub/super and normal).
+    # Instead of silently dropping spans into flat plain text, mark conflicting spans `ambiguous=True`
+    # so `typeset_and_export` safely falls back to original PDF with an explicit warning before redaction.
     if spans_out:
         roles_by_ctx: dict[tuple[str, str], set[str]] = {}
         for item in spans_out:
@@ -597,19 +635,36 @@ def extract_inline_math_spans(
                 if cur_normal:
                     normal_chunks.append("".join(cur_normal))
 
+            _WORD_MATH_CH_RE = re.compile(r"[A-Za-z0-9\U0001d400-\U0001d7ff]")
             for (ctx, tgt), rset in roles_by_ctx.items():
-                pat = re.compile(re.escape(ctx) + r"(?![A-Za-z0-9\U0001d400-\U0001d7ff])")
+                left_guard = (
+                    r"(?<![A-Za-z0-9\U0001d400-\U0001d7ff])"
+                    if ctx and _WORD_MATH_CH_RE.match(ctx[0])
+                    else ""
+                )
+                right_guard = (
+                    r"(?![A-Za-z0-9\U0001d400-\U0001d7ff])"
+                    if ctx and _WORD_MATH_CH_RE.match(ctx[-1])
+                    else ""
+                )
+                pat = re.compile(left_guard + re.escape(ctx) + right_guard)
                 for chunk in normal_chunks:
                     if pat.search(chunk):
                         rset.add("normal")
                         break
 
-            spans_out = [
-                item
-                for item in spans_out
-                if item.role not in ("super", "sub")
-                or len(roles_by_ctx.get((item.context_text, item.target_text), set())) <= 1
-            ]
+            final_spans: list[InlineMathSpan] = []
+            seen_ambiguous: set[tuple[str, str]] = set()
+            for item in spans_out:
+                if item.role in ("super", "sub"):
+                    key = (item.context_text, item.target_text)
+                    if len(roles_by_ctx.get(key, set())) > 1:
+                        if key not in seen_ambiguous:
+                            seen_ambiguous.add(key)
+                            final_spans.append(item.model_copy(update={"ambiguous": True}))
+                        continue
+                final_spans.append(item)
+            spans_out = final_spans
 
     return spans_out
 
@@ -642,7 +697,16 @@ def _build_styled_line_plan(
     overbar_ranges: list[tuple[int, int]] = []
 
     if inline_math_spans:
-        for mspan in inline_math_spans:
+        # Process longer contexts first (e.g. `𝑃abci` before `𝑃abc`) so stacked
+        # subscript characters are already classified when shorter super spans check boundaries.
+        ordered_spans = sorted(
+            inline_math_spans,
+            key=lambda m: (len(m.context_text), 1 if m.role == "sub" else 0),
+            reverse=True,
+        )
+        for mspan in ordered_spans:
+            if mspan.ambiguous:
+                continue
             ctx = mspan.context_text
             tgt = mspan.target_text
             if not ctx or not tgt:
@@ -700,11 +764,17 @@ def _build_styled_line_plan(
     char_x0 = [0.0] * n
     char_x1 = [0.0] * n
     cursor_x = 0.0
+    last_run_end_x = 0.0
+    max_rendered_x1 = 0.0
+    sup_group_x0: float | None = None
+    sup_group_x1 = 0.0
+    sub_group_x1 = 0.0
+    in_stacked_sub = False
 
     for i in range(n):
         ch = line_str[i]
         role = char_role[i]
-        # Collapse artificial space between stacked superscript and subscript (`𝑃^∗_3`)
+        # Collapse artificial space between stacked superscript and subscript (`𝑃^∗_3`, `𝑃^{abc}_{i}`)
         if (
             ch == " "
             and i > 0
@@ -712,9 +782,8 @@ def _build_styled_line_plan(
             and char_role[i - 1] == "super"
             and char_role[i + 1] == "sub"
         ):
-            char_x0[i] = char_x0[i - 1]
-            char_x1[i] = char_x0[i - 1]
-            cursor_x = char_x0[i - 1]
+            char_x0[i] = cursor_x
+            char_x1[i] = cursor_x
             continue
 
         if role == "hat" and i + 1 < n:
@@ -725,45 +794,77 @@ def _build_styled_line_plan(
             hat_x = cursor_x + max(0.0, (base_w - hat_w) * 0.5)
             hat_y = font_size_pt * char_dy_em[i]
             styled_runs.append((hat_tag, hat_fobj, ch, hat_x, hat_y, hat_fs))
+            last_run_end_x = hat_x + hat_w
+            max_rendered_x1 = max(max_rendered_x1, last_run_end_x)
             char_x0[i] = cursor_x
             char_x1[i] = cursor_x + base_w
+            sup_group_x0 = None
+            in_stacked_sub = False
             continue
 
-        # If a subscript immediately follows a superscript (`𝑃∗2`), stack them at the same x0
-        if role == "sub" and i > 0 and char_role[i - 1] == "super":
-            cursor_x = char_x0[i - 1]
+        if role == "super":
+            if i == 0 or char_role[i - 1] != "super":
+                sup_group_x0 = cursor_x
+                sup_group_x1 = cursor_x
+            in_stacked_sub = False
+        elif role == "sub":
+            is_sub_start = i == 0 or char_role[i - 1] != "sub"
+            preceded_by_super = (
+                (i > 0 and char_role[i - 1] == "super")
+                or (i >= 2 and line_str[i - 1] == " " and char_role[i - 2] == "super")
+            )
+            if is_sub_start and preceded_by_super and sup_group_x0 is not None:
+                in_stacked_sub = True
+                sub_group_x1 = sup_group_x0
+                cursor_x = sup_group_x0
+        else:
+            in_stacked_sub = False
+            sup_group_x0 = None
 
         c_fs = font_size_pt * char_scale[i]
         c_y = font_size_pt * char_dy_em[i]
         c_tag, c_fobj, c_w = _measure_char(ch, c_fs)
-        char_x0[i] = cursor_x
+        c_x0 = cursor_x
+        char_x0[i] = c_x0
         cursor_x += c_w
         char_x1[i] = cursor_x
+        if role == "super":
+            sup_group_x1 = max(sup_group_x1, cursor_x)
+        if in_stacked_sub:
+            sub_group_x1 = max(sub_group_x1, cursor_x)
 
-        if (
-            styled_runs
+        can_merge = (
+            bool(styled_runs)
             and (i == 0 or char_role[i - 1] != "hat")
-            and not (role == "sub" and i > 0 and char_role[i - 1] == "super")
+            and not (role == "sub" and in_stacked_sub and (i == 0 or char_role[i - 1] != "sub"))
             and styled_runs[-1][0] == c_tag
             and abs(styled_runs[-1][4] - c_y) < 1e-4
             and abs(styled_runs[-1][5] - c_fs) < 1e-4
-        ):
+            and abs(last_run_end_x - c_x0) < 1e-4
+        )
+        if can_merge:
             p_tag, p_fobj, p_txt, p_x, p_y, p_fs = styled_runs[-1]
-            styled_runs[-1] = (p_tag, p_fobj, p_txt + ch, p_x, p_y, p_fs)
+            new_txt = p_txt + ch
+            styled_runs[-1] = (p_tag, p_fobj, new_txt, p_x, p_y, p_fs)
+            if c_fobj is not None:
+                actual_w = float(c_fobj.text_length(new_txt, fontsize=c_fs))
+                last_run_end_x = p_x + actual_w
+                cursor_x = max(cursor_x, last_run_end_x)
+                char_x1[i] = cursor_x
+            else:
+                last_run_end_x = cursor_x
         else:
-            styled_runs.append((c_tag, c_fobj, ch, char_x0[i], c_y, c_fs))
+            styled_runs.append((c_tag, c_fobj, ch, c_x0, c_y, c_fs))
+            last_run_end_x = cursor_x
 
-        # Ensure cursor_x after stacked sub/super advances to the wider of the two
-        if role == "sub" and i > 0 and (
-            char_role[i - 1] == "super"
-            or (
-                i >= 2
-                and line_str[i - 1] == " "
-                and char_role[i - 2] == "super"
-            )
-        ):
-            sup_idx = i - 1 if char_role[i - 1] == "super" else i - 2
-            cursor_x = max(cursor_x, char_x1[sup_idx])
+        max_rendered_x1 = max(max_rendered_x1, cursor_x, last_run_end_x)
+
+        # At the end of a stacked sub/super group, advance cursor_x past the wider group
+        if in_stacked_sub and (i + 1 >= n or char_role[i + 1] != "sub"):
+            cursor_x = max(sup_group_x1, sub_group_x1)
+            max_rendered_x1 = max(max_rendered_x1, cursor_x)
+            in_stacked_sub = False
+            sup_group_x0 = None
 
     overbars: list[tuple[float, float, float, float]] = []
     for t0, t1 in overbar_ranges:
@@ -773,6 +874,7 @@ def _build_styled_line_plan(
             by_off = -font_size_pt * 0.88
             bw = max(0.45, font_size_pt * 0.055)
             overbars.append((bx0, bx1, by_off, bw))
+            max_rendered_x1 = max(max_rendered_x1, bx1)
 
     top_em = 0.78
     if any(r in ("super", "hat") for r in char_role):
@@ -783,7 +885,51 @@ def _build_styled_line_plan(
     if any(r == "sub" for r in char_role):
         bot_em = max(bot_em, 0.36)
 
-    return styled_runs, overbars, cursor_x, top_em, bot_em
+    return styled_runs, overbars, max_rendered_x1, top_em, bot_em
+
+
+def _subtract_protected_boxes(
+    rect_coords: list[float],
+    protected_boxes: list[list[float]],
+    margin: float = 0.25,
+) -> list[tuple[float, float, float, float]]:
+    """Return non-overlapping sub-rectangles of `rect_coords` strictly outside every
+    box in `protected_boxes` (inflated by `margin`). Used so whiteout rects such as
+    `orig_overbar_bbox` never paint over protected text or vector graphics.
+    """
+    rects: list[tuple[float, float, float, float]] = [
+        (float(rect_coords[0]), float(rect_coords[1]), float(rect_coords[2]), float(rect_coords[3]))
+    ]
+    for pb in protected_boxes:
+        cx0 = float(pb[0]) - margin
+        cy0 = float(pb[1]) - margin
+        cx1 = float(pb[2]) + margin
+        cy1 = float(pb[3]) + margin
+        next_rects: list[tuple[float, float, float, float]] = []
+        for rx0, ry0, rx1, ry1 in rects:
+            ix0 = max(rx0, cx0)
+            iy0 = max(ry0, cy0)
+            ix1 = min(rx1, cx1)
+            iy1 = min(ry1, cy1)
+            if ix0 >= ix1 or iy0 >= iy1:
+                next_rects.append((rx0, ry0, rx1, ry1))
+                continue
+            if ry0 < iy0:
+                next_rects.append((rx0, ry0, rx1, iy0))
+            if iy1 < ry1:
+                next_rects.append((rx0, iy1, rx1, ry1))
+            if rx0 < ix0:
+                next_rects.append((rx0, iy0, ix0, iy1))
+            if ix1 < rx1:
+                next_rects.append((ix1, iy0, rx1, iy1))
+        rects = [
+            (x0, y0, x1, y1)
+            for (x0, y0, x1, y1) in next_rects
+            if (x1 - x0) > 0.1 and (y1 - y0) > 0.1
+        ]
+        if not rects:
+            break
+    return rects
 
 
 def _rewrite_tounicode_cmap_smp_bytes(raw: bytes) -> bytes:
@@ -2341,7 +2487,19 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 if p_idx < 0 or p_idx >= len(out_doc):
                     continue
                 mpage = out_doc[p_idx]
-                page_blocks = blocks_by_page.get(p_idx, [])
+                raw_page_blocks = blocks_by_page.get(p_idx, [])
+                # Sort deterministically by geometry/id so protection decisions and rendering
+                # never depend on the caller's input list ordering.
+                page_blocks = sorted(
+                    raw_page_blocks,
+                    key=lambda b: (
+                        round(float(b.bbox[1]), 3),
+                        round(float(b.bbox[0]), 3),
+                        round(float(b.bbox[3]), 3),
+                        round(float(b.bbox[2]), 3),
+                        b.id,
+                    ),
+                )
                 page_manual = manual_by_page.get(p_idx, [])
 
                 # Pre-check 0: Detect translatable block pairs whose bounding boxes deeply overlap
@@ -2372,7 +2530,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
 
                 for b_col in candidate_trans_blocks:
                     if b_col.id in colliding_block_ids:
-                        peer_ids = colliding_block_ids[b_col.id]
+                        peer_ids = sorted(colliding_block_ids[b_col.id])
                         b_col.status = BlockStatus.FALLBACK_ORIGINAL
                         b_col.translation_provenance = "fallback_original"
                         if "TRANSLATED_BLOCK_OVERLAP_FALLBACK" not in b_col.warnings:
@@ -2396,7 +2554,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
                             )
                         )
 
-                # Collect all protected bounding boxes on this page so we NEVER draw over them
+                # Collect all initial protected bounding boxes on this page
                 protected_boxes: list[list[float]] = [
                     b.bbox
                     for b in page_blocks
@@ -2411,8 +2569,35 @@ class NativePreservingAdapter(PdfEngineAdapter):
                     ):
                         protected_boxes.append(reg.bbox)
 
-                approved_typeset_items: list[tuple[Block, float, list[str], list[InlineMathSpan]]] = []
+                def _record_fallback(
+                    blk_obj: Block,
+                    code: str,
+                    message: str,
+                    details: dict | None = None,
+                ) -> None:
+                    blk_obj.status = BlockStatus.FALLBACK_ORIGINAL
+                    blk_obj.translation_provenance = "fallback_original"
+                    if code not in blk_obj.warnings:
+                        blk_obj.warnings.append(code)
+                    protected_boxes.append(blk_obj.bbox)
+                    issues.append(
+                        ValidationIssue(
+                            id=f"iss-{uuid.uuid4().hex[:10]}",
+                            job_id=job_id,
+                            document_id=document.id,
+                            page_index=p_idx,
+                            block_id=blk_obj.id,
+                            bbox=blk_obj.bbox,
+                            code=code,
+                            severity=IssueSeverity.WARNING,
+                            message=message,
+                            details=details or {},
+                            fallback_applied=True,
+                        )
+                    )
 
+                # Phase 1: Intrinsic per-block checks (order-independent) before spatial convergence
+                provisional_items: list[tuple[Block, float, list[str], list[InlineMathSpan]]] = []
                 for blk in page_blocks:
                     if blk.status not in (BlockStatus.TRANSLATED, BlockStatus.MANUALLY_EDITED):
                         continue
@@ -2428,27 +2613,14 @@ class NativePreservingAdapter(PdfEngineAdapter):
                     # Pre-redaction check 1: Never allow unresolved placeholders into final PDF
                     unresolved_phs = _find_unresolved_placeholders(restored_text, blk.source_text)
                     if unresolved_phs:
-                        blk.status = BlockStatus.FALLBACK_ORIGINAL
-                        blk.translation_provenance = "fallback_original"
-                        blk.warnings.append("UNRESOLVED_PLACEHOLDER_FALLBACK")
-                        protected_boxes.append(blk.bbox)
-                        issues.append(
-                            ValidationIssue(
-                                id=f"iss-{uuid.uuid4().hex[:10]}",
-                                job_id=job_id,
-                                document_id=document.id,
-                                page_index=p_idx,
-                                block_id=blk.id,
-                                bbox=blk.bbox,
-                                code="UNRESOLVED_PLACEHOLDER_FALLBACK",
-                                severity=IssueSeverity.WARNING,
-                                message=(
-                                    f"未解決の保護プレースホルダー（{unresolved_phs}）が残存しているため、"
-                                    "不完全な出力を避けて原文要素を保持しました。"
-                                ),
-                                details={"unresolved_placeholders": unresolved_phs},
-                                fallback_applied=True,
-                            )
+                        _record_fallback(
+                            blk,
+                            "UNRESOLVED_PLACEHOLDER_FALLBACK",
+                            (
+                                f"未解決の保護プレースホルダー（{unresolved_phs}）が残存しているため、"
+                                "不完全な出力を避けて原文要素を保持しました。"
+                            ),
+                            {"unresolved_placeholders": unresolved_phs},
                         )
                         continue
 
@@ -2461,57 +2633,14 @@ class NativePreservingAdapter(PdfEngineAdapter):
                         math_font_obj,
                     )
                     if missing_glyphs:
-                        blk.status = BlockStatus.FALLBACK_ORIGINAL
-                        blk.translation_provenance = "fallback_original"
-                        blk.warnings.append("UNRENDERABLE_GLYPH_FALLBACK")
-                        protected_boxes.append(blk.bbox)
-                        issues.append(
-                            ValidationIssue(
-                                id=f"iss-{uuid.uuid4().hex[:10]}",
-                                job_id=job_id,
-                                document_id=document.id,
-                                page_index=p_idx,
-                                block_id=blk.id,
-                                bbox=blk.bbox,
-                                code="UNRENDERABLE_GLYPH_FALLBACK",
-                                severity=IssueSeverity.WARNING,
-                                message=(
-                                    f"利用可能なフォントにグリフが存在しない文字（{missing_glyphs}）が含まれるため、"
-                                    "文字欠け（.notdef）を防ぎ原文要素を保持しました。"
-                                ),
-                                details={"missing_glyphs": missing_glyphs},
-                                fallback_applied=True,
-                            )
-                        )
-                        continue
-
-                    # Check overlap with protected boxes (both IoU and sub-box containment ratio)
-                    overlapping_prot = [
-                        pb
-                        for pb in protected_boxes
-                        if bbox_iou(blk.bbox, pb) > 0.02
-                        or bbox_intersection_ratio(pb, blk.bbox) > 0.05
-                        or bbox_intersection_ratio(blk.bbox, pb) > 0.05
-                    ]
-                    if overlapping_prot:
-                        # Do not risk overwriting a protected formula/figure! Keep original PDF element
-                        blk.status = BlockStatus.FALLBACK_ORIGINAL
-                        blk.translation_provenance = "fallback_original"
-                        blk.warnings.append("PROTECTED_REGION_OVERLAP_FALLBACK")
-                        protected_boxes.append(blk.bbox)
-                        issues.append(
-                            ValidationIssue(
-                                id=f"iss-{uuid.uuid4().hex[:10]}",
-                                job_id=job_id,
-                                document_id=document.id,
-                                page_index=p_idx,
-                                block_id=blk.id,
-                                bbox=blk.bbox,
-                                code="PROTECTED_REGION_OVERLAP_FALLBACK",
-                                severity=IssueSeverity.WARNING,
-                                message="翻訳領域が保護対象（数式・図）と近接・重複するため、数式保護を優先して原文要素を保持しました。",
-                                fallback_applied=True,
-                            )
+                        _record_fallback(
+                            blk,
+                            "UNRENDERABLE_GLYPH_FALLBACK",
+                            (
+                                f"利用可能なフォントにグリフが存在しない文字（{missing_glyphs}）が含まれるため、"
+                                "文字欠け（.notdef）を防ぎ原文要素を保持しました。"
+                            ),
+                            {"missing_glyphs": missing_glyphs},
                         )
                         continue
 
@@ -2575,6 +2704,22 @@ class NativePreservingAdapter(PdfEngineAdapter):
                     else:
                         active_math_spans = list(blk.inline_math_spans)
 
+                    # Pre-redaction check 3: Refuse to flatten conflicting super/sub/normal math roles
+                    ambiguous_ctxs = sorted(
+                        {ms.context_text for ms in active_math_spans if ms.ambiguous}
+                    )
+                    if ambiguous_ctxs:
+                        _record_fallback(
+                            blk,
+                            "AMBIGUOUS_INLINE_MATH_FALLBACK",
+                            (
+                                f"同一ブロック内で上付き・下付き・通常表記が競合する数式表現（{ambiguous_ctxs}）があり、"
+                                "意味を損なわず安全に組版できないため原文要素を保持しました。"
+                            ),
+                            {"ambiguous_contexts": ambiguous_ctxs},
+                        )
+                        continue
+
                     # Fit Japanese lines within bbox respecting min_font_size_pt (Section 12)
                     fitted_size, wrapped_lines, fits = fit_japanese_text_in_bbox(
                         text=render_ready_text,
@@ -2588,35 +2733,64 @@ class NativePreservingAdapter(PdfEngineAdapter):
                     if not fits:
                         # Section 12: Never shrink below min_font_size_pt, never delete text,
                         # never move figures/formulas; keep original and emit overflow warning.
-                        blk.status = BlockStatus.FALLBACK_ORIGINAL
-                        blk.translation_provenance = "fallback_original"
-                        blk.warnings.append("TYPESETTING_OVERFLOW_FALLBACK")
-                        protected_boxes.append(blk.bbox)
-                        issues.append(
-                            ValidationIssue(
-                                id=f"iss-{uuid.uuid4().hex[:10]}",
-                                job_id=job_id,
-                                document_id=document.id,
-                                page_index=p_idx,
-                                block_id=blk.id,
-                                bbox=blk.bbox,
-                                code="TYPESETTING_OVERFLOW_FALLBACK",
-                                severity=IssueSeverity.WARNING,
-                                message=(
-                                    f"最小フォントサイズ（{job_config.min_font_size_pt}pt）でも枠内に収まらないため、"
-                                    "訳文の切り捨てや数式への重なりを避けて原文要素を保持しました（要手動確認）。"
-                                ),
-                                details={
-                                    "min_font_size_pt": job_config.min_font_size_pt,
-                                    "restored_text": restored_text,
-                                },
-                                fallback_applied=True,
-                            )
+                        _record_fallback(
+                            blk,
+                            "TYPESETTING_OVERFLOW_FALLBACK",
+                            (
+                                f"最小フォントサイズ（{job_config.min_font_size_pt}pt）でも枠内に収まらないため、"
+                                "訳文の切り捨てや数式への重なりを避けて原文要素を保持しました（要手動確認）。"
+                            ),
+                            {
+                                "min_font_size_pt": job_config.min_font_size_pt,
+                                "restored_text": restored_text,
+                            },
                         )
                         continue
 
                     blk.fitted_font_size_pt = fitted_size
-                    approved_typeset_items.append((blk, fitted_size, wrapped_lines, active_math_spans))
+                    provisional_items.append((blk, fitted_size, wrapped_lines, active_math_spans))
+
+                # Phase 2: Fixed-point convergence so all approved blocks & overbar clear rects
+                # are re-evaluated whenever `protected_boxes` grows, guaranteeing order independence.
+                while provisional_items:
+                    newly_rejected = False
+                    next_provisional: list[
+                        tuple[Block, float, list[str], list[InlineMathSpan]]
+                    ] = []
+                    for item in provisional_items:
+                        blk, fitted_size, wrapped_lines, active_math_spans = item
+                        overbar_boxes = [
+                            [
+                                float(ms.orig_overbar_bbox[0]),
+                                float(ms.orig_overbar_bbox[1]),
+                                float(ms.orig_overbar_bbox[2]),
+                                float(ms.orig_overbar_bbox[3]),
+                            ]
+                            for ms in active_math_spans
+                            if ms.orig_overbar_bbox and len(ms.orig_overbar_bbox) == 4
+                        ]
+                        check_boxes = [blk.bbox] + overbar_boxes
+                        overlapping_prot = any(
+                            bbox_iou(cb, pb) > 0.02
+                            or bbox_intersection_ratio(pb, cb) > 0.05
+                            or bbox_intersection_ratio(cb, pb) > 0.05
+                            for cb in check_boxes
+                            for pb in protected_boxes
+                        )
+                        if overlapping_prot:
+                            _record_fallback(
+                                blk,
+                                "PROTECTED_REGION_OVERLAP_FALLBACK",
+                                "翻訳領域が保護対象（数式・図）と近接・重複するため、数式保護を優先して原文要素を保持しました。",
+                            )
+                            newly_rejected = True
+                        else:
+                            next_provisional.append(item)
+                    provisional_items = next_provisional
+                    if not newly_rejected:
+                        break
+
+                approved_typeset_items = provisional_items
 
                 if approved_typeset_items:
                     # Redact ONLY the approved translated text bounding boxes while preserving 100% of images & vector line art
@@ -2651,7 +2825,8 @@ class NativePreservingAdapter(PdfEngineAdapter):
                     )
 
                     # Clear any inline radical vinculum bar from the original English position
-                    # for blocks that are being re-typeset so orphan bars do not remain over prose
+                    # for blocks that are being re-typeset, subtracting all protected_boxes
+                    # so protected text or vector graphics adjacent to the overbar are never erased.
                     for blk, _, _, active_math_spans in approved_typeset_items:
                         for mspan in active_math_spans:
                             if mspan.orig_overbar_bbox and len(mspan.orig_overbar_bbox) == 4:
@@ -2661,12 +2836,18 @@ class NativePreservingAdapter(PdfEngineAdapter):
                                     float(mspan.orig_overbar_bbox[2]),
                                     float(mspan.orig_overbar_bbox[3]),
                                 )
-                                mpage.draw_rect(
-                                    pymupdf.Rect(ox0 - 0.5, oy0 - 1.0, ox1 + 0.5, oy1 + 1.0),
-                                    color=None,
-                                    fill=(1, 1, 1),
-                                    overlay=True,
+                                white_rects = _subtract_protected_boxes(
+                                    [ox0 - 0.5, oy0 - 1.0, ox1 + 0.5, oy1 + 1.0],
+                                    protected_boxes,
+                                    margin=0.25,
                                 )
+                                for wx0, wy0, wx1, wy1 in white_rects:
+                                    mpage.draw_rect(
+                                        pymupdf.Rect(wx0, wy0, wx1, wy1),
+                                        color=None,
+                                        fill=(1, 1, 1),
+                                        overlay=True,
+                                    )
 
                     if font_path and font_path.exists():
                         mpage.insert_font(fontname=ja_font_tag, fontfile=str(font_path))
@@ -2977,6 +3158,39 @@ def unmask_inline_protected_elements(
     return pattern.sub(lambda m: ph_map[m.group(0)], translated_text)
 
 
+def _measure_rendered_line_width(
+    line_str: str,
+    font_size_pt: float,
+    ja_font: pymupdf.Font | None = None,
+    math_font: pymupdf.Font | None = None,
+    inline_math_spans: list[InlineMathSpan] | None = None,
+) -> float:
+    """Measure the exact rendered horizontal extent of a line matching `_build_styled_line_plan`."""
+    if not line_str:
+        return 0.0
+    if inline_math_spans or ja_font is not None:
+        styled_runs, _, plan_w, _, _ = _build_styled_line_plan(
+            line_str=line_str,
+            font_size_pt=font_size_pt,
+            ja_font_tag="F_JA",
+            ja_font=ja_font,
+            math_font_tag="F_MATH" if math_font is not None else None,
+            math_font=math_font,
+            inline_math_spans=inline_math_spans,
+        )
+        max_x1 = plan_w
+        for _, r_fobj, r_txt, r_x0, _, r_fs in styled_runs:
+            if r_fobj is not None:
+                max_x1 = max(max_x1, r_x0 + float(r_fobj.text_length(r_txt, fontsize=r_fs)))
+        return max_x1
+    return sum(
+        font_size_pt * 0.56
+        if (ord(c) < 128 or (0x1D400 <= ord(c) <= 0x1D7FF))
+        else font_size_pt * 1.02
+        for c in line_str
+    )
+
+
 def wrap_japanese_kinsoku(
     text: str,
     max_width_pt: float,
@@ -2986,9 +3200,8 @@ def wrap_japanese_kinsoku(
     inline_math_spans: list[InlineMathSpan] | None = None,
 ) -> list[str]:
     """Wrap mixed Japanese/English/math text into lines respecting `max_width_pt`
-    and Kinsoku Shori (prohibited line-start and line-end characters).
-    When `ja_font` (and optionally `math_font` / `inline_math_spans`) are provided, uses
-    exact glyph metrics and sub/superscript/hat scaling matching the rendering layout.
+    and Kinsoku Shori (prohibited line-start and line-end characters) without
+    right-edge horizontal overhang.
     """
     if not text:
         return []
@@ -2996,90 +3209,70 @@ def wrap_japanese_kinsoku(
     lines: list[str] = []
 
     def _measure_str(s: str) -> float:
-        if inline_math_spans:
-            _, _, w, _, _ = _build_styled_line_plan(
-                line_str=s,
-                font_size_pt=font_size_pt,
-                ja_font_tag="F_JA",
-                ja_font=ja_font,
-                math_font_tag="F_MATH" if math_font is not None else None,
-                math_font=math_font,
-                inline_math_spans=inline_math_spans,
-            )
-            return w
-        if ja_font is not None:
-            total = 0.0
-            for ch in s:
-                sel = _select_char_font(
-                    ch,
-                    "F_JA",
-                    ja_font,
-                    "F_MATH" if math_font is not None else None,
-                    math_font,
-                )
-                fobj = sel[1] if sel is not None else ja_font
-                total += float(fobj.text_length(ch, fontsize=font_size_pt))
-            return total
-        return sum(
-            font_size_pt * 0.56
-            if (ord(c) < 128 or (0x1D400 <= ord(c) <= 0x1D7FF))
-            else font_size_pt * 1.02
-            for c in s
+        return _measure_rendered_line_width(
+            line_str=s,
+            font_size_pt=font_size_pt,
+            ja_font=ja_font,
+            math_font=math_font,
+            inline_math_spans=inline_math_spans,
         )
 
-    # Tokenize so `{vN}`, radical expressions `√(...)`, or inline math sequences stay together
+    # Tokenize so URLs, `{vN}`, radical expressions `√(...)`, or inline math sequences stay together
     tokens = re.findall(
-        r"[A-Za-z0-9\U0001d400-\U0001d7ff\u0370-\u03ff\u02c6=+\-−∗]*√\([^()\n]+\)[.,;:]?"
+        r"https?://[^\s\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff\uff00-\uffef]+"
+        r"|[A-Za-z0-9\U0001d400-\U0001d7ff\u0370-\u03ff\u02c6=+\-−∗]*√\([^()\n]+\)[.,;:]?"
         r"|[A-Za-z0-9\U0001d400-\U0001d7ff\u0370-\u03ff\u2070-\u209f\u02c6_^\(\)\[\]{}=<>≤≥≈≠±+\-−∗√∑∏∫*/.,:;′″']+"
         r"|\s+|.",
         norm_text,
     )
-    cur_line = ""
-    cur_w = 0.0
+    cur_tokens: list[str] = []
 
     for tok in tokens:
         if tok == "\n":
-            if cur_line.strip():
-                lines.append(cur_line.rstrip())
-            cur_line = ""
-            cur_w = 0.0
+            cur_joined = "".join(cur_tokens).rstrip()
+            if cur_joined:
+                lines.append(cur_joined)
+            cur_tokens = []
             continue
-        if not cur_line and tok.isspace():
+        if not cur_tokens and tok.isspace():
             continue
 
-        cand_line = cur_line + tok
+        cand_line = "".join(cur_tokens) + tok
         cand_w = _measure_str(cand_line)
-        tok_w = cand_w - cur_w
-        if cur_line and (cand_w > max_width_pt):
-            # Kinsoku line-start check: if `tok` starts with a prohibited line-start char
-            # and we have only 1 char, allow slight overhang or pull last char from cur_line
-            if (
-                len(tok) == 1
-                and tok in KINSOKU_LINE_START_PROHIBITED
-                and cand_w <= max_width_pt + font_size_pt * 1.1
-            ):
-                cur_line = cand_line
-                lines.append(cur_line.rstrip())
-                cur_line = ""
-                cur_w = 0.0
-                continue
-            # Kinsoku line-end check: if cur_line ends with an opening bracket, push it to next line
-            if len(cur_line) >= 2 and cur_line[-1] in KINSOKU_LINE_END_PROHIBITED:
-                carry = cur_line[-1]
-                lines.append(cur_line[:-1].rstrip())
-                cur_line = carry + tok.lstrip()
-                cur_w = _measure_str(cur_line)
+        if cur_tokens and (cand_w > max_width_pt):
+            cur_joined = "".join(cur_tokens)
+            # Kinsoku line-start check (追い出し without exceeding max_width_pt):
+            # Pull the trailing non-space token onto the next line with `tok`.
+            if len(tok) == 1 and tok in KINSOKU_LINE_START_PROHIBITED:
+                if (
+                    len(cur_tokens) >= 2
+                    and not cur_tokens[-1].isspace()
+                    and cur_tokens[-1] not in KINSOKU_LINE_END_PROHIBITED
+                    and cur_tokens[-1] not in KINSOKU_LINE_START_PROHIBITED
+                ):
+                    prefix = "".join(cur_tokens[:-1]).rstrip()
+                    if prefix and _measure_str(prefix) <= max_width_pt + 1e-3:
+                        lines.append(prefix)
+                        cur_tokens = [cur_tokens[-1], tok]
+                        continue
+            # Kinsoku line-end check: if cur_tokens ends with an opening bracket, push it to next line
+            if len(cur_tokens) >= 2 and cur_tokens[-1] in KINSOKU_LINE_END_PROHIBITED:
+                carry = cur_tokens[-1]
+                prefix = "".join(cur_tokens[:-1]).rstrip()
+                if prefix:
+                    lines.append(prefix)
+                cur_tokens = [carry] if tok.isspace() else [carry, tok]
                 continue
 
-            lines.append(cur_line.rstrip())
-            cur_line = tok.lstrip()
-            cur_w = _measure_str(cur_line)
+            if cur_joined.rstrip():
+                lines.append(cur_joined.rstrip())
+            cur_tokens = [] if tok.isspace() else [tok]
         else:
-            cur_line = cand_line
-            cur_w = cand_w
+            cur_tokens.append(tok)
 
-    if cur_line.strip():
-        lines.append(cur_line.rstrip())
+    cur_joined = "".join(cur_tokens).rstrip()
+    if cur_joined:
+        lines.append(cur_joined)
 
     return lines
 
@@ -3094,16 +3287,24 @@ def fit_japanese_text_in_bbox(
     inline_math_spans: list[InlineMathSpan] | None = None,
 ) -> tuple[float, list[str], bool]:
     """Find the largest font size in `[min_font_size, initial_font_size]` (step 0.5pt)
-    such that the wrapped text (including any superscript/hat/radical top ascent and
-    subscript bottom descent) fits inside `bbox` width and height.
+    such that the wrapped text (including any superscript/hat/radical top ascent,
+    subscript bottom descent, and every wrapped line's horizontal extent) fits
+    inside `bbox` width and height.
     Returns `(fitted_font_size, lines, fits_in_box)`.
     """
     box_w = max(10.0, bbox[2] - bbox[0])
     box_h = max(8.0, bbox[3] - bbox[1])
     start_sz = max(min_font_size, initial_font_size)
 
+    candidate_sizes: list[float] = []
     sz = start_sz
     while sz >= min_font_size - 1e-6:
+        candidate_sizes.append(max(min_font_size, sz))
+        sz -= 0.5
+    if candidate_sizes and candidate_sizes[-1] > min_font_size + 1e-6:
+        candidate_sizes.append(min_font_size)
+
+    for sz in candidate_sizes:
         lines = wrap_japanese_kinsoku(
             text,
             box_w,
@@ -3127,11 +3328,22 @@ def fit_japanese_text_in_bbox(
             if last_bot_em > 0.25:
                 extra_bottom = (last_bot_em - 0.22) * sz
         required_h = len(lines) * line_h + extra_bottom
-        if required_h <= box_h + sz * 0.45:
+        vertical_fits = required_h <= box_h + sz * 0.45
+        horizontal_fits = all(
+            _measure_rendered_line_width(
+                line_str=line,
+                font_size_pt=sz,
+                ja_font=ja_font,
+                math_font=math_font,
+                inline_math_spans=inline_math_spans,
+            )
+            <= box_w + 1e-3
+            for line in lines
+        )
+        if vertical_fits and horizontal_fits:
             return round(sz, 2), lines, True
-        sz -= 0.5
 
-    # Even at min_font_size it overflows
+    # Even at min_font_size it overflows vertically or horizontally
     min_lines = wrap_japanese_kinsoku(
         text,
         box_w,
