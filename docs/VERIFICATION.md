@@ -53,6 +53,26 @@
   - 最新コード上での新規実モデル推論（`page-7:block-27` のような実推論出力に対する数値検証の再評価を含む）および全13ページの新規翻訳E2E
   - `初回セットアップ.bat` によるクリーンな別 Windows PC 環境での再セットアップ
 
+### 日本語直後の添字抑止・狭小bbox下限クランプ修正の検証（コミット `c71acf9` — 2026-11-14 追記）
+
+> 注記：本節はコミット `1589f6f` を起点とするローカル追加修正（コミット `c71acf9`、ブランチ `fix/inline-math-preservation`）における限定修正 2 点および再組版検証の結果のみを記録します。本番データ領域へは接続せず、分離ランタイム上で実施しています。
+
+- **今回修正した 2 点（スコープ限定修正）:**
+  1. **日本語助詞等が直後に続く場合のインライン数式添字抑止の修正**: [`_build_styled_line_plan()`](backend/pdf/adapters/native_preserving_adapter.py) の末尾境界ガードにおいて Unicode 全般の `str.isalnum()` を用いていた箇所を [`_is_math_ident_continuation_char()`](backend/pdf/adapters/native_preserving_adapter.py) に置換し、ASCII 英数字・ラテン拡張・ギリシャ文字・文字様記号・上付き下付き・数学用英数字記号のみを数式識別子の継続文字として判定するよう限定しました（ひらがな・カタカナ・漢字等の直前では添字抑止を解除し、先頭側境界ガード・Unicode 非 ASCII 化・`MANUALLY_EDITED`・`AMBIGUOUS_INLINE_MATH_FALLBACK` の既存挙動は維持）。
+  2. **狭小 bbox の幅・高さ下限クランプ撤去**: [`fit_japanese_text_in_bbox()`](backend/pdf/adapters/native_preserving_adapter.py) の `box_w = max(10.0, ...)` / `box_h = max(8.0, ...)` を撤去し、元ブロックの実際の幅・高さで収まり判定を行うよう修正しました（`raw_w <= 0.0` または `raw_h <= 0.0` の場合は `False` を返却、`min_font_size_pt = 8.0` は不変）。
+- **最新ローカル自動テスト結果（コミット `c71acf9`・分離 `PAPERBRIDGE_RUNTIME_DIR` 使用）:**
+  - ローカル全 `pytest`: **`105 passed, 7 skipped, 1 warning`**（回帰テスト `test_fix_a_japanese_following_subscript_and_superscript_not_suppressed` および `test_fix_b_narrow_bbox_subcaptions_fallback_without_overhang` を追加、修正前 `1589f6f` 上での FAIL 確認後に PASS を確認。スキップ 7 件は `--run-real-llm` 指定時のみ実行される `tests/integration/test_real_plamo_phase2.py`）。
+  - CI 環境 `YuGothR.ttc` フォールバック模擬（`NotoSerifJP-VF.ttf` 不在模擬下での `test_inline_math_preservation.py` + `test_visual_preservation.py`）: **`35 passed`**。
+- **保存済み 13 ページ訳文を使った再組版確認（新規推論ではないことを明記）:**
+  - **実施性質の明記**: 本確認は 13 ページ全編の保存済み実モデル訳文（Stage 1 出力スナップショットの分離複製）を最新コード（`c71acf9`）の組版器で再組版（`retypeset_job` / `POST /api/jobs/{job_id}/retypeset`）した確認であり、**新規の LLM 推論は実施していません（`llm_calls_made = 0`、`last_retypeset_llm_calls_made = 0`）**。
+  - **対象 5 箇所の下付き文字の再現（`mono` / `dual` 両PDF確認）**: `page-5:block-19` の `𝐿𝑡𝑟は`・`分類損失𝐿𝑐𝑙𝑠および`（`6.341pt`、ベースライン比 `+1.46pt`）および `page-7:block-16` の `𝑃𝑗は`・`𝑖𝑝および`・`ˆ𝑖𝑝は`（`6.825pt`、ベースライン比 `+1.57pt`、ハット `ˆ` は `-1.61pt` 上移動）について、修正前 `mono` では平文大のままだった 5 箇所すべてが修正後 `mono` / `dual` 双方で縮小下付き（+ハット）として描画されることを座標・レンダリング画像で確認しました。
+  - **p.10 サブキャプションと全 239 ブロックへの影響**: 全 239 ブロックのうちステータス変化が生じたのは **p.10 の 2 ブロック（`page-10:block-2` `(a)` および `page-10:block-6` `(c)`）のみ**であり、いずれも `translated` から原文保持（`fallback_original`、`TYPESETTING_OVERFLOW_FALLBACK`）へ遷移しました（`translated: 117 -> 115`、`fallback_original: 25 -> 27`、`protected_skip: 97 -> 97`）。p.10 `(a)`–`(d)` 全 4 枠で元英語 `LinLibertineTB 6.974pt` が枠内に収まり、13 ページ全 `115` 翻訳ブロックのブロック内横超過 `0` 件・保護領域視覚保全全ページ通過を確認しました。
+- **別問題として確認された再組版時の既存警告消失事象（A・B の改善とは区別）:**
+  - `POST /api/jobs/{job_id}/retypeset` 経路において、`retypeset_job()` が処理冒頭で全ブロックの `warnings` を初期化し、`TRANSLATED` / `MANUALLY_EDITED` のみを再検証・再組版して `replace_validation_issues_for_job()` でジョブの issue テーブルを全置換するため、修正前の翻訳時に既に `fallback_original` へ遷移していた 25 ブロック（`NUMERIC_VALUE_MISMATCH` や `UNTRANSLATED_SOURCE_RETURNED` などの翻訳検証警告、および既存の `TRANSLATED_BLOCK_OVERLAP_FALLBACK` / `TYPESETTING_OVERFLOW_FALLBACK` を含む）が再評価対象から外れて `warnings` から消失し、再組版で新たに組版評価された 2 件の `TYPESETTING_OVERFLOW_FALLBACK` のみが残る現象（`validation_issues_count: 26 -> 2`、`warning_count: 26 -> 2`、ジョブ状態は `has_fallbacks=True` により `completed_with_warnings` 維持）を確認しました。本事象は未修正の未解決事項として別途切り分け管理します。
+- **公開用の既知制限（本修正スコープ外）:**
+  - **分割キャプションの日英混在**: 1 つのキャプションが複数ブロックへ分割抽出された場合（例：`page-3:block-9` と `block-10` の `(a) Layout of WiFi devices` / `and human bodies`）、片方のブロックのみが `TYPESETTING_OVERFLOW_FALLBACK` 等で原文保持になると訳文と原文の日英混在が残ります。
+  - **`translate_tables=False` 時の表段落誤検出**: レイアウト解析で表領域が `table` ではなく `paragraph` として抽出された場合（今回の 13 ページ論文 239 ブロックでは `kind='table'` が `0` 件で、`page-8:block-1`, `block-5` 等が `paragraph` 扱い）、`translate_tables=False` 設定であっても段落翻訳の対象となり表セル・列配置の整列が失われる場合があります。
+
 ## Experimental Windows one-click setup & source-ZIP check — 2026-11-12
 
 > Notice: Past historical verification records below (2026-11-08 and earlier) are preserved as originally recorded. This section covers only the experimental source-ZIP one-click setup additions on branch `feat/one-click-setup`. The archive/CLI tests described below were run on pre-push local verification commits prior to rebuilding those unpushed commits with GitHub noreply commit metadata (`285997610+hann451@users.noreply.github.com`), and the runtime tests were not re-run solely for the rebuilt commit SHAs; subsequent `docs/VERIFICATION.md` SHA-alignment edits sit cleanly on top without altering functional code.
