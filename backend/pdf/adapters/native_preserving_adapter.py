@@ -3080,6 +3080,18 @@ class NativePreservingAdapter(PdfEngineAdapter):
         return reports
 
 
+TYPESETTING_ISSUE_CODES: frozenset[str] = frozenset(
+    {
+        "TRANSLATED_BLOCK_OVERLAP_FALLBACK",
+        "UNRESOLVED_PLACEHOLDER_FALLBACK",
+        "UNRENDERABLE_GLYPH_FALLBACK",
+        "AMBIGUOUS_INLINE_MATH_FALLBACK",
+        "TYPESETTING_OVERFLOW_FALLBACK",
+        "PROTECTED_REGION_OVERLAP_FALLBACK",
+    }
+)
+
+
 # ----------------------------------------------------------------------
 # Helper functions for Inline Formula Masking & Kinsoku Japanese Fitting
 # ----------------------------------------------------------------------

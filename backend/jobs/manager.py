@@ -34,7 +34,10 @@ from backend.domain.models import (
     ValidationIssue,
 )
 from backend.pdf.adapters.base import PdfEngineAdapter
-from backend.pdf.adapters.native_preserving_adapter import NativePreservingAdapter
+from backend.pdf.adapters.native_preserving_adapter import (
+    TYPESETTING_ISSUE_CODES,
+    NativePreservingAdapter,
+)
 from backend.pdf.coordinates import bbox_iou, parse_page_range_spec
 from backend.pdf.validation.preflight import (
     compute_sha256,
@@ -57,7 +60,114 @@ from backend.translation.prompts.pfml3 import (
     HistoryPair,
     split_paragraph_preserving_placeholders,
 )
-from backend.translation.validation.validator import validate_translation_output
+from backend.translation.validation.validator import (
+    TRANSLATION_VALIDATION_ISSUE_CODES,
+    validate_translation_output,
+)
+
+PROTECTION_CHANGE_ISSUE_CODES: frozenset[str] = frozenset(
+    {"UNTRANSLATED_AFTER_PROTECTION_CHANGE"}
+)
+VISUAL_PRESERVATION_ISSUE_CODES: frozenset[str] = frozenset(
+    {"VISUAL_PRESERVATION_DIFF_DETECTED"}
+)
+_BLOCK_IDENTITY_BBOX_IOU_MIN: float = 0.45
+
+
+def _issue_check_scope(code: str) -> str:
+    """Classify a ValidationIssue code into its re-evaluation check scope (never uses message text)."""
+    if code in TRANSLATION_VALIDATION_ISSUE_CODES:
+        return "translation_validation"
+    if code in TYPESETTING_ISSUE_CODES:
+        return "typesetting"
+    if code in PROTECTION_CHANGE_ISSUE_CODES:
+        return "protection_change"
+    if code in VISUAL_PRESERVATION_ISSUE_CODES:
+        return "visual_preservation"
+    return "other"
+
+
+def _issue_matches_block(issue: ValidationIssue, block: Block) -> bool:
+    """Verify a block-scoped issue matches the target block by id, page, and spatial IoU."""
+    if issue.block_id != block.id or issue.page_index != block.page_index:
+        return False
+    if issue.bbox and len(issue.bbox) == 4 and block.bbox and len(block.bbox) == 4:
+        return bbox_iou(issue.bbox, block.bbox) >= _BLOCK_IDENTITY_BBOX_IOU_MIN
+    return True
+
+
+def _reconcile_retypeset_issues_and_warnings(
+    *,
+    existing_issues: list[ValidationIssue],
+    new_issues: list[ValidationIssue],
+    working_blocks: list[Block],
+    evaluated_page_indices: set[int],
+    reevaluated_scopes_by_block: dict[str, set[str]],
+    evaluated_visual_pages: set[int],
+    orig_warnings_by_block: dict[str, list[str]] | None = None,
+) -> list[ValidationIssue]:
+    """Reconcile existing issues with newly evaluated ones and sync block.warnings.
+
+    Preserves existing issues and fallback reasons for non-re-evaluated blocks/scopes,
+    replaces only re-evaluated check scopes per block/page, clears resolved issues,
+    guards against orphaned/shifted issues leaking onto unrelated blocks, deduplicates
+    repeated outputs, and sorts deterministically by (page_index, id).
+    """
+    block_by_id = {b.id: b for b in working_blocks}
+    kept_existing: list[ValidationIssue] = []
+
+    for old in existing_issues:
+        scope = _issue_check_scope(old.code)
+        if scope == "visual_preservation":
+            if old.page_index not in evaluated_visual_pages:
+                kept_existing.append(old)
+            continue
+
+        if old.block_id is None:
+            kept_existing.append(old)
+            continue
+
+        if old.page_index not in evaluated_page_indices:
+            kept_existing.append(old)
+            continue
+
+        blk = block_by_id.get(old.block_id)
+        if blk is None or not _issue_matches_block(old, blk):
+            continue
+
+        if scope in reevaluated_scopes_by_block.get(blk.id, set()):
+            continue
+
+        kept_existing.append(old)
+
+    deduped = _deduplicate_validation_issues(kept_existing + list(new_issues))
+    reconciled = sorted(deduped, key=lambda item: (item.page_index, item.id))
+
+    issues_by_block: dict[str, list[ValidationIssue]] = {}
+    for iss in reconciled:
+        if iss.block_id is None or _issue_check_scope(iss.code) == "visual_preservation":
+            continue
+        blk = block_by_id.get(iss.block_id)
+        if blk is not None and _issue_matches_block(iss, blk):
+            issues_by_block.setdefault(blk.id, []).append(iss)
+
+    orig_map = orig_warnings_by_block or {}
+    for blk in working_blocks:
+        blk_issues = issues_by_block.get(blk.id, [])
+        present_codes = {iss.code for iss in blk_issues}
+        synced: list[str] = []
+        seen: set[str] = set()
+        for code in orig_map.get(blk.id, []):
+            if code in present_codes and code not in seen:
+                synced.append(code)
+                seen.add(code)
+        for iss in blk_issues:
+            if iss.code not in seen:
+                synced.append(iss.code)
+                seen.add(iss.code)
+        blk.warnings = synced
+
+    return reconciled
 
 
 def _deduplicate_validation_issues(
@@ -984,6 +1094,11 @@ class JobManager:
             ]
             # Work on deep copies so DB blocks are not mutated if staging fails
             working_blocks = [b.model_copy(deep=True) for b in stored_blocks]
+            existing_issues = self.db.list_validation_issues(job.id)
+            orig_status_by_id = {b.id: b.status for b in stored_blocks}
+            orig_warnings_by_id = {b.id: list(b.warnings) for b in stored_blocks}
+            reevaluated_scopes_by_block: dict[str, set[str]] = {}
+            evaluated_visual_pages: set[int] = set()
             issues: list[ValidationIssue] = []
             requires_reparse_or_retranslate = False
 
@@ -995,6 +1110,7 @@ class JobManager:
                 saved_manual = blk.manual_translation_text
                 saved_masked = blk.masked_source_text
                 saved_items = list(blk.protected_items)
+                prev_status = orig_status_by_id.get(blk.id, blk.status)
 
                 if protection_changed and isinstance(self.pdf_adapter, NativePreservingAdapter):
                     self.pdf_adapter._apply_protection_and_masking(
@@ -1007,7 +1123,16 @@ class JobManager:
                     if (saved_trans is not None or saved_manual is not None) and saved_masked is not None:
                         blk.masked_source_text = saved_masked
                         blk.protected_items = saved_items
-                    if blk.status != BlockStatus.PROTECTED_SKIP:
+                    if blk.status == BlockStatus.PROTECTED_SKIP:
+                        reevaluated_scopes_by_block.setdefault(blk.id, set()).update(
+                            {"translation_validation", "typesetting", "protection_change"}
+                        )
+                    elif prev_status == BlockStatus.FALLBACK_ORIGINAL:
+                        # Existing FALLBACK_ORIGINAL blocks not newly protected stay
+                        # untouched so their original fallback reason is never overwritten.
+                        blk.status = BlockStatus.FALLBACK_ORIGINAL
+                    else:
+                        reevaluated_scopes_by_block.setdefault(blk.id, set()).add("protection_change")
                         if saved_manual is not None:
                             blk.status = BlockStatus.MANUALLY_EDITED
                         elif saved_trans is not None:
@@ -1030,16 +1155,19 @@ class JobManager:
                                     fallback_applied=True,
                                 )
                             )
+                elif blk.status == BlockStatus.PROTECTED_SKIP:
+                    reevaluated_scopes_by_block.setdefault(blk.id, set()).update(
+                        {"translation_validation", "typesetting", "protection_change"}
+                    )
 
                 if blk.status in (BlockStatus.TRANSLATED, BlockStatus.MANUALLY_EDITED):
+                    block_scopes = reevaluated_scopes_by_block.setdefault(blk.id, set())
+                    block_scopes.update({"translation_validation", "protection_change"})
                     eff = blk.effective_translation
-                    if not eff:
-                        blk.status = BlockStatus.FALLBACK_ORIGINAL
-                        continue
                     val_res = validate_translation_output(
                         source_text=blk.source_text,
                         masked_source_text=blk.masked_source_text or blk.source_text,
-                        translated_text=eff,
+                        translated_text=eff or "",
                         protected_items=blk.protected_items,
                         finish_reason="stop",
                     )
@@ -1047,12 +1175,16 @@ class JobManager:
                         blk.manual_validation_errors = list(val_res.error_codes)
                         blk.manual_validation_warnings = list(val_res.warning_codes)
 
+                    is_empty_eff = eff is None or not eff.strip()
                     if not val_res.is_valid or val_res.findings:
                         if not allow_validation_warnings:
                             codes = [f.code for f in val_res.findings]
                             raise ValueError(
                                 f"RetypesetValidationFailed: Block '{blk.id}' has validation findings {codes}"
                             )
+                        should_fallback = not val_res.is_valid and (
+                            blk.status != BlockStatus.MANUALLY_EDITED or is_empty_eff
+                        )
                         for f in val_res.findings:
                             blk.warnings.append(f.code)
                             issues.append(
@@ -1067,11 +1199,12 @@ class JobManager:
                                     severity=f.severity,
                                     message=f.message,
                                     details=f.details,
-                                    fallback_applied=(not val_res.is_valid and blk.status != BlockStatus.MANUALLY_EDITED),
+                                    fallback_applied=should_fallback,
                                 )
                             )
-                        if not val_res.is_valid and blk.status != BlockStatus.MANUALLY_EDITED:
+                        if should_fallback:
                             blk.status = BlockStatus.FALLBACK_ORIGINAL
+                            block_scopes.add("typesetting")
 
             next_rev = job.retypeset_revision + 1
             staging_dir = (
@@ -1091,6 +1224,11 @@ class JobManager:
                 staging_dir / f"{doc.id}.dual.pdf" if job.config.output_dual_pdf else None
             )
 
+            if not job.config.only_roundtrip_preservation:
+                for b in working_blocks:
+                    if b.status in (BlockStatus.TRANSLATED, BlockStatus.MANUALLY_EDITED):
+                        reevaluated_scopes_by_block.setdefault(b.id, set()).add("typesetting")
+
             working_blocks, typeset_issues = self.pdf_adapter.typeset_and_export(
                 document=doc,
                 blocks=working_blocks,
@@ -1101,10 +1239,16 @@ class JobManager:
                 job_config=job.config,
                 manual_regions=manual_regions,
             )
+            for ts_iss in typeset_issues:
+                if ts_iss.block_id:
+                    reevaluated_scopes_by_block.setdefault(ts_iss.block_id, set()).add(
+                        _issue_check_scope(ts_iss.code)
+                    )
             issues.extend(typeset_issues)
 
             visual_reports = []
             if staging_mono and staging_mono.exists():
+                evaluated_visual_pages.update(page_indices)
                 v_reps = self.pdf_adapter.verify_preservation(
                     document=doc,
                     output_pdf_path=staging_mono,
@@ -1176,6 +1320,16 @@ class JobManager:
             original_intact = verify_original_unchanged(doc.safe_storage_path, doc.sha256_hash)
             if not original_intact:
                 raise RuntimeError("CRITICAL: Original PDF hash changed during retypeset!")
+
+            issues = _reconcile_retypeset_issues_and_warnings(
+                existing_issues=existing_issues,
+                new_issues=issues,
+                working_blocks=working_blocks,
+                evaluated_page_indices=page_index_set,
+                reevaluated_scopes_by_block=reevaluated_scopes_by_block,
+                evaluated_visual_pages=evaluated_visual_pages,
+                orig_warnings_by_block=orig_warnings_by_id,
+            )
 
             applied_revisions = {
                 b.id: {

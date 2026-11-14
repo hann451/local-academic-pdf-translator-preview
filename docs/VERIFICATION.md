@@ -73,6 +73,27 @@
   - **分割キャプションの日英混在**: 1 つのキャプションが複数ブロックへ分割抽出された場合（例：`page-3:block-9` と `block-10` の `(a) Layout of WiFi devices` / `and human bodies`）、片方のブロックのみが `TYPESETTING_OVERFLOW_FALLBACK` 等で原文保持になると訳文と原文の日英混在が残ります。
   - **`translate_tables=False` 時の表段落誤検出**: レイアウト解析で表領域が `table` ではなく `paragraph` として抽出された場合（今回の 13 ページ論文 239 ブロックでは `kind='table'` が `0` 件で、`page-8:block-1`, `block-5` 等が `paragraph` 扱い）、`translate_tables=False` 設定であっても段落翻訳の対象となり表セル・列配置の整列が失われる場合があります。
 
+### 再組版（retypeset）時の既存警告・ValidationIssue 保持修正の検証（2026-11-14 追記）
+
+> 注記：上記（コミット `c71acf9` 時点）の「再組版時の既存警告消失事象」を含む過去履歴は当時の記録のまま保持しています。本節はブランチ `fix/inline-math-preservation` 上で実施した再組版（`retypeset`）時の既存警告・`ValidationIssue` 保持／再評価／集計整合性修正に対する検証結果のみを記録します。本番データ領域へは接続せず、分離ランタイム上で実施しています。
+
+- **修正範囲と整合性ルール（スコープ限定修正）:**
+  - `backend/translation/validation/validator.py`（`TRANSLATION_VALIDATION_ISSUE_CODES`）および `backend/pdf/adapters/native_preserving_adapter.py`（`TYPESETTING_ISSUE_CODES`）に検査カテゴリ別の公式コード集合を定義し、`backend/jobs/manager.py` に `_issue_check_scope()`（`message` 文字列ではなく `code` のみで `translation_validation` / `typesetting` / `protection_change` / `visual_preservation` / `other` へ分類）、`_issue_matches_block()`（`block_id`・`page_index`・`bbox_iou >= 0.45` で再解析時のずれ・孤立 Issue 混入を防止）、および `_reconcile_retypeset_issues_and_warnings()` を追加しました。
+  - 変更や再評価対象とならない `FALLBACK_ORIGINAL` ブロックの既存警告・`ValidationIssue`・原文保持理由は保持し、再評価対象ブロックでは**再評価した検査カテゴリの Issue のみ**を最新結果で置き換えるようにしました（他ブロックの保護変更時にも既存 `FALLBACK_ORIGINAL` ブロックが `UNTRANSLATED_AFTER_PROTECTION_CHANGE` で上書きされないようガード）。
+  - 手動修正や `PROTECTED_SKIP` 化等で解消・再検証通過した Issue は除去しつつ、未解消 Issue や非再評価対象チェック（`block_id=None` のページ／文書単位通知やカスタム `"other"` 通知、視覚検証未実行ページの `VISUAL_PRESERVATION_DIFF_DETECTED`）は保持し、`VISUAL_PRESERVATION_DIFF_DETECTED` は従来通り `block.warnings` へは混入させないよう制御しています。統合後のリストは `_deduplicate_validation_issues()` および `(page_index, id)` 順で正規化し、`blocks[].warnings`、`GET /api/jobs/{job_id}/issues`、`job.warning_count`、`job.state`、`RetypesetJobResponse.issues`、`validation_report_json` 間で完全一致させました。
+- **自動テスト結果（分離 `PAPERBRIDGE_RUNTIME_DIR` 使用・本番データ非接続）:**
+  - **修正前 TDD 再現確認**（ベース `6b303f3` 上での新規 HTTP 統合テスト 3 件実行）: **`3 failed`**（既存 7 件消失で `assert 1 == 8`、未解消 Issue 消失で `assert 1 == 2`、無関係 `FALLBACK_ORIGINAL` 上書きで `assert ['UNTRANSLATED_AFTER_PROTECTION_CHANGE'] == ['UNTRANSLATED_SOURCE_RETURNED']`）。
+  - **修正後フォーカス回帰確認**（`tests/unit/test_job_accounting.py` 4件＋`tests/integration/test_phase3_api_and_retypeset.py` 9件）: **`13 passed, 1 warning`**。
+  - **修正後ローカル全 `pytest`**: **`111 passed, 7 skipped, 1 warning`**（skip 7件は `--run-real-llm` 指定時のみ実行される `tests/integration/test_real_plamo_phase2.py`）。
+  - **CI 環境 `YuGothR.ttc` フォールバック模擬**（`NotoSerifJP-VF.ttf` 等不在模擬で `YuGothR.ttc` + `cambria.ttc` を用いる環境での `tests/unit/test_inline_math_preservation.py` 32件＋`tests/visual/test_visual_preservation.py` 3件）: **`35 passed`**。
+  - 本修正ではフロントエンドコードを変更していないため、フロントエンド単体テスト・ビルド（`npm test` / `npm run build`）は今回未再実行です。
+- **Stage 1 保存済み 13 ページ訳文（分離複製）での HTTP `retypeset` 連続検証（新規推論なし）:**
+  - **実施性質の明記**: 保存済み 13 ページ訳文（Stage 1 スナップショットの新規分離複製）に対して HTTP `POST /api/jobs/job-837518917322/retypeset` を 2 回連続実行した検証であり、新規の LLM 推論は実施していません（`rev 1`・`rev 2` とも `llm_calls_made = 0`、本番 `%LOCALAPPDATA%\PaperBridgeLocal` および元 Stage 1 スナップショットはいずれも不変）。
+  - **修正前（`rev 0`）**: `state = completed_with_warnings`、`job.warning_count = 26`、`GET /issues` = `26` 件、`validation_report_json` = `26` 件（`TYPESETTING_OVERFLOW_FALLBACK`: 20、`TRANSLATED_BLOCK_OVERLAP_FALLBACK`: 4、`UNTRANSLATED_SOURCE_RETURNED`: 1 [`error`]、`NUMERIC_VALUE_MISMATCH`: 1）、`warnings` 保持ブロック数 `25`（`translated`: 117、`fallback_original`: 25、`protected_skip`: 97）。
+  - **1 回目再組版（`rev 1`）**: 既存 26 件すべての Issue が元 ID のまま完全保持された上で、p.10 狭小サブキャプション 2 ブロック（`page-10:block-2`, `page-10:block-6`）のみが `translated -> fallback_original` へ遷移し新規 `TYPESETTING_OVERFLOW_FALLBACK` 2 件が追加され、`state = completed_with_warnings`、`job.warning_count = 28`、`GET /issues` = `28` 件、`validation_report_json` = `28` 件、`warnings` 保持ブロック数 `27`（`translated`: 115、`fallback_original`: 27、`protected_skip`: 97）で全経路一致を確認。
+  - **2 回目連続再組版（`rev 2`・無編集）**: `rev 1` と同一の **28 件の Issue ID**・件数（`28` 件）・状態（`completed_with_warnings`）・ブロック統計（`translated`: 115、`fallback_original`: 27、`protected_skip`: 97）・`llm_calls_made = 0` を維持し、再組版反復による警告消失も重複増殖も起きないことを確認しました。
+  - なお、前項に記載した公開用の既知制限 2 点（分割キャプションの日英混在、`translate_tables=False` 時の表段落誤検出）は本修正の対象外として引き続き残存します。
+
 ## Experimental Windows one-click setup & source-ZIP check — 2026-11-12
 
 > Notice: Past historical verification records below (2026-11-08 and earlier) are preserved as originally recorded. This section covers only the experimental source-ZIP one-click setup additions on branch `feat/one-click-setup`. The archive/CLI tests described below were run on pre-push local verification commits prior to rebuilding those unpushed commits with GitHub noreply commit metadata (`285997610+hann451@users.noreply.github.com`), and the runtime tests were not re-run solely for the rebuilt commit SHAs; subsequent `docs/VERIFICATION.md` SHA-alignment edits sit cleanly on top without altering functional code.

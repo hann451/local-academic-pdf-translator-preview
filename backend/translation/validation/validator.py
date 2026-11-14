@@ -25,6 +25,24 @@ from dataclasses import dataclass, field
 
 from backend.domain.models import IssueSeverity, ProtectedItem, ProtectedItemKind
 
+TRANSLATION_VALIDATION_ISSUE_CODES: frozenset[str] = frozenset(
+    {
+        "EMPTY_OUTPUT",
+        "TRUNCATED_BY_LENGTH",
+        "SPECIAL_TOKEN_RESIDUE",
+        "PLACEHOLDER_ALTERED",
+        "PLACEHOLDER_MISSING",
+        "PLACEHOLDER_DUPLICATED",
+        "PLACEHOLDER_HALLUCINATED",
+        "REFERENCE_MARKER_MISSING",
+        "ABNORMAL_REPETITION",
+        "EXPLANATION_CONTAMINATION",
+        "UNTRANSLATED_SOURCE_RETURNED",
+        "ABNORMALLY_SHORT_TRANSLATION",
+        "NUMERIC_VALUE_MISMATCH",
+    }
+)
+
 _PLACEHOLDER_RE = re.compile(r"\{v\d+\}")
 _MALFORMED_PLACEHOLDER_RE = re.compile(
     r"(?:\{\s*v\s*\d+[A-Za-z0-9_]*\s*\}|［\s*v\s*\d+[A-Za-z0-9_]*\s*］|｛\s*v\s*\d+[A-Za-z0-9_]*\s*｝|\[\s*v\s*\d+[A-Za-z0-9_]*\s*\])",
