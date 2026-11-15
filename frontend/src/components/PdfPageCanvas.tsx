@@ -14,7 +14,25 @@
 import React, { useEffect, useRef, useState } from "react";
 import * as pdfjsLib from "pdfjs-dist";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
-import { getRotatedViewportDimensions } from "../utils/coordinates";
+import {
+  FALLBACK_CANVAS_AREA_PX,
+  FALLBACK_CANVAS_EDGE_PX,
+  computeSafeCanvasRenderScale,
+  getRotatedViewportDimensions,
+} from "../utils/coordinates";
+
+function isRenderCancelledError(err: unknown): boolean {
+  if (!err) return false;
+  const name =
+    typeof err === "object" && "name" in err
+      ? String((err as { name?: unknown }).name)
+      : "";
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    name === "RenderingCancelledException" ||
+    msg.includes("RenderingCancelledException")
+  );
+}
 
 if (typeof window !== "undefined" && pdfjsLib.GlobalWorkerOptions) {
   pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
@@ -51,10 +69,26 @@ export const PdfPageCanvas: React.FC<PdfPageCanvasProps> = ({
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
-  const [renderStatus, setRenderStatus] = useState<"idle" | "rendering" | "rendered" | "fallback">(
-    "idle"
-  );
+  const docCacheRef = useRef<{
+    pdfBytes: Uint8Array;
+    loadingTask: {
+      destroy?: () => Promise<void>;
+      promise: Promise<pdfjsLib.PDFDocumentProxy>;
+    };
+    doc: pdfjsLib.PDFDocumentProxy | null;
+  } | null>(null);
+  const activeRenderRef = useRef<{
+    task: { cancel?: () => void; promise?: Promise<unknown> } | null;
+    promise: Promise<unknown> | null;
+  }>({ task: null, promise: null });
+  const [renderStatus, setRenderStatus] = useState<
+    "idle" | "rendering" | "rendered" | "fallback"
+  >("idle");
   const [renderError, setRenderError] = useState<string | null>(null);
+  const [renderedCanvasSize, setRenderedCanvasSize] = useState<{
+    width: number;
+    height: number;
+  } | null>(null);
 
   const dpr = typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1;
   const dims = getRotatedViewportDimensions(
@@ -66,16 +100,75 @@ export const PdfPageCanvas: React.FC<PdfPageCanvasProps> = ({
     dpr
   );
 
+  // Destroy the cached PDFDocumentProxy only when pdfBytes changes or on unmount so zoom/page changes reuse it.
+  useEffect(() => {
+    return () => {
+      const cached = docCacheRef.current;
+      docCacheRef.current = null;
+      if (!cached) return;
+      try {
+        if (cached.loadingTask?.destroy) {
+          void cached.loadingTask.destroy();
+        } else {
+          void cached.doc?.destroy?.();
+        }
+      } catch {
+        // ignore cleanup errors
+      }
+    };
+  }, [pdfBytes]);
+
   useEffect(() => {
     let cancelled = false;
-    let renderTask: { cancel?: () => void; promise?: Promise<unknown> } | null = null;
-    let loadingTask: { destroy?: () => Promise<void>; promise: Promise<pdfjsLib.PDFDocumentProxy> } | null =
+    let renderTask: { cancel?: () => void; promise?: Promise<unknown> } | null =
       null;
+
+    async function getOrLoadDocument(
+      bytes: Uint8Array
+    ): Promise<pdfjsLib.PDFDocumentProxy> {
+      const existing = docCacheRef.current;
+      if (existing && existing.pdfBytes === bytes) {
+        if (existing.doc) return existing.doc;
+        const resolved = await existing.loadingTask.promise;
+        if (docCacheRef.current === existing) {
+          existing.doc = resolved;
+        }
+        return resolved;
+      }
+
+      // Pass a copy of Uint8Array so PDF.js worker transfer doesn't detach the parent buffer.
+      const dataCopy = new Uint8Array(bytes);
+      const loadingTask = pdfjsLib.getDocument({
+        data: dataCopy,
+        isEvalSupported: false,
+        disableAutoFetch: true,
+        disableFontFace: false,
+      });
+      const entry: NonNullable<typeof docCacheRef.current> = {
+        pdfBytes: bytes,
+        loadingTask,
+        doc: null,
+      };
+      docCacheRef.current = entry;
+      try {
+        const loaded = await loadingTask.promise;
+        if (docCacheRef.current === entry) {
+          entry.doc = loaded;
+        }
+        return loaded;
+      } catch (loadErr) {
+        if (docCacheRef.current === entry) {
+          docCacheRef.current = null;
+        }
+        throw loadErr;
+      }
+    }
 
     async function renderPdfPage() {
       const canvas = canvasRef.current;
       if (!canvas || !pdfBytes || pdfBytes.byteLength === 0) {
         setRenderStatus("idle");
+        setRenderedCanvasSize(null);
         return;
       }
 
@@ -90,54 +183,134 @@ export const PdfPageCanvas: React.FC<PdfPageCanvasProps> = ({
         setRenderStatus("fallback");
         return;
       }
+      const canvasCtx = ctx;
 
       setRenderStatus("rendering");
       setRenderError(null);
 
+      // Wait for any previous in-flight PDF.js render() on this canvas to settle before resizing/re-rendering.
+      const prevRender = activeRenderRef.current;
+      if (prevRender.task) {
+        try {
+          prevRender.task.cancel?.();
+        } catch {
+          // ignore
+        }
+        if (prevRender.promise) {
+          try {
+            await prevRender.promise;
+          } catch {
+            // expected RenderingCancelledException from superseded zoom/page render
+          }
+        }
+        if (cancelled) return;
+      }
+
       try {
-        // Pass a copy of Uint8Array so PDF.js worker transfer doesn't detach the parent buffer
-        const dataCopy = new Uint8Array(pdfBytes);
-        loadingTask = pdfjsLib.getDocument({
-          data: dataCopy,
-          isEvalSupported: false,
-          disableAutoFetch: true,
-          disableFontFace: false,
-        });
-        const pdfDoc = await loadingTask.promise;
+        const pdfDoc = await getOrLoadDocument(pdfBytes);
         if (cancelled) return;
 
-        const safePageNum = Math.max(1, Math.min(pdfDoc.numPages, displayPageNumber));
+        const safePageNum = Math.max(
+          1,
+          Math.min(pdfDoc.numPages, displayPageNumber)
+        );
         const pdfPage = await pdfDoc.getPage(safePageNum);
         if (cancelled) return;
 
-        const viewport = pdfPage.getViewport({
-          scale,
-          rotation: dims.totalRotationDeg,
-        });
+        const attemptRender = async (targetW: number, targetH: number) => {
+          const safeCssW = Math.max(1, dims.cssWidthPx);
+          const safeCssH = Math.max(1, dims.cssHeightPx);
+          const scaleX = targetW / safeCssW;
+          const scaleY = targetH / safeCssH;
+          const transform =
+            Math.abs(scaleX - 1) > 1e-4 || Math.abs(scaleY - 1) > 1e-4
+              ? [scaleX, 0, 0, scaleY, 0, 0]
+              : undefined;
 
-        canvas.width = dims.canvasWidthPx;
-        canvas.height = dims.canvasHeightPx;
-        canvas.style.width = `${dims.cssWidthPx}px`;
-        canvas.style.height = `${dims.cssHeightPx}px`;
+          canvas.width = targetW;
+          canvas.height = targetH;
+          canvas.style.width = `${dims.cssWidthPx}px`;
+          canvas.style.height = `${dims.cssHeightPx}px`;
+          try {
+            canvasCtx.setTransform(1, 0, 0, 1, 0, 0);
+            canvasCtx.fillStyle = "#ffffff";
+            canvasCtx.fillRect(0, 0, targetW, targetH);
+          } catch {
+            // ignore on minimal mock 2d contexts
+          }
 
-        const transform =
-          dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined;
+          const viewport = pdfPage.getViewport({
+            scale,
+            rotation: dims.totalRotationDeg,
+          });
 
-        renderTask = pdfPage.render({
-          canvasContext: ctx,
-          viewport,
-          transform,
-        });
-        await renderTask.promise;
-        if (!cancelled) {
-          setRenderStatus("rendered");
+          renderTask = pdfPage.render({
+            canvasContext: canvasCtx,
+            viewport,
+            transform,
+          });
+          activeRenderRef.current = {
+            task: renderTask,
+            promise: renderTask.promise ?? null,
+          };
+          try {
+            await renderTask.promise;
+          } finally {
+            if (activeRenderRef.current.task === renderTask) {
+              activeRenderRef.current = { task: null, promise: null };
+            }
+          }
+        };
+
+        try {
+          await attemptRender(dims.canvasWidthPx, dims.canvasHeightPx);
+          if (!cancelled) {
+            setRenderedCanvasSize({
+              width: dims.canvasWidthPx,
+              height: dims.canvasHeightPx,
+            });
+            setRenderStatus("rendered");
+          }
+        } catch (primaryErr) {
+          if (cancelled || isRenderCancelledError(primaryErr)) {
+            return;
+          }
+          // Retry once at a conservative backing-store budget if the browser/GPU/RDP rejected the larger buffer.
+          const fallbackDpr = computeSafeCanvasRenderScale(
+            dims.cssWidthPx,
+            dims.cssHeightPx,
+            1,
+            FALLBACK_CANVAS_EDGE_PX,
+            FALLBACK_CANVAS_AREA_PX
+          );
+          const fallbackW = Math.max(
+            1,
+            Math.floor(dims.cssWidthPx * fallbackDpr)
+          );
+          const fallbackH = Math.max(
+            1,
+            Math.floor(dims.cssHeightPx * fallbackDpr)
+          );
+          if (
+            fallbackW < dims.canvasWidthPx ||
+            fallbackH < dims.canvasHeightPx
+          ) {
+            await attemptRender(fallbackW, fallbackH);
+            if (!cancelled) {
+              setRenderedCanvasSize({ width: fallbackW, height: fallbackH });
+              setRenderStatus("rendered");
+            }
+            return;
+          }
+          throw primaryErr;
         }
       } catch (err) {
-        if (!cancelled) {
-          const msg = err instanceof Error ? err.message : String(err);
-          setRenderError(msg);
-          setRenderStatus("fallback");
+        if (cancelled || isRenderCancelledError(err)) {
+          return;
         }
+        const msg = err instanceof Error ? err.message : String(err);
+        setRenderError(msg);
+        setRenderStatus("fallback");
       }
     }
 
@@ -147,11 +320,6 @@ export const PdfPageCanvas: React.FC<PdfPageCanvasProps> = ({
       cancelled = true;
       try {
         renderTask?.cancel?.();
-      } catch {
-        // ignore
-      }
-      try {
-        void loadingTask?.destroy?.();
       } catch {
         // ignore
       }
@@ -165,7 +333,6 @@ export const PdfPageCanvas: React.FC<PdfPageCanvasProps> = ({
     dims.canvasHeightPx,
     dims.cssWidthPx,
     dims.cssHeightPx,
-    dpr,
   ]);
 
   const toLocalCoords = (ev: React.MouseEvent<SVGSVGElement>): [number, number] => {
@@ -183,6 +350,7 @@ export const PdfPageCanvas: React.FC<PdfPageCanvasProps> = ({
       className="pdf-canvas-wrapper"
       style={{
         position: "relative",
+        flexShrink: 0,
         width: `${dims.cssWidthPx}px`,
         height: `${dims.cssHeightPx}px`,
         backgroundColor: "#ffffff",
@@ -196,6 +364,8 @@ export const PdfPageCanvas: React.FC<PdfPageCanvasProps> = ({
       data-scale={scale}
       data-total-rotation={dims.totalRotationDeg}
       data-render-status={renderStatus}
+      data-canvas-width={renderedCanvasSize?.width ?? dims.canvasWidthPx}
+      data-canvas-height={renderedCanvasSize?.height ?? dims.canvasHeightPx}
     >
       <canvas
         ref={canvasRef}

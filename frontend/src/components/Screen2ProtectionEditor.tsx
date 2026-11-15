@@ -715,16 +715,17 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
       {/* Main Split View: Left = PDF + SVG Overlay, Right = Region Tools & List */}
       <div className="grid-viewer-sidebar">
         <div
+          data-testid="pdf-viewer-scroll-container"
           style={{
             overflow: "auto",
+            minWidth: 0,
             backgroundColor: "#e2e8f0",
             padding: "16px",
             borderRadius: "8px",
-            display: "flex",
-            justifyContent: "center",
             minHeight: "520px",
           }}
         >
+          <div style={{ width: "fit-content", margin: "0 auto" }}>
           <PdfPageCanvas
             pdfBytes={pdfBytes}
             displayPageNumber={safeDisplayPage}
@@ -1013,6 +1014,7 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
               />
             )}
           </PdfPageCanvas>
+          </div>
         </div>
 
         {/* Right Sidebar: Drag Mode Configuration, Manual Regions List & Block Inspector */}
