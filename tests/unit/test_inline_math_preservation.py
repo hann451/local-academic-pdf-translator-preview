@@ -2638,3 +2638,151 @@ def test_figure_adjacent_small_unit_labels_auto_protected(tmp_path: Path) -> Non
     body_blk = next(b for b in blocks if "experimental setup" in b.source_text)
     assert body_blk.status == BlockStatus.PENDING
 
+
+def test_compound_subscript_grouping_masking_and_rendering(tmp_path: Path) -> None:
+    """Issue B: Multi-span compound subscripts (including nested sub-subscripts such as
+    `a_{t_0-10,t_0-1}`, `a_{t_0,t_0+9}`, and `t_{1.5s}`) must:
+    1) Group into complete `InlineMathSpan` entries without emitting partial `at`/`t0` fragments.
+    2) Never be torn mid-identifier into `{v1}`/`{v2}` (`at0{v1},t0{v2}` or `width = mean(at0−10`).
+    3) Protect compound subscript tokens cleanly as single `{vN}` units during block masking.
+    4) Render the entire compound subscript tail at lowered subscript size and baseline in PDFs.
+    """
+    raw_lines = [
+        {
+            "spans": [
+                {"text": "First ", "size": 9.96, "origin": [50.0, 100.0], "bbox": [50.0, 92.0, 74.0, 102.0]},
+                {"text": "a", "size": 9.96, "origin": [74.0, 100.0], "bbox": [74.0, 92.0, 80.0, 102.0]},
+                {"text": "t", "size": 6.97, "origin": [80.0, 101.5], "bbox": [80.0, 96.0, 83.0, 103.0]},
+                {"text": "0", "size": 4.98, "origin": [83.0, 102.5], "bbox": [83.0, 98.5, 86.2, 103.5]},
+                {"text": "−", "size": 6.97, "origin": [86.7, 101.5], "bbox": [86.7, 96.0, 92.7, 103.0]},
+                {"text": "10", "size": 6.97, "origin": [92.7, 101.5], "bbox": [92.7, 96.0, 100.5, 103.0]},
+                {"text": ",t", "size": 6.97, "origin": [100.5, 101.5], "bbox": [100.5, 96.0, 106.0, 103.0]},
+                {"text": "0", "size": 4.98, "origin": [106.0, 102.5], "bbox": [106.0, 98.5, 109.2, 103.5]},
+                {"text": "−", "size": 6.97, "origin": [109.7, 101.5], "bbox": [109.7, 96.0, 115.7, 103.0]},
+                {"text": "1", "size": 6.97, "origin": [115.7, 101.5], "bbox": [115.7, 96.0, 119.7, 103.0]},
+                {"text": " and ", "size": 9.96, "origin": [120.2, 100.0], "bbox": [120.2, 92.0, 140.0, 102.0]},
+                {"text": "a", "size": 9.96, "origin": [140.0, 100.0], "bbox": [140.0, 92.0, 146.0, 102.0]},
+                {"text": "t", "size": 6.97, "origin": [146.0, 101.5], "bbox": [146.0, 96.0, 149.0, 103.0]},
+                {"text": "0", "size": 4.98, "origin": [149.0, 102.5], "bbox": [149.0, 98.5, 152.2, 103.5]},
+                {"text": ",t", "size": 6.97, "origin": [152.7, 101.5], "bbox": [152.7, 96.0, 158.0, 103.0]},
+                {"text": "0", "size": 4.98, "origin": [158.0, 102.5], "bbox": [158.0, 98.5, 161.2, 103.5]},
+                {"text": "+9", "size": 6.97, "origin": [161.7, 101.5], "bbox": [161.7, 96.0, 171.7, 103.0]},
+                {"text": " at t", "size": 9.96, "origin": [172.2, 100.0], "bbox": [172.2, 92.0, 189.0, 102.0]},
+                {"text": "0", "size": 6.97, "origin": [189.0, 101.5], "bbox": [189.0, 96.0, 193.0, 103.0]},
+                {"text": " and t", "size": 9.96, "origin": [193.5, 100.0], "bbox": [193.5, 92.0, 215.0, 102.0]},
+                {"text": "1", "size": 6.97, "origin": [215.0, 101.5], "bbox": [215.0, 96.0, 219.0, 103.0]},
+                {"text": ".", "size": 6.97, "origin": [219.0, 101.5], "bbox": [219.0, 96.0, 221.3, 103.0]},
+                {"text": "5", "size": 6.97, "origin": [221.3, 101.5], "bbox": [221.3, 96.0, 225.3, 103.0]},
+                {"text": "s", "size": 6.97, "origin": [225.3, 101.5], "bbox": [225.3, 96.0, 229.0, 103.0]},
+                {"text": ".", "size": 9.96, "origin": [229.5, 100.0], "bbox": [229.5, 92.0, 232.0, 102.0]},
+            ]
+        }
+    ]
+    extracted = extract_inline_math_spans(raw_lines)
+    tuples = {(m.role, m.context_text, m.target_text, m.ambiguous) for m in extracted}
+    assert ("sub", "at0−10,t0−1", "t0−10,t0−1", False) in tuples
+    assert ("sub", "at0,t0+9", "t0,t0+9", False) in tuples
+    assert ("sub", "t1.5s", "1.5s", False) in tuples
+    assert ("sub", "t0", "0", False) in tuples
+    assert not any(m.context_text == "at" for m in extracted)
+
+    # Standalone masking (without inline_math_spans) must not rip `-10` / `-1` out of `at0−10,t0−1`
+    raw_para = "between 10 samples at0−10,t0−1 and 10 samples at0,t0+9 at t0 and t1.5s."
+    raw_masked, raw_items = mask_inline_protected_elements(raw_para)
+    assert "at0{" not in raw_masked
+    assert "t0{" not in raw_masked
+    assert unmask_inline_protected_elements(raw_masked, raw_items) == raw_para
+
+    # Equation masking with mean(...) must keep balanced equation without tearing `at0−10`
+    eq_src = "Falling width = mean(at0−10,t0−1) − mean(at0,t0+9)(6) A point is identified."
+    eq_masked, eq_items = mask_inline_protected_elements(eq_src)
+    assert [it.original_text for it in eq_items] == ["width = mean(at0−10,t0−1) − mean(at0,t0+9)"]
+    assert unmask_inline_protected_elements(eq_masked, eq_items) == eq_src
+
+    # With PDF inline_math_spans, compound subscripts mask cleanly as single `{vN}` placeholders
+    masked, items = mask_inline_protected_elements(raw_para, inline_math_spans=extracted)
+    origs = [it.original_text for it in items]
+    assert origs == ["at0−10,t0−1", "at0,t0+9", "t1.5s"]
+    assert "at0{" not in masked
+    assert unmask_inline_protected_elements(masked, items) == raw_para
+
+    # End-to-end typesetting to mono & dual PDFs renders full compound tails as subscripts
+    pdf_path = tmp_path / "compound_sub_src.pdf"
+    pdf_doc = pymupdf.open()
+    pg = pdf_doc.new_page(width=595, height=842)
+    pg.insert_textbox(pymupdf.Rect(50.0, 90.0, 290.0, 175.0), raw_para, fontsize=9.96)
+    pdf_doc.save(str(pdf_path))
+    pdf_doc.close()
+
+    doc_model = Document(
+        id="doc-comp-sub",
+        original_filename="compound_sub_src.pdf",
+        safe_storage_path=str(pdf_path),
+        sha256_hash=compute_sha256(pdf_path),
+        file_size_bytes=pdf_path.stat().st_size,
+        page_count=1,
+    )
+    blk = Block(
+        id="doc-comp-sub:page-1:block-1",
+        page_index=0,
+        bbox=[50.0, 90.0, 290.0, 175.0],
+        kind=BlockKind.PARAGRAPH,
+        source_text=raw_para,
+        masked_source_text=masked,
+        protected_items=items,
+        inline_math_spans=extracted,
+        translation_text="時刻 t0 と {v3} において、前半 {v1} と後半 {v2} の平均値を比較する。",
+        status=BlockStatus.TRANSLATED,
+        font_size_pt=9.96,
+    )
+    adapter = NativePreservingAdapter(config=AppConfig(runtime_dir=tmp_path / "rt_comp"))
+    mono_out = tmp_path / "compound_sub_mono.pdf"
+    dual_out = tmp_path / "compound_sub_dual.pdf"
+    updated, issues = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=[blk],
+        page_indices=[0],
+        job_config=TranslationJobConfig(output_mono_pdf=True, output_dual_pdf=True),
+        mono_output_path=mono_out,
+        dual_output_path=dual_out,
+        job_id="job-comp-sub",
+    )
+    assert not issues
+    assert updated[0].status == BlockStatus.TRANSLATED
+    fitted = updated[0].fitted_font_size_pt or 9.0
+
+    for out_file, is_dual in [(mono_out, False), (dual_out, True)]:
+        d_out = pymupdf.open(str(out_file))
+        clip = (
+            pymupdf.Rect(50.0 + 595.0, 90.0, 290.0 + 595.0, 175.0)
+            if is_dual and d_out[0].rect.width > 700
+            else pymupdf.Rect(50.0, 90.0, 290.0, 175.0)
+        )
+        pd = d_out[0].get_text("dict", clip=clip)
+        d_out.close()
+        rendered_spans = [
+            s
+            for b_item in pd["blocks"]
+            if b_item.get("type") == 0
+            for ln in b_item["lines"]
+            for s in ln["spans"]
+        ]
+        full_text = "".join(s["text"] for s in rendered_spans).replace("\xa0", " ")
+        assert "{v" not in full_text
+        assert "at0−10,t0−1" in full_text
+        assert "at0,t0+9" in full_text
+        assert "t1.5s" in full_text
+
+        sub_t0_9 = next(s for s in rendered_spans if "t0,t0+9" in s["text"])
+        sub_15s = next(s for s in rendered_spans if "1.5s" in s["text"])
+        sub_10 = next(s for s in rendered_spans if "10,t0" in s["text"])
+        for ss in (sub_t0_9, sub_15s, sub_10):
+            assert ss["size"] < fitted * 0.85
+            same_line_normals = [
+                ns
+                for ns in rendered_spans
+                if ns["size"] >= fitted * 0.90 and abs(ns["origin"][1] - ss["origin"][1]) < 6.0
+            ]
+            assert same_line_normals
+            assert ss["origin"][1] > same_line_normals[0]["origin"][1] + 1.0
+
