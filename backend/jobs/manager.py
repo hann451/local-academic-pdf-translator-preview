@@ -1310,16 +1310,22 @@ class JobManager:
                         blk.translation_provenance = "manual_edit"
                         blk.warnings = _clear_transient_block_warnings(blk.warnings)
                         continue
-                    if (
-                        blk.status == BlockStatus.FALLBACK_ORIGINAL
-                        and target_block_ids is not None
-                        and blk.id not in target_block_ids
-                    ):
-                        blk.translation_provenance = "fallback_original"
-                        continue
                     blk_is_mock_origin = bool(blk.translation_is_mock) or str(
                         blk.translation_text or ""
                     ).lstrip().startswith("[MOCK")
+                    if (
+                        blk.status == BlockStatus.FALLBACK_ORIGINAL
+                        and (
+                            (target_block_ids is not None and blk.id not in target_block_ids)
+                            or (
+                                resume
+                                and not blk.needs_retranslation
+                                and not (not translator.is_mock and blk_is_mock_origin)
+                            )
+                        )
+                    ):
+                        blk.translation_provenance = "fallback_original"
+                        continue
                     if (
                         blk.status == BlockStatus.TRANSLATED
                         and blk.translation_text
