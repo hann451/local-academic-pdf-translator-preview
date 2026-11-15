@@ -576,3 +576,146 @@ def test_probe_permission_failure_invalid_url_timeout_and_job_report_propagation
         None,
         "unverified_from_api",
     )
+
+
+def test_mock_to_real_isolation_warning_cleanup_and_fallback_retry(
+    isolated_config: AppConfig, tmp_path: Path
+) -> None:
+    """Verify:
+    1) Mock run translations (cache & block reuse) are never reused by subsequent Real run.
+    2) Transient warnings are cleared when blocks recover (via translation/manual edit).
+    3) Manual translation updates translation_provenance='manual_edit'.
+    4) Previous FALLBACK_ORIGINAL blocks are retried on full run_job, while untouched on unrelated partial retranslate.
+    """
+    from backend.domain.models import BlockStatus
+    from backend.jobs.manager import JobManager
+    from backend.translation.adapters.base import TranslationAdapter, TranslationAdapterResponse
+
+    class _RealStubAdapter(TranslationAdapter):
+        adapter_version = "real-stub-1.0"
+        prompt_version = "pfml3-v1"
+        is_mock = False
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def check_health(self) -> dict[str, str | bool | None]:
+            return {"status": "connected", "is_mock": False, "model_name": "plamo-3-translate"}
+
+        def translate_segment(
+            self,
+            source_text: str,
+            source_lang: str = "en",
+            target_lang: str = "ja",
+            form: str = "plain",
+            context: str | None = None,
+            history=None,
+            glossary_entries=None,
+            context_budget_tokens: int = 8192,
+        ) -> TranslationAdapterResponse:
+            self.calls.append(source_text)
+            out = (
+                "1. 序論"
+                if "Introduction" in source_text
+                else "これは実機スタブ翻訳の正確な日本語訳であり、十分な長さと自然な表現を保持している。"
+            )
+            return TranslationAdapterResponse(
+                translated_text=out,
+                raw_output=out,
+                prompt_used=source_text,
+                finish_reason="stop",
+                model_name="plamo-3-translate",
+                quantization="Q4_K_M",
+                is_mock=False,
+            )
+
+    pdf_path = tmp_path / "mock_real_iso.pdf"
+    doc = pymupdf.open()
+    p1 = doc.new_page(width=595, height=842)
+    p1.insert_text((72, 80), "Synthetic Title Protected", fontsize=20)
+    p1.insert_text((72, 130), "1 Introduction", fontsize=12)
+    p1.insert_textbox(pymupdf.Rect(72, 160, 520, 230), BODY, fontsize=10)
+    p1.insert_textbox(
+        pymupdf.Rect(72, 260, 520, 330),
+        "Another independent paragraph explaining experimental setup and convergence results clearly.",
+        fontsize=10,
+    )
+    p1.insert_textbox(
+        pymupdf.Rect(72, 360, 520, 430),
+        "A third distinct body paragraph whose mock translation must never be reused by a real model run.",
+        fontsize=10,
+    )
+    doc.save(str(pdf_path))
+    doc.close()
+
+    mgr_mock = JobManager(config=isolated_config)
+    document = mgr_mock.register_document(pdf_path, original_filename=pdf_path.name)
+    mgr_mock.parse_document_blocks(document.id, TranslationJobConfig(use_mock_translator=True))
+
+    # 1. Mock run -> produces mock translations and sets translation_is_mock=True
+    mock_job = mgr_mock.create_job(document.id, TranslationJobConfig(use_mock_translator=True))
+    completed_mock = mgr_mock.run_job(mock_job.id)
+    assert completed_mock.is_mock_run is True
+    blocks_after_mock = mgr_mock.db.list_blocks(document.id)
+    body_blocks = [b for b in blocks_after_mock if b.semantic_category == "body"]
+    assert len(body_blocks) >= 3
+    assert all(b.translation_is_mock is True for b in body_blocks)
+    mock_texts = {b.id: b.translation_text for b in body_blocks}
+
+    real_stub = _RealStubAdapter()
+    mgr = JobManager(config=isolated_config, translation_adapter=real_stub)
+
+    # 2. Full Real run immediately after Mock run MUST reject Mock reuse/cache and translate all body blocks via Real
+    real_job_1 = mgr.create_job(document.id, TranslationJobConfig(use_mock_translator=False))
+    completed_real_1 = mgr.run_job(real_job_1.id)
+    assert completed_real_1.state in (JobState.COMPLETED, JobState.COMPLETED_WITH_WARNINGS)
+    assert len(real_stub.calls) >= 3
+    blocks_after_real1 = {b.id: b for b in mgr.db.list_blocks(document.id)}
+    for b in body_blocks:
+        blk = blocks_after_real1[b.id]
+        assert blk.status == BlockStatus.TRANSLATED
+        assert blk.translation_is_mock is False
+        assert blk.translation_text != mock_texts[b.id]
+        assert blk.translation_text == "これは実機スタブ翻訳の正確な日本語訳であり、十分な長さと自然な表現を保持している。"
+
+    # 3. Plant FALLBACK_ORIGINAL + stale warning on second body block to verify partial vs full retry & warning cleanup
+    b_first, b_second = body_blocks[0], body_blocks[1]
+    b_second_mod = blocks_after_real1[b_second.id]
+    b_second_mod.status = BlockStatus.FALLBACK_ORIGINAL
+    b_second_mod.translation_provenance = "fallback_original"
+    b_second_mod.needs_retranslation = False
+    b_second_mod.warnings = ["AMBIGUOUS_INLINE_MATH_FALLBACK"]
+    mgr.db.save_blocks(document.id, [b_second_mod])
+
+    # Partial retranslate targeting ONLY b_first must preserve untouched b_second FALLBACK_ORIGINAL
+    partial_job = mgr.create_job(
+        document.id,
+        TranslationJobConfig(use_mock_translator=False),
+    )
+    mgr.run_job(partial_job.id, target_block_ids={b_first.id})
+    blocks_mid = {b.id: b for b in mgr.db.list_blocks(document.id)}
+    assert blocks_mid[b_first.id].status == BlockStatus.TRANSLATED
+    assert blocks_mid[b_second.id].status == BlockStatus.FALLBACK_ORIGINAL
+
+    # Full Real run (target_block_ids=None) MUST retry b_second even when needs_retranslation=False, clearing stale warnings
+    real_job_2 = mgr.create_job(document.id, TranslationJobConfig(use_mock_translator=False))
+    completed_real_2 = mgr.run_job(real_job_2.id)
+    assert completed_real_2.state in (JobState.COMPLETED, JobState.COMPLETED_WITH_WARNINGS)
+    blocks_after_real = {b.id: b for b in mgr.db.list_blocks(document.id)}
+    blk2 = blocks_after_real[b_second.id]
+    assert blk2.status == BlockStatus.TRANSLATED
+    assert blk2.translation_is_mock is False
+    assert "AMBIGUOUS_INLINE_MATH_FALLBACK" not in blk2.warnings
+
+    # 4. Manual edit on previously fallback-provenance block updates translation_provenance='manual_edit'
+    b_second_cur = blocks_after_real[b_second.id]
+    b_second_cur.status = BlockStatus.FALLBACK_ORIGINAL
+    b_second_cur.translation_provenance = "fallback_original"
+    mgr.db.save_blocks(document.id, [b_second_cur])
+    edited = mgr.db.update_block_manual_translation(
+        document_id=document.id,
+        block_id=b_second.id,
+        manual_text="手動で修正した正確な日本語訳文。",
+    )
+    assert edited.status == BlockStatus.MANUALLY_EDITED
+    assert edited.translation_provenance == "manual_edit"

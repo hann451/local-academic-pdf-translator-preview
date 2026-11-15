@@ -369,6 +369,7 @@ def extract_inline_math_spans(
             )
 
         script_base_by_idx: dict[int, tuple[str, Literal["super", "sub"]]] = {}
+        script_span_meta_by_idx: dict[int, tuple[Literal["super", "sub"], float, float]] = {}
 
         for idx, s in enumerate(spans):
             raw_t = normalize_for_pdf_rendering(str(s.get("text", "")))
@@ -502,7 +503,9 @@ def extract_inline_math_spans(
                     pt = normalize_for_pdf_rendering(str(ps.get("text", "")))
                     role_lit: Literal["super", "sub"] = "super" if is_sup else "sub"
                     dy_val = -0.29 if is_sup else 0.18
+                    script_span_meta_by_idx[idx] = (role_lit, sz, oy)
                     prev_script = script_base_by_idx.get(ps_idx)
+                    prev_meta = script_span_meta_by_idx.get(ps_idx)
                     if prev_script is not None and prev_script[1] != role_lit:
                         base_tok = prev_script[0] + pt.strip()
                         _add(
@@ -553,10 +556,30 @@ def extract_inline_math_spans(
                                 )
                             )
                     else:
+                        if prev_meta is not None and prev_meta[0] == role_lit:
+                            _, prev_sz, prev_oy = prev_meta
+                            is_nested_level = (
+                                (
+                                    role_lit == "sub"
+                                    and sz < prev_sz * 0.90
+                                    and oy > prev_oy + max_sz * 0.04
+                                )
+                                or (
+                                    role_lit == "super"
+                                    and sz < prev_sz * 0.90
+                                    and oy < prev_oy - max_sz * 0.04
+                                )
+                            )
+                            if not is_nested_level:
+                                continue
                         pt_parts = [
                             tok for tok in re.split(r"[\s(\[{,=+\-−*/√]+", pt) if tok
                         ]
                         base_tok = pt_parts[-1] if pt_parts else ""
+                        if not base_tok or not re.search(
+                            r"[A-Za-z0-9\u0370-\u03ff\U0001d400-\U0001d7ff]", base_tok
+                        ):
+                            continue
                         if is_sub and base_tok.isdigit():
                             continue
                         if base_tok:
@@ -584,7 +607,24 @@ def extract_inline_math_spans(
                     (item.role, item.target_text)
                 )
         if variants_by_ctx:
-            normal_chunks: list[str] = []
+            _PROSE_STOPWORD_SET = frozenset(_PROSE_SHORT_WORDS[3:-1].split("|")) | {
+                "the",
+                "and",
+                "for",
+                "not",
+                "but",
+                "are",
+                "was",
+                "has",
+                "had",
+                "can",
+                "may",
+                "out",
+                "off",
+                "per",
+                "via",
+            }
+            normal_chunks: list[list[tuple[str, bool]]] = []
             for line in lines:
                 spans = line["spans"]
                 line_sizes = [
@@ -613,7 +653,7 @@ def extract_inline_math_spans(
                         else 0.0
                     )
                 )
-                cur_normal: list[str] = []
+                cur_normal: list[tuple[str, bool]] = []
                 for s in spans:
                     raw_t = normalize_for_pdf_rendering(str(s.get("text", "")))
                     st = raw_t.strip()
@@ -636,12 +676,17 @@ def extract_inline_math_spans(
                     )
                     if is_sup or is_sub or st == "ˆ":
                         if cur_normal:
-                            normal_chunks.append("".join(cur_normal))
+                            normal_chunks.append(cur_normal)
                             cur_normal = []
                     else:
-                        cur_normal.append(raw_t)
+                        s_font = str(s.get("font", "")).lower()
+                        is_math_or_italic = any(
+                            tok in s_font
+                            for tok in ("cmmi", "cmsy", "cmex", "math", "italic", "oblique")
+                        ) or bool(re.search(r"[\u0370-\u03ff\U0001d400-\U0001d7ff]", raw_t))
+                        cur_normal.append((raw_t, is_math_or_italic))
                 if cur_normal:
-                    normal_chunks.append("".join(cur_normal))
+                    normal_chunks.append(cur_normal)
 
             _WORD_MATH_CH_RE = re.compile(r"[A-Za-z0-9\U0001d400-\U0001d7ff]")
             for ctx, vset in variants_by_ctx.items():
@@ -656,8 +701,38 @@ def extract_inline_math_spans(
                     else ""
                 )
                 pat = re.compile(left_guard + re.escape(ctx) + right_guard)
-                for chunk in normal_chunks:
-                    if pat.search(chunk):
+                is_lower_stopword = ctx.islower() and ctx in _PROSE_STOPWORD_SET
+                for chunk_parts in normal_chunks:
+                    chunk_text = "".join(t for t, _ in chunk_parts)
+                    found_non_stopword_match = False
+                    for m in pat.finditer(chunk_text):
+                        if not is_lower_stopword:
+                            found_non_stopword_match = True
+                            break
+                        # Check whether matched span uses italic/math font or sits outside English prose words
+                        m_start, m_end = m.start(), m.end()
+                        pos = 0
+                        touches_math_font = False
+                        for seg_t, seg_is_math in chunk_parts:
+                            seg_end = pos + len(seg_t)
+                            if seg_end > m_start and pos < m_end and seg_is_math:
+                                touches_math_font = True
+                                break
+                            pos = seg_end
+                        has_adjacent_prose_word = bool(
+                            re.search(
+                                r"(?:[A-Za-z]{2,}\s+"
+                                + re.escape(ctx)
+                                + r"\b|\b"
+                                + re.escape(ctx)
+                                + r"\s+[A-Za-z]{2,})",
+                                chunk_text,
+                            )
+                        )
+                        if touches_math_font or not has_adjacent_prose_word:
+                            found_non_stopword_match = True
+                            break
+                    if found_non_stopword_match:
                         vset.add(("normal", ctx))
                         break
 
@@ -2233,19 +2308,32 @@ class NativePreservingAdapter(PdfEngineAdapter):
                     in_references_section,
                 )
 
-        # 3. Inside a vector drawing / table box -> classify as FIGURE
+        # 3. Inside or tightly attached outside a vector drawing / table box -> classify as FIGURE
+        is_small_drawing_label = (
+            not _CAPTION_RE.match(stripped)
+            and len(stripped) <= 32
+            and line_count <= 2
+            and avg_font_size <= min(body_font_size - 1.4, body_font_size * 0.86)
+        )
         for d_box in drawing_boxes:
-            if bbox_intersection_ratio(bbox, d_box) >= 0.65:
-                if not _CAPTION_RE.match(stripped):
-                    return (
-                        BlockKind.FIGURE,
-                        "figure",
-                        "自動：図表内部テキスト",
-                        "RULE_FIGURE_INTERNAL_TEXT",
-                        "high",
-                        False,
-                        in_references_section,
-                    )
+            inside_drawing = bbox_intersection_ratio(bbox, d_box) >= 0.65
+            near_drawing_label = False
+            if is_small_drawing_label and not inside_drawing:
+                gap_x = max(0.0, d_box[0] - bbox[2], bbox[0] - d_box[2])
+                gap_y = max(0.0, d_box[1] - bbox[3], bbox[1] - d_box[3])
+                near_drawing_label = (gap_x == 0.0 and gap_y <= 5.0) or (
+                    gap_y == 0.0 and gap_x <= 5.0
+                )
+            if (inside_drawing and not _CAPTION_RE.match(stripped)) or near_drawing_label:
+                return (
+                    BlockKind.FIGURE,
+                    "figure",
+                    "自動：図表内部テキスト",
+                    "RULE_FIGURE_INTERNAL_TEXT",
+                    "high",
+                    False,
+                    in_references_section,
+                )
 
         # 4. Caption check
         if _CAPTION_RE.match(stripped):
@@ -2931,6 +3019,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 for blk in page_blocks:
                     if blk.status not in (BlockStatus.TRANSLATED, BlockStatus.MANUALLY_EDITED):
                         continue
+                    blk.warnings = [w for w in blk.warnings if w not in TYPESETTING_ISSUE_CODES]
                     effective_txt = blk.effective_translation
                     if not effective_txt:
                         continue
@@ -3017,38 +3106,53 @@ class NativePreservingAdapter(PdfEngineAdapter):
                                 effective_txt,
                             )
                         )
-                        norm_orig_trans = normalize_for_pdf_rendering(blk.translation_text or "")
                         active_math_spans = [
                             ms
                             for ms in blk.inline_math_spans
-                            if (
-                                any(ms.context_text in orig_t for orig_t in kept_orig_texts)
-                                and ms.context_text not in stripped_manual
-                            )
-                            or (
-                                not any(ms.context_text in orig_t for orig_t in all_prot_texts)
-                                and bool(norm_orig_trans)
-                                and ms.context_text in norm_orig_trans
+                            if ms.context_text in render_ready_text
+                            and (
+                                (
+                                    any(ms.context_text in orig_t for orig_t in kept_orig_texts)
+                                    and ms.context_text not in stripped_manual
+                                )
+                                or (
+                                    not any(ms.context_text in orig_t for orig_t in all_prot_texts)
+                                    and ms.context_text in stripped_manual
+                                )
                             )
                         ]
                     else:
-                        active_math_spans = list(blk.inline_math_spans)
+                        active_math_spans = [
+                            ms
+                            for ms in blk.inline_math_spans
+                            if ms.context_text in render_ready_text
+                        ]
 
                     # Pre-redaction check 3: Refuse to flatten conflicting super/sub/normal math roles
                     ambiguous_ctxs = sorted(
-                        {ms.context_text for ms in active_math_spans if ms.ambiguous}
+                        {
+                            ms.context_text
+                            for ms in active_math_spans
+                            if ms.ambiguous and ms.context_text in render_ready_text
+                        }
                     )
                     if ambiguous_ctxs:
-                        _record_fallback(
-                            blk,
-                            "AMBIGUOUS_INLINE_MATH_FALLBACK",
-                            (
-                                f"同一ブロック内で上付き・下付き・通常表記が競合する数式表現（{ambiguous_ctxs}）があり、"
-                                "意味を損なわず安全に組版できないため原文要素を保持しました。"
-                            ),
-                            {"ambiguous_contexts": ambiguous_ctxs},
-                        )
-                        continue
+                        if blk.status == BlockStatus.MANUALLY_EDITED:
+                            amb_set = set(ambiguous_ctxs)
+                            active_math_spans = [
+                                ms for ms in active_math_spans if ms.context_text not in amb_set
+                            ]
+                        else:
+                            _record_fallback(
+                                blk,
+                                "AMBIGUOUS_INLINE_MATH_FALLBACK",
+                                (
+                                    f"同一ブロック内で上付き・下付き・通常表記が競合する数式表現（{ambiguous_ctxs}）があり、"
+                                    "意味を損なわず安全に組版できないため原文要素を保持しました。"
+                                ),
+                                {"ambiguous_contexts": ambiguous_ctxs},
+                            )
+                            continue
 
                     # Fit Japanese lines within bbox respecting min_font_size_pt (Section 12).
                     # For split siblings adjacent to a protected formula seam, shift line 1 baseline

@@ -110,6 +110,7 @@ export interface Block {
   source_text_hash?: string | null;
   needs_retranslation?: boolean;
   translation_provenance: string;
+  translation_is_mock?: boolean;
 }
 
 export type BlockSplitRole = "top" | "formula" | "bottom";

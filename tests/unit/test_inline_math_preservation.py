@@ -2470,3 +2470,171 @@ def test_fix_b_narrow_bbox_subcaptions_fallback_without_overhang(tmp_path: Path)
                 )
         out_pdf.close()
 
+
+def test_prose_stopword_and_decimal_subscript_no_false_ambiguity(tmp_path: Path) -> None:
+    """Ensure:
+    - Upright lowercase prose stopwords ('at' in normal English prose) do not collide
+      with subscript math 'a_t' -> no bogus AMBIGUOUS_INLINE_MATH_FALLBACK.
+    - Decimal subscripts spanned across 't', '1', '.', '5', 's' do not emit '.5' pseudo-math spans.
+    - MANUALLY_EDITED blocks never inspect stale `translation_text` or get downgraded to FALLBACK_ORIGINAL
+      by heuristic script ambiguity when manual text renders cleanly.
+    """
+    from backend.pdf.adapters.native_preserving_adapter import extract_inline_math_spans
+
+    lines_prose_at = [
+        {
+            "spans": [
+                {"text": "The window starts ", "size": 10.0, "font": "CMR10", "origin": [72.0, 120.0], "bbox": [72.0, 110.0, 145.0, 122.0]},
+                {"text": "at", "size": 10.0, "font": "CMR10", "origin": [146.0, 120.0], "bbox": [146.0, 110.0, 155.0, 122.0]},
+                {"text": " the initial frame and outputs ", "size": 10.0, "font": "CMR10", "origin": [156.0, 120.0], "bbox": [156.0, 110.0, 280.0, 122.0]},
+                {"text": "a", "size": 10.0, "font": "CMMI10", "origin": [281.0, 120.0], "bbox": [281.0, 110.0, 286.0, 122.0]},
+                {"text": "t", "size": 7.0, "font": "CMMI7", "origin": [286.5, 121.8], "bbox": [286.5, 115.0, 290.0, 123.5]},
+                {"text": ".", "size": 10.0, "font": "CMR10", "origin": [290.2, 120.0], "bbox": [290.2, 110.0, 293.0, 122.0]},
+            ]
+        }
+    ]
+    spans_at = extract_inline_math_spans(lines_prose_at, [])
+    assert any(s.context_text == "at" and s.role == "sub" and s.ambiguous is False for s in spans_at)
+
+    lines_t15s = [
+        {
+            "spans": [
+                {"text": "between t", "size": 10.0, "font": "CMMI10", "origin": [72.0, 150.0], "bbox": [72.0, 140.0, 112.0, 152.0]},
+                {"text": "1", "size": 7.0, "font": "CMR7", "origin": [112.2, 151.6], "bbox": [112.2, 145.0, 116.0, 153.2]},
+                {"text": ".", "size": 7.0, "font": "CMMI7", "origin": [116.1, 151.6], "bbox": [116.1, 145.0, 118.5, 153.2]},
+                {"text": "5", "size": 7.0, "font": "CMR7", "origin": [118.6, 151.6], "bbox": [118.6, 145.0, 122.5, 153.2]},
+                {"text": "s", "size": 7.0, "font": "CMMI7", "origin": [122.6, 151.6], "bbox": [122.6, 145.0, 126.5, 153.2]},
+                {"text": " and 1.5 s.", "size": 10.0, "font": "CMR10", "origin": [127.0, 150.0], "bbox": [127.0, 140.0, 175.0, 152.0]},
+            ]
+        }
+    ]
+    spans_t15 = extract_inline_math_spans(lines_t15s, [])
+    assert not any(s.context_text == ".5" for s in spans_t15)
+
+    # End-to-end typeset test: block 1 has false-stopword scenario translated cleanly without "at";
+    # block 2 is MANUALLY_EDITED despite stale .5 inside old translation_text + ambiguous inline_math_spans.
+    pdf_path = tmp_path / "issue_a_typeset.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    b1_box = [72.0, 100.0, 500.0, 140.0]
+    b2_box = [72.0, 160.0, 500.0, 200.0]
+    page.insert_textbox(pymupdf.Rect(b1_box), "The window starts at initial frame and yields at.", fontsize=10)
+    page.insert_textbox(pymupdf.Rect(b2_box), "Measured at t1.5s across 1.5 s interval.", fontsize=10)
+    doc.save(str(pdf_path))
+    doc.close()
+
+    cfg = AppConfig(runtime_dir=tmp_path / "rt")
+    doc_model = Document(
+        id="doc-issue-a",
+        original_filename="issue_a_typeset.pdf",
+        safe_storage_path=str(pdf_path),
+        sha256_hash=compute_sha256(pdf_path),
+        file_size_bytes=pdf_path.stat().st_size,
+        page_count=1,
+    )
+    b1 = Block(
+        id="doc-issue-a:page-1:block-1",
+        page_index=0,
+        bbox=b1_box,
+        kind=BlockKind.PARAGRAPH,
+        reading_order=0,
+        source_text="The window starts at initial frame and yields at.",
+        translation_text="ウィンドウは初期フレームから開始し、時刻 t の値を出力する。",
+        status=BlockStatus.TRANSLATED,
+        warnings=["AMBIGUOUS_INLINE_MATH_FALLBACK"],  # stale warning should be cleared!
+        inline_math_spans=spans_at,
+        font_size_pt=10.0,
+    )
+    b2 = Block(
+        id="doc-issue-a:page-1:block-2",
+        page_index=0,
+        bbox=b2_box,
+        kind=BlockKind.PARAGRAPH,
+        reading_order=1,
+        source_text="Measured at t1.5s across 1.5 s interval.",
+        translation_text="古い訳文では .5 が含まれていた。",  # stale AI output must be ignored!
+        manual_translation_text="間隔1.5秒において時刻t1.5sで計測された。",
+        status=BlockStatus.MANUALLY_EDITED,
+        warnings=["AMBIGUOUS_INLINE_MATH_FALLBACK"],
+        inline_math_spans=[
+            InlineMathSpan(context_text=".5", target_text="5", role="sub", ambiguous=True),
+        ],
+        font_size_pt=10.0,
+    )
+
+    mono_out = tmp_path / "mono.pdf"
+    dual_out = tmp_path / "dual.pdf"
+    adapter = NativePreservingAdapter(config=cfg)
+    updated, issues = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=[b1, b2],
+        page_indices=[0],
+        job_config=TranslationJobConfig(),
+        mono_output_path=mono_out,
+        dual_output_path=dual_out,
+        job_id="job-issue-a",
+    )
+    by_id = {b.id: b for b in updated}
+    assert by_id[b1.id].status == BlockStatus.TRANSLATED
+    assert "AMBIGUOUS_INLINE_MATH_FALLBACK" not in by_id[b1.id].warnings
+    assert by_id[b2.id].status == BlockStatus.MANUALLY_EDITED
+    assert "AMBIGUOUS_INLINE_MATH_FALLBACK" not in by_id[b2.id].warnings
+    assert not any(i.code == "AMBIGUOUS_INLINE_MATH_FALLBACK" for i in issues)
+
+    with pymupdf.open(str(mono_out)) as out_pdf:
+        full_txt = out_pdf[0].get_text()
+        assert "開始し" in full_txt
+        assert "計測された" in full_txt
+
+
+def test_figure_adjacent_small_unit_labels_auto_protected(tmp_path: Path) -> None:
+    """Dimension labels (e.g. '1.6m', '2m' at ~6.9pt) sitting 1.2-2.7pt outside a vector
+    diagram box must be classified under RULE_FIGURE_INTERNAL_TEXT while normal ~10pt body
+    text remains translatable.
+    """
+    pdf_path = tmp_path / "fig_adjacent_labels.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    # Place 1 Introduction heading above so body blocks sit in body zone (not page-1 frontmatter)
+    page.insert_text((72.0, 72.0), "1 Introduction", fontsize=12)
+    # Vector diagram box: [366, 283, 496, 368]
+    page.draw_rect(pymupdf.Rect(366.0, 283.0, 496.0, 368.0), color=(0, 0, 0), width=1.0)
+    page.draw_line((366.0, 283.0), (496.0, 368.0), color=(0, 0, 0), width=1.0)
+    # Dimension labels placed 1.5-2.7pt outside right/bottom edges at 6.9pt font
+    page.insert_text((497.5, 329.0), "1.6m", fontsize=6.9)
+    page.insert_text((425.0, 377.8), "2m", fontsize=6.9)
+    # Caption below (should remain caption / translatable, not figure internal)
+    page.insert_text((366.0, 395.0), "Fig. 1 Diagram layout", fontsize=9.96)
+    # Normal body paragraph nearby
+    page.insert_textbox(
+        pymupdf.Rect(72.0, 283.0, 340.0, 420.0),
+        "This paragraph describes the experimental setup using Wi-Fi sensing across multiple environments.",
+        fontsize=9.96,
+    )
+    doc.save(str(pdf_path))
+    doc.close()
+
+    cfg = AppConfig(runtime_dir=tmp_path / "rt_fig")
+    adapter = NativePreservingAdapter(config=cfg)
+    doc_model = Document(
+        id="doc-fig-lbl",
+        original_filename="fig_adjacent_labels.pdf",
+        safe_storage_path=str(pdf_path),
+        sha256_hash=compute_sha256(pdf_path),
+        file_size_bytes=pdf_path.stat().st_size,
+        page_count=1,
+    )
+    blocks = adapter.parse_and_extract_blocks(
+        document=doc_model,
+        page_indices=[0],
+        manual_regions=[],
+        job_config=TranslationJobConfig(use_mock_translator=True),
+    )
+    by_text = {b.source_text.strip(): b for b in blocks}
+    assert by_text["1.6m"].protection_rule_id == "RULE_FIGURE_INTERNAL_TEXT"
+    assert by_text["1.6m"].status == BlockStatus.PROTECTED_SKIP
+    assert by_text["2m"].protection_rule_id == "RULE_FIGURE_INTERNAL_TEXT"
+    assert by_text["2m"].status == BlockStatus.PROTECTED_SKIP
+    body_blk = next(b for b in blocks if "experimental setup" in b.source_text)
+    assert body_blk.status == BlockStatus.PENDING
+

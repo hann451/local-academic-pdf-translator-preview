@@ -287,6 +287,7 @@ class DatabaseRepository:
             if manual_text is not None:
                 block.needs_retranslation = False
                 block.status = BlockStatus.MANUALLY_EDITED
+                block.translation_provenance = "manual_edit"
                 val_res = validate_translation_output(
                     source_text=block.source_text,
                     masked_source_text=block.masked_source_text or block.source_text,
@@ -301,6 +302,8 @@ class DatabaseRepository:
                 block.manual_validation_warnings = []
                 if block.translation_text is not None:
                     block.status = BlockStatus.TRANSLATED
+                    if block.translation_provenance == "manual_edit":
+                        block.translation_provenance = "llm_inference"
 
             conn.execute(
                 """
@@ -834,19 +837,24 @@ class DatabaseRepository:
             return [ExportArtifact.model_validate_json(r["payload_json"]) for r in rows]
 
     # --- Translation Cache operations ---
-    def get_cached_translation(self, cache_key: str) -> dict | None:
+    def get_cached_translation(
+        self, cache_key: str, *, expected_is_mock: bool | None = None
+    ) -> dict | None:
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM translation_cache WHERE cache_key = ?", (cache_key,)
             ).fetchone()
             if not row:
                 return None
+            row_is_mock = bool(row["is_mock"])
+            if expected_is_mock is not None and row_is_mock != bool(expected_is_mock):
+                return None
             return {
                 "cache_key": row["cache_key"],
                 "model_output_text": row["model_output_text"],
                 "model_name": row["model_name"],
                 "quantization": row["quantization"],
-                "is_mock": bool(row["is_mock"]),
+                "is_mock": row_is_mock,
                 "created_at": row["created_at"],
             }
 

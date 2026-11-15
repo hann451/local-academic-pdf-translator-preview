@@ -581,6 +581,79 @@ describe("Screen 2: PDF Viewer & SVG Protection Editor (Section 6)", () => {
       });
     });
   });
+
+  it("distinguishes fallback_original warnings and translate_as_body manual overrides from locked manual protection in Screen 2", () => {
+    const edgeBlocks: Block[] = [
+      {
+        ...SAMPLE_BLOCKS[0],
+        id: "doc-abc123456789:page-1:block-fallback",
+        status: "fallback_original",
+        protection_source: "none",
+        warnings: ["AMBIGUOUS_INLINE_MATH_FALLBACK"],
+        source_text: "Window starts at initial frame with a_t.",
+      },
+      {
+        ...SAMPLE_BLOCKS[0],
+        id: "doc-abc123456789:page-1:block-translate-body",
+        reading_order: 1,
+        status: "pending",
+        protection_source: "manual",
+        protection_reason: "手動領域：翻訳対象",
+        source_text: "Falling width = mean(a) (6) A point is identified.",
+      },
+      {
+        ...SAMPLE_BLOCKS[0],
+        id: "doc-abc123456789:page-1:block-manual-locked",
+        reading_order: 2,
+        status: "protected_skip",
+        protection_source: "manual",
+        protection_reason: "手動領域：非翻訳対象",
+        source_text: "Protected manual formula block.",
+      },
+    ];
+
+    render(
+      <Screen2ProtectionEditor
+        document={SAMPLE_DOC}
+        pdfBytes={null}
+        blocks={edgeBlocks}
+        protectionRegions={[]}
+        isParsing={false}
+        saveStatus="saved"
+        saveMessage={null}
+        onReparseBlocks={vi.fn()}
+        onAddProtectionRegion={vi.fn()}
+        onDeleteProtectionRegion={vi.fn()}
+        onProceedToStartJob={vi.fn()}
+      />
+    );
+
+    // Fallback block must surface fallback warning and never show plain "翻訳対象"
+    const fbBadge = screen.getByTestId(
+      "block-status-badge-doc-abc123456789:page-1:block-fallback"
+    );
+    expect(fbBadge).toHaveTextContent("原文保持フォールバック");
+    expect(fbBadge).toHaveTextContent("AMBIGUOUS_INLINE_MATH_FALLBACK");
+
+    // translate_as_body block (protection_source="manual", status="pending") must NOT display 🔒手動保護 / 🔒Manual
+    const transBodyBadge = screen.getByTestId(
+      "block-status-badge-doc-abc123456789:page-1:block-translate-body"
+    );
+    expect(transBodyBadge).not.toHaveTextContent("🔒手動保護");
+    expect(transBodyBadge).toHaveTextContent("翻訳対象");
+
+    // Genuine manual protected block still displays 🔒手動保護
+    const lockedBadge = screen.getByTestId(
+      "block-status-badge-doc-abc123456789:page-1:block-manual-locked"
+    );
+    expect(lockedBadge).toHaveTextContent("🔒手動保護");
+
+    // SVG badges agree accurately
+    const svg = screen.getByTestId("pdf-svg-overlay");
+    expect(svg).toHaveTextContent("⚠Fallback");
+    expect(svg).toHaveTextContent("翻訳(手動)");
+    expect(svg).toHaveTextContent("🔒Manual");
+  });
 });
 
 describe("Screen 3: 13-Stage Progress, Cancel Distinction, Manual Edit & Retypeset (Section 7)", () => {

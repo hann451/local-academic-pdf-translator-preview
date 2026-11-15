@@ -759,14 +759,21 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
               const splitTag = blk.split_role
                 ? SPLIT_ROLE_LABELS[blk.split_role]?.shortTag
                 : null;
+              const isManualProtected =
+                blk.status === "protected_skip" && isManualOverride;
+              const isManualTranslatable =
+                blk.status !== "protected_skip" &&
+                (isManualOverride || blk.user_protection_override === "force_translate");
               const sourceBadge = isFallback
                 ? "⚠Fallback"
                 : splitTag
                 ? splitTag
-                : isManualOverride
+                : isManualProtected
                 ? "🔒Manual"
-                : blk.protection_source === "auto"
+                : blk.status === "protected_skip"
                 ? "Auto保護"
+                : isManualTranslatable
+                ? "翻訳(手動)"
                 : "翻訳対象";
 
               return (
@@ -798,7 +805,7 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
                         ? "#ea580c"
                         : blk.split_role === "formula"
                         ? "#7c3aed"
-                        : isManualOverride
+                        : isManualProtected
                         ? "#dc2626"
                         : st.stroke
                     }
@@ -1505,13 +1512,27 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
                       </strong>{" "}
                       (#{b.reading_order + 1})
                     </span>
-                    <span className="badge badge-neutral">
-                      {b.split_role === "formula"
+                    <span
+                      className={`badge ${
+                        b.status === "fallback_original" ? "badge-error" : "badge-neutral"
+                      }`}
+                      data-testid={`block-status-badge-${b.id}`}
+                    >
+                      {b.status === "fallback_original"
+                        ? `⚠ 原文保持フォールバック${
+                            b.warnings && b.warnings.length > 0
+                              ? ` (${b.warnings.join(", ")})`
+                              : ""
+                          }`
+                        : b.split_role === "formula"
                         ? "✂ 分割数式・原文保護"
-                        : b.protection_source === "manual"
-                        ? "🔒手動保護"
                         : b.status === "protected_skip"
-                        ? b.protection_reason || "自動保護"
+                        ? b.protection_source === "manual"
+                          ? "🔒手動保護"
+                          : b.protection_reason || "自動保護"
+                        : b.protection_source === "manual" ||
+                          b.user_protection_override === "force_translate"
+                        ? b.protection_reason || "翻訳対象（手動指定）"
                         : "翻訳対象"}
                     </span>
                   </div>

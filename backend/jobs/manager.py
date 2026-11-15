@@ -66,6 +66,30 @@ from backend.translation.prompts.pfml3 import (
     HistoryPair,
     split_paragraph_preserving_placeholders,
 )
+
+_TRANSIENT_BLOCK_WARNING_CODES: frozenset[str] = TYPESETTING_ISSUE_CODES | frozenset(
+    {
+        "UNTRANSLATED_AFTER_PROTECTION_CHANGE",
+        "EMPTY_OUTPUT",
+        "TRUNCATED_BY_LENGTH",
+        "SPECIAL_TOKEN_RESIDUE",
+        "PLACEHOLDER_ALTERED",
+        "PLACEHOLDER_MISSING",
+        "PLACEHOLDER_DUPLICATED",
+        "PLACEHOLDER_HALLUCINATED",
+        "REFERENCE_MARKER_MISSING",
+        "ABNORMAL_REPETITION",
+        "EXPLANATION_CONTAMINATION",
+        "UNTRANSLATED_SOURCE_RETURNED",
+        "ABNORMALLY_SHORT_TRANSLATION",
+        "NUMERIC_VALUE_MISMATCH",
+    }
+)
+
+
+def _clear_transient_block_warnings(warnings: list[str]) -> list[str]:
+    """Remove transient translation/typesetting warnings before re-evaluation."""
+    return [w for w in warnings if w not in _TRANSIENT_BLOCK_WARNING_CODES]
 from backend.translation.validation.validator import (
     TRANSLATION_VALIDATION_ISSUE_CODES,
     validate_translation_output,
@@ -464,6 +488,7 @@ class JobManager:
             if not same_mask_unit:
                 clear_manual_ids.add(pb.id)
                 pb.translation_text = None
+                pb.translation_is_mock = False
                 pb.manual_translation_text = None
                 pb.manual_validation_errors = []
                 pb.manual_validation_warnings = []
@@ -477,6 +502,7 @@ class JobManager:
             pb.manual_validation_errors = list(old_b.manual_validation_errors)
             pb.manual_validation_warnings = list(old_b.manual_validation_warnings)
             pb.translation_text = old_b.translation_text
+            pb.translation_is_mock = old_b.translation_is_mock
             pb.manual_translation_text = old_b.manual_translation_text
 
             if not bbox_moved:
@@ -493,16 +519,24 @@ class JobManager:
             if pb.status != BlockStatus.PROTECTED_SKIP:
                 if (
                     target_block_ids is None or pb.id not in target_block_ids
-                ) and old_b.status in (BlockStatus.TRANSLATED, BlockStatus.MANUALLY_EDITED):
+                ) and old_b.status in (
+                    BlockStatus.TRANSLATED,
+                    BlockStatus.MANUALLY_EDITED,
+                    BlockStatus.FALLBACK_ORIGINAL,
+                ):
                     pb.status = old_b.status
                     pb.needs_retranslation = old_b.needs_retranslation
                     pb.translation_provenance = (
                         "manual_edit"
                         if old_b.status == BlockStatus.MANUALLY_EDITED
                         else (
-                            old_b.translation_provenance
-                            if old_b.translation_provenance != "none"
-                            else "reused_block"
+                            "fallback_original"
+                            if old_b.status == BlockStatus.FALLBACK_ORIGINAL
+                            else (
+                                old_b.translation_provenance
+                                if old_b.translation_provenance != "none"
+                                else "reused_block"
+                            )
                         )
                     )
                 elif target_block_ids is not None and pb.id in target_block_ids:
@@ -1267,26 +1301,34 @@ class JobManager:
                     # Skip blocks that are protected or already translated (unless targeted for partial re-translation)
                     if blk.status == BlockStatus.PROTECTED_SKIP:
                         blk.translation_provenance = "protected_skip"
+                        blk.needs_retranslation = False
+                        blk.warnings = _clear_transient_block_warnings(blk.warnings)
                         continue
                     if blk.status == BlockStatus.MANUALLY_EDITED and (
                         target_block_ids is None or blk.id not in target_block_ids
                     ):
                         blk.translation_provenance = "manual_edit"
+                        blk.warnings = _clear_transient_block_warnings(blk.warnings)
                         continue
                     if (
                         blk.status == BlockStatus.FALLBACK_ORIGINAL
-                        and not blk.needs_retranslation
-                        and (target_block_ids is None or blk.id not in target_block_ids)
+                        and target_block_ids is not None
+                        and blk.id not in target_block_ids
                     ):
                         blk.translation_provenance = "fallback_original"
                         continue
+                    blk_is_mock_origin = bool(blk.translation_is_mock) or str(
+                        blk.translation_text or ""
+                    ).lstrip().startswith("[MOCK")
                     if (
                         blk.status == BlockStatus.TRANSLATED
                         and blk.translation_text
                         and not blk.needs_retranslation
+                        and not (not translator.is_mock and blk_is_mock_origin)
                         and (target_block_ids is None or blk.id not in target_block_ids)
                     ):
                         blk.translation_provenance = "reused_block"
+                        blk.warnings = _clear_transient_block_warnings(blk.warnings)
                         reused_existing_blocks += 1
                         history_window.append(
                             HistoryPair(
@@ -2143,6 +2185,7 @@ class JobManager:
             llm_calls += 1
             return translator.translate_segment(**kw)
 
+        block.warnings = _clear_transient_block_warnings(block.warnings)
         masked_src = block.masked_source_text or block.source_text
         cache_key = compute_translation_cache_key(
             masked_source_text=masked_src,
@@ -2157,9 +2200,13 @@ class JobManager:
             history=history_window,
             protected_items=block.protected_items,
             adapter_version=translator.adapter_version,
+            is_mock=translator.is_mock,
         )
 
-        cached = self.db.get_cached_translation(cache_key)
+        cached = self.db.get_cached_translation(
+            cache_key,
+            expected_is_mock=translator.is_mock,
+        )
         if cached is not None:
             val_res = validate_translation_output(
                 source_text=block.source_text,
@@ -2173,6 +2220,7 @@ class JobManager:
                 block.status = BlockStatus.TRANSLATED
                 block.needs_retranslation = False
                 block.translation_provenance = "cache_hit"
+                block.translation_is_mock = bool(cached.get("is_mock", translator.is_mock))
                 return "cache_hit", 0
 
         max_attempts = 3  # Initial attempt + up to 2 retries (Section 11)
@@ -2293,12 +2341,15 @@ class JobManager:
                         )
                     )
                 block.translation_provenance = "llm_inference"
+                block.translation_is_mock = translator.is_mock
                 return "llm_inference", llm_calls
 
         # All attempts (initial + 2 retries) failed validation!
         # Section 11: Never delete placeholders to fake repair. Keep original source and record issue.
         block.translation_text = None
         block.status = BlockStatus.FALLBACK_ORIGINAL
+        block.needs_retranslation = False
+        block.translation_is_mock = translator.is_mock
         if last_val_res:
             for f in last_val_res.findings:
                 block.warnings.append(f.code)
