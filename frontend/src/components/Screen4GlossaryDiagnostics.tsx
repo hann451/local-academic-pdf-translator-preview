@@ -3,8 +3,19 @@
  */
 
 import React, { useMemo, useState } from "react";
-import type { Glossary, GlossaryEntry, SystemDiagnostics } from "../types/api";
+import type {
+  Glossary,
+  GlossaryEntry,
+  ModelDownloadJob,
+  ModelsOverviewResponse,
+  RegisteredModel,
+  RegisterLocalModelRequest,
+  StartModelDownloadRequest,
+  SystemDiagnostics,
+} from "../types/api";
 import { parseGlossaryInput, type GlossaryParseReport } from "../utils/glossaryParser";
+import { ModelLicenseNotice, resolveActiveCatalogModel } from "./ModelLicenseNotice";
+import { ModelSelectionPanel } from "./ModelSelectionPanel";
 
 export interface Screen4Props {
   glossaries: Glossary[];
@@ -12,7 +23,18 @@ export interface Screen4Props {
   hasProbedLlama: boolean;
   isLoadingDiagnostics: boolean;
   diagnosticsError: string | null;
+  modelsOverview?: ModelsOverviewResponse | null;
+  activeModelDownload?: ModelDownloadJob | null;
+  isLoadingModels?: boolean;
+  modelsError?: string | null;
   onRefreshDiagnostics: (probeLlama: boolean) => Promise<void>;
+  onRefreshModels?: (probeLlama: boolean) => Promise<void>;
+  onBrowseLocalModelFile?: () => Promise<string | null>;
+  onRegisterLocalModel?: (payload: RegisterLocalModelRequest) => Promise<RegisteredModel>;
+  onSelectModel?: (registrationId: string) => Promise<void>;
+  onDeleteModel?: (registrationId: string) => Promise<void>;
+  onStartModelDownload?: (payload: StartModelDownloadRequest) => Promise<ModelDownloadJob>;
+  onCancelModelDownload?: (downloadId: string) => Promise<void>;
   onCreateGlossary: (name: string, entries: GlossaryEntry[]) => Promise<Glossary>;
   onUpdateGlossary: (
     glossaryId: string,
@@ -30,7 +52,18 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
   hasProbedLlama,
   isLoadingDiagnostics,
   diagnosticsError,
+  modelsOverview = null,
+  activeModelDownload = null,
+  isLoadingModels = false,
+  modelsError = null,
   onRefreshDiagnostics,
+  onRefreshModels,
+  onBrowseLocalModelFile,
+  onRegisterLocalModel,
+  onSelectModel,
+  onDeleteModel,
+  onStartModelDownload,
+  onCancelModelDownload,
   onCreateGlossary,
   onUpdateGlossary,
   onDeleteGlossary,
@@ -207,8 +240,51 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
     );
   };
 
+  const activeCatalogModel = resolveActiveCatalogModel(modelsOverview);
+  const hasModelActions = Boolean(
+    onRefreshModels &&
+      onBrowseLocalModelFile &&
+      onRegisterLocalModel &&
+      onSelectModel &&
+      onDeleteModel &&
+      onStartModelDownload &&
+      onCancelModelDownload
+  );
+
   return (
     <div className="screen-container" data-testid="screen4-glossary-diagnostics">
+      {hasModelActions &&
+        onRefreshModels &&
+        onBrowseLocalModelFile &&
+        onRegisterLocalModel &&
+        onSelectModel &&
+        onDeleteModel &&
+        onStartModelDownload &&
+        onCancelModelDownload && (
+          <section
+            className="card"
+            data-testid="screen4-model-management-panel"
+            style={{ marginBottom: "16px" }}
+          >
+            <h2 className="card-title" style={{ marginBottom: "8px" }}>
+              0. 翻訳モデルの選択・ダウンロード・ローカル登録
+            </h2>
+            <ModelSelectionPanel
+              overview={modelsOverview}
+              activeDownload={activeModelDownload}
+              isLoading={isLoadingModels}
+              error={modelsError}
+              onRefreshModels={onRefreshModels}
+              onBrowseLocalFile={onBrowseLocalModelFile}
+              onRegisterLocalModel={onRegisterLocalModel}
+              onSelectModel={onSelectModel}
+              onDeleteModel={onDeleteModel}
+              onStartDownload={onStartModelDownload}
+              onCancelDownload={onCancelModelDownload}
+            />
+          </section>
+        )}
+
       <div className="grid-2col">
         {/* Left Column: Glossary Management (Section 8) */}
         <section className="card" data-testid="glossary-management-panel">
@@ -620,10 +696,60 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
                   <code>{diagnostics.llama_server_url}</code>
                 </dd>
               </div>
+              <div>
+                <dt>UI選択中の翻訳モデル / 状態</dt>
+                <dd data-testid="diag-active-model">
+                  {diagnostics.active_model_display_name || "未登録 / 既定"} (
+                  {diagnostics.active_model_status || "unregistered"})
+                  {diagnostics.active_model_file_path && (
+                    <>
+                      <br />
+                      <code style={{ fontSize: "11px", wordBreak: "break-all" }}>
+                        {diagnostics.active_model_file_path}
+                      </code>
+                    </>
+                  )}
+                </dd>
+              </div>
+              <div>
+                <dt>選択モデルと起動中サーバの整合</dt>
+                <dd data-testid="diag-model-server-match">
+                  <span
+                    className={`badge ${
+                      diagnostics.model_server_mismatch
+                        ? "badge-error"
+                        : diagnostics.model_server_match_status === "matched" ||
+                          diagnostics.model_server_match_status ===
+                            "matched_same_model_different_path"
+                        ? "badge-success"
+                        : "badge-neutral"
+                    }`}
+                  >
+                    {diagnostics.model_server_match_status || "unverified"}
+                  </span>{" "}
+                  {diagnostics.model_server_match_message && (
+                    <span style={{ fontSize: "12px" }}>
+                      {diagnostics.model_server_match_message}
+                    </span>
+                  )}
+                </dd>
+              </div>
               <div style={{ gridColumn: "1 / -1" }}>
                 <dt>推論サーバ接続状態・ロード済みモデル</dt>
                 <dd style={{ marginTop: "4px" }}>
                   {renderConnectionBadge(diagnostics)}
+                  {diagnostics.model_server_mismatch && (
+                    <div
+                      role="alert"
+                      data-testid="diag-model-server-mismatch-alert"
+                      className="alert alert-error"
+                      style={{ marginTop: "8px", fontSize: "12px" }}
+                    >
+                      <strong>選択モデルと起動中 llama-server が一致していません:</strong>{" "}
+                      {diagnostics.model_server_match_message ||
+                        "選択したモデルの再起動または実機切替が必要です。"}
+                    </div>
+                  )}
                   {diagnostics.llama_connection_status !== "connected" && (
                     <div
                       data-testid="diag-llama-disconnected-guide"
@@ -634,7 +760,7 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
                         lineHeight: 1.5,
                       }}
                     >
-                      実機翻訳を行う場合は、別ターミナルで PLaMo モデルを指定して{" "}
+                      実機翻訳を行う場合は、別ターミナルで選択中の翻訳モデルを指定して{" "}
                       <code>llama-server</code>（既定 <code>127.0.0.1:8000</code>
                       ）を起動し、上部の「🔌 推論サーバ疎通確認 (probe_llama=true)」を押してください（疎通確認は{" "}
                       <code>GET /v1/models</code>{" "}
@@ -648,68 +774,11 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
 
           <hr style={{ border: "none", borderTop: "1px solid #e2e8f0", margin: "16px 0" }} />
 
-          <div
-            data-testid="plamo-model-license-panel"
-            style={{
-              padding: "12px",
-              backgroundColor: "#f8fafc",
-              border: "1px solid #cbd5e1",
-              borderRadius: "6px",
-              fontSize: "12px",
-              color: "#334155",
-              lineHeight: 1.5,
-              marginBottom: "16px",
-            }}
-          >
-            <h3 style={{ fontSize: "14px", margin: "0 0 6px 0", color: "#0f172a" }}>
-              モデル・ライセンス案内（Built with PLaMo）
-            </h3>
-            <ul style={{ margin: "0 0 8px 18px", padding: 0 }}>
-              <li>
-                <strong>使用を想定するモデル:</strong> PLaMo 3 Translate（
-                <code>pfnet/plamo-3-translate-2b-GGUF</code>） / <strong>Built with PLaMo</strong>
-              </li>
-              <li>
-                <strong>非公式ツール:</strong> 本ツールは Preferred Networks（PFN）の公式製品ではありません。
-              </li>
-              <li>
-                <strong>ライセンスの分離と別途取得:</strong> アプリ本体のライセンス（GNU AGPL v3 /{" "}
-                <code>AGPL-3.0-only</code>
-                ）とモデルのライセンス（PLaMoコミュニティライセンス契約）は別です。モデル本体（GGUF）と推論サーバ（
-                <code>llama.cpp</code>）は同梱しておらず、利用者が別途取得・起動する構成です。
-              </li>
-              <li>
-                <strong>PLaMo 3 Translate の適用条件（2026年11月9日改定に関するPFN回答に基づく案内）:</strong>{" "}
-                モデル非同梱であっても、利用者は公式リンク先の契約条件を確認・遵守する必要があります（本案内は受領回答に基づくものであり、公開条文の確認結果や過去のモデル取得時点の条件記録とは区別します）。書籍・論文などの独立した長文公表物に関する場合を除き、通常の翻訳PDFの提供・公表には一律の出自表示や契約コピー・説明ファイルの添付は不要ですが、<strong>ただし書籍・論文などの独立した長文公表物の全部または実質的部分として公表する場合は、PLaMoを翻訳に利用した旨をPDF内に含めて明示する必要があります</strong>（PDF末尾の説明ページでも対応可能です。本ツールは説明ページを自動追加しません。また原著作物の翻訳・配布・公表の許諾まで与えるものではありません。外部リンクはクリック時のみ開きます）。
-              </li>
-            </ul>
-            <div style={{ display: "flex", gap: "14px", flexWrap: "wrap" }}>
-              <a
-                href="https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF"
-                target="_blank"
-                rel="noopener noreferrer"
-                data-testid="link-plamo-model-repo"
-              >
-                公式モデル配布元 (pfnet/plamo-3-translate-2b-GGUF)
-              </a>
-              <a
-                href="https://plamo.preferredai.jp/info/plamo-community-license-ja"
-                target="_blank"
-                rel="noopener noreferrer"
-                data-testid="link-plamo-license-ja"
-              >
-                PLaMoコミュニティライセンス契約（日本語）
-              </a>
-              <a
-                href="https://plamo.preferredai.jp/info/plamo-community-license-en"
-                target="_blank"
-                rel="noopener noreferrer"
-                data-testid="link-plamo-license-en"
-              >
-                PLaMo Community License Agreement (English)
-              </a>
-            </div>
-          </div>
+          <ModelLicenseNotice
+            variant="screen4"
+            catalogModel={activeCatalogModel}
+            activeModel={modelsOverview?.active_model ?? null}
+          />
 
           <h3 style={{ fontSize: "15px", margin: "0 0 8px 0" }}>
             セキュリティ・メンテナンス操作

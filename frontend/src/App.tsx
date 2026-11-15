@@ -5,6 +5,8 @@
 import React, { useCallback, useEffect, useState } from "react";
 import {
   ApiHttpError,
+  browseLocalModelFile,
+  cancelModelDownload,
   cancelTranslationJob,
   createBlockSplit,
   createGlossary,
@@ -12,6 +14,7 @@ import {
   deleteBlockSplit,
   deleteGlossary,
   deleteProtectionRegion,
+  deleteRegisteredModel,
   downloadArtifactFile,
   ensureSessionToken,
   fetchArtifactPdfBytes,
@@ -23,9 +26,14 @@ import {
   fetchJob,
   fetchJobArtifacts,
   fetchJobIssues,
+  fetchModelDownload,
+  fetchModelsOverview,
   fetchProtectionRegions,
   fetchSystemDiagnostics,
   previewBlockSplit,
+  registerLocalModel,
+  selectActiveModel,
+  startModelDownload,
   updateBlockProtection,
   reapplyAutoProtection,
   parseDocumentBlocks,
@@ -53,8 +61,13 @@ import type {
   Glossary,
   GlossaryEntry,
   Job,
+  ModelDownloadJob,
+  ModelsOverviewResponse,
   ProtectionMode,
   ProtectionRegion,
+  RegisterLocalModelRequest,
+  RegisteredModel,
+  StartModelDownloadRequest,
   SystemDiagnostics,
   TranslationJobConfig,
   ValidationIssue,
@@ -107,6 +120,10 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
   const [glossaries, setGlossaries] = useState<Glossary[]>([]);
   const [diagnostics, setDiagnostics] = useState<SystemDiagnostics | null>(null);
   const [hasProbedLlama, setHasProbedLlama] = useState<boolean>(false);
+  const [modelsOverview, setModelsOverview] = useState<ModelsOverviewResponse | null>(null);
+  const [activeModelDownload, setActiveModelDownload] = useState<ModelDownloadJob | null>(null);
+  const [isLoadingModels, setIsLoadingModels] = useState<boolean>(false);
+  const [modelsError, setModelsError] = useState<string | null>(null);
 
   // Loading & Error Flags
   const [isUploading, setIsUploading] = useState<boolean>(false);
@@ -129,6 +146,46 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
   const [isLoadingDiagnostics, setIsLoadingDiagnostics] = useState<boolean>(false);
   const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
 
+  const syncJobConfigWithOverview = useCallback((overview: ModelsOverviewResponse) => {
+    const active = overview.active_model;
+    if (!active) return;
+    const cat = overview.catalog.find((c) => c.model_id === active.catalog_model_id);
+    setJobConfig((prev) => ({
+      ...prev,
+      model_id: active.catalog_model_id,
+      model_name: active.file_name || active.display_name || prev.model_name,
+      model_sha256: active.measured_sha256 || null,
+      quantization: active.quantization || prev.quantization,
+      context_length: cat?.context_length_default ?? prev.context_length,
+    }));
+  }, []);
+
+  const refreshModelsOverview = useCallback(
+    async (probeLlama: boolean = false) => {
+      setIsLoadingModels(true);
+      setModelsError(null);
+      try {
+        const overview = await fetchModelsOverview(probeLlama);
+        setModelsOverview(overview);
+        syncJobConfigWithOverview(overview);
+        if (probeLlama) {
+          setHasProbedLlama(true);
+        }
+        const runningDl = overview.downloads.find(
+          (dl) => dl.status === "downloading" || dl.status === "verifying"
+        );
+        if (runningDl) {
+          setActiveModelDownload(runningDl);
+        }
+      } catch (err) {
+        setModelsError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setIsLoadingModels(false);
+      }
+    },
+    [syncJobConfigWithOverview]
+  );
+
   const loadInitialSessionAndData = useCallback(async () => {
     try {
       await ensureSessionToken();
@@ -138,14 +195,50 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
       ]);
       setGlossaries(gls);
       setDiagnostics(diag);
+      void refreshModelsOverview(false);
     } catch (err) {
       setDiagnosticsError(err instanceof Error ? err.message : String(err));
     }
-  }, []);
+  }, [refreshModelsOverview]);
 
   useEffect(() => {
     void loadInitialSessionAndData();
   }, [loadInitialSessionAndData]);
+
+  // Poll model download status while downloading or verifying
+  useEffect(() => {
+    if (
+      !activeModelDownload ||
+      (activeModelDownload.status !== "downloading" &&
+        activeModelDownload.status !== "verifying")
+    ) {
+      return;
+    }
+
+    const timer = window.setInterval(async () => {
+      try {
+        const updated = await fetchModelDownload(activeModelDownload.download_id);
+        setActiveModelDownload(updated);
+        if (
+          updated.status === "completed" ||
+          updated.status === "canceled" ||
+          updated.status === "failed"
+        ) {
+          await refreshModelsOverview(false);
+          try {
+            const diag = await fetchSystemDiagnostics(false);
+            setDiagnostics(diag);
+          } catch {
+            // ignore diagnostics refresh failure on background download finish
+          }
+        }
+      } catch {
+        // ignore transient poll error
+      }
+    }, 600);
+
+    return () => window.clearInterval(timer);
+  }, [activeModelDownload?.download_id, activeModelDownload?.status, refreshModelsOverview]);
 
   const refreshJobDetails = useCallback(
     async (jobId: string, docId: string) => {
@@ -266,9 +359,18 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
     setRetypesetMessage(null);
     setRetypesetError(null);
     try {
-      const effectiveConfig: TranslationJobConfig = options?.allowPendingSplits
-        ? { ...jobConfig, allow_pending_splits: true }
+      const activeModel = modelsOverview?.active_model;
+      const baseConfig: TranslationJobConfig = activeModel
+        ? {
+            ...jobConfig,
+            model_id: activeModel.catalog_model_id,
+            model_name: activeModel.file_name || activeModel.display_name || jobConfig.model_name,
+            model_sha256: activeModel.measured_sha256 || jobConfig.model_sha256 || null,
+          }
         : jobConfig;
+      const effectiveConfig: TranslationJobConfig = options?.allowPendingSplits
+        ? { ...baseConfig, allow_pending_splits: true }
+        : baseConfig;
       const job = await startTranslationJob(
         currentDocument.id,
         effectiveConfig,
@@ -565,7 +667,7 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
     await downloadArtifactFile(currentJob.id, artifactType, fallbackName);
   };
 
-  // --- Screen 4 Handlers ---
+  // --- Screen 4 & Model Management Handlers ---
   const handleRefreshDiagnostics = async (probeLlama: boolean) => {
     setIsLoadingDiagnostics(true);
     setDiagnosticsError(null);
@@ -575,11 +677,69 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
       if (probeLlama) {
         setHasProbedLlama(true);
       }
+      void refreshModelsOverview(probeLlama);
     } catch (err) {
       setDiagnosticsError(err instanceof Error ? err.message : String(err));
     } finally {
       setIsLoadingDiagnostics(false);
     }
+  };
+
+  const handleRefreshModels = async (probeLlama: boolean): Promise<void> => {
+    await refreshModelsOverview(probeLlama);
+    try {
+      const diag = await fetchSystemDiagnostics(probeLlama);
+      setDiagnostics(diag);
+      if (probeLlama) {
+        setHasProbedLlama(true);
+      }
+    } catch (err) {
+      setDiagnosticsError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleBrowseLocalModelFile = async (): Promise<string | null> => {
+    const res = await browseLocalModelFile();
+    return res.canceled ? null : res.file_path;
+  };
+
+  const handleRegisterLocalModel = async (
+    payload: RegisterLocalModelRequest
+  ): Promise<RegisteredModel> => {
+    const reg = await registerLocalModel(payload);
+    await handleRefreshModels(false);
+    return reg;
+  };
+
+  const handleSelectModel = async (registrationId: string): Promise<void> => {
+    await selectActiveModel(registrationId, true);
+    await handleRefreshModels(true);
+  };
+
+  const handleDeleteModel = async (registrationId: string): Promise<void> => {
+    await deleteRegisteredModel(registrationId);
+    await handleRefreshModels(false);
+  };
+
+  const handleStartModelDownload = async (
+    payload: StartModelDownloadRequest
+  ): Promise<ModelDownloadJob> => {
+    const dlJob = await startModelDownload(payload);
+    setActiveModelDownload(dlJob);
+    if (
+      dlJob.status === "completed" ||
+      dlJob.status === "canceled" ||
+      dlJob.status === "failed"
+    ) {
+      await handleRefreshModels(false);
+    }
+    return dlJob;
+  };
+
+  const handleCancelModelDownload = async (downloadId: string): Promise<void> => {
+    const canceled = await cancelModelDownload(downloadId);
+    setActiveModelDownload(canceled);
+    await handleRefreshModels(false);
   };
 
   const handleCreateGlossary = async (
@@ -719,6 +879,10 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
             currentDocument={currentDocument}
             jobConfig={jobConfig}
             glossaries={glossaries}
+            modelsOverview={modelsOverview}
+            activeModelDownload={activeModelDownload}
+            isLoadingModels={isLoadingModels}
+            modelsError={modelsError}
             isUploading={isUploading}
             uploadError={uploadError}
             isStartingJob={isStartingJob}
@@ -726,6 +890,14 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
             onUploadFile={handleUploadFile}
             onUpdateJobConfig={setJobConfig}
             onOpenProtectionScreen={() => setActiveScreen("screen2")}
+            onOpenModelsScreen={() => handleNavigate("screen4")}
+            onRefreshModels={handleRefreshModels}
+            onBrowseLocalModelFile={handleBrowseLocalModelFile}
+            onRegisterLocalModel={handleRegisterLocalModel}
+            onSelectModel={handleSelectModel}
+            onDeleteModel={handleDeleteModel}
+            onStartModelDownload={handleStartModelDownload}
+            onCancelModelDownload={handleCancelModelDownload}
             onStartTranslationJob={handleStartTranslationJob}
           />
         )}
@@ -785,7 +957,18 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
             hasProbedLlama={hasProbedLlama}
             isLoadingDiagnostics={isLoadingDiagnostics}
             diagnosticsError={diagnosticsError}
+            modelsOverview={modelsOverview}
+            activeModelDownload={activeModelDownload}
+            isLoadingModels={isLoadingModels}
+            modelsError={modelsError}
             onRefreshDiagnostics={handleRefreshDiagnostics}
+            onRefreshModels={handleRefreshModels}
+            onBrowseLocalModelFile={handleBrowseLocalModelFile}
+            onRegisterLocalModel={handleRegisterLocalModel}
+            onSelectModel={handleSelectModel}
+            onDeleteModel={handleDeleteModel}
+            onStartModelDownload={handleStartModelDownload}
+            onCancelModelDownload={handleCancelModelDownload}
             onCreateGlossary={handleCreateGlossary}
             onUpdateGlossary={handleUpdateGlossary}
             onDeleteGlossary={handleDeleteGlossary}

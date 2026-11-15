@@ -280,6 +280,8 @@ export interface TranslationJobConfig {
   target_lang: string;
   form: "plain" | "polite";
   model_name: string;
+  model_id?: string | null;
+  model_sha256?: string | null;
   quantization: string;
   context_length: number;
   translate_captions: boolean;
@@ -307,6 +309,9 @@ export interface ExecutionProvenance {
   engine_process?: string;
   endpoint_url?: string;
   model_name?: string;
+  model_id?: string | null;
+  model_display_name?: string | null;
+  model_sha256?: string | null;
   model_file?: string | null;
   quantization?: string;
   compute_backend?: string;
@@ -386,6 +391,191 @@ export interface SystemDiagnostics {
   llama_build_info?: string | null;
   llama_compute_backend?: string | null;
   llama_server_pid?: number | null;
+  active_registration_id?: string | null;
+  active_catalog_model_id?: string | null;
+  active_model_display_name?: string | null;
+  active_model_file_path?: string | null;
+  active_model_status?: string | null;
+  running_server_model_path?: string | null;
+  model_server_match_status?: string | null;
+  model_server_match_message?: string | null;
+  model_server_mismatch?: boolean;
+}
+
+export interface CatalogArtifact {
+  revision: string;
+  size_bytes: number;
+  sha256: string;
+  label: string;
+}
+
+export interface ModelLicenseInfo {
+  id: string;
+  name: string;
+  tagline?: string | null;
+  url_ja?: string | null;
+  url_en?: string | null;
+  model_card_url?: string | null;
+  summary_ja: string;
+  disclosure_note_ja?: string | null;
+  requires_agreement: boolean;
+}
+
+export interface ModelLaunchSettings {
+  alias: string;
+  context_length: number;
+  parallel_slots: number;
+  gpu_layers_auto: number;
+  extra_args: string[];
+}
+
+export interface CatalogModel {
+  model_id: string;
+  display_name: string;
+  short_name: string;
+  provider: string;
+  family: string;
+  parameter_size: string;
+  quantization: string;
+  is_default: boolean;
+  source_repo: string;
+  source_repo_type: string;
+  pinned_revision: string;
+  filename: string;
+  relative_subdir: string;
+  download_url: string;
+  model_card_url: string;
+  known_size_bytes: number;
+  known_sha256: string;
+  accepted_artifacts: CatalogArtifact[];
+  supported_backends: string[];
+  expected_gguf_architecture: string;
+  expected_gguf_name_prefix: string;
+  prompt_format: string;
+  prompt_version: string;
+  stop_tokens: string[];
+  context_length_default: number;
+  context_length_max: number;
+  launch_settings: ModelLaunchSettings;
+  catalog_verification_status:
+    | "verified_runtime"
+    | "catalog_verified_runtime_unverified"
+    | "experimental";
+  hardware_note_ja: string;
+  license: ModelLicenseInfo;
+}
+
+export interface ModelVerificationState {
+  file_exists: boolean;
+  format_valid: boolean;
+  hash_status: "matched_known" | "mismatch" | "unverified" | "missing_file";
+  backend_compatible: boolean;
+  launch_verified: boolean;
+  translation_verified: boolean;
+  matched_revision?: string | null;
+  matched_label?: string | null;
+  validation_error?: string | null;
+  validated_at: string;
+}
+
+export interface RegisteredModel {
+  registration_id: string;
+  catalog_model_id: string;
+  display_name: string;
+  short_name: string;
+  provider: string;
+  parameter_size: string;
+  quantization: string;
+  source_type: "downloaded" | "reference" | "managed_copy" | "migrated_legacy";
+  file_path: string;
+  file_name: string;
+  file_size_bytes: number;
+  file_mtime_ns: number;
+  measured_sha256: string;
+  gguf_architecture?: string | null;
+  gguf_model_name?: string | null;
+  verification: ModelVerificationState;
+  license_accepted: boolean;
+  license_accepted_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ModelServerMatchResult {
+  match_status:
+    | "matched"
+    | "matched_same_model_different_path"
+    | "mismatch"
+    | "server_unreachable"
+    | "no_active_model"
+    | "server_path_unverified"
+    | "selected_model_invalid";
+  is_matched: boolean;
+  active_registration_id?: string | null;
+  active_catalog_model_id?: string | null;
+  active_display_name?: string | null;
+  active_file_path?: string | null;
+  active_sha256_prefix?: string | null;
+  running_loaded_alias?: string | null;
+  running_model_path?: string | null;
+  running_model_file?: string | null;
+  running_identified_model_id?: string | null;
+  running_identified_display_name?: string | null;
+  message_ja: string;
+}
+
+export interface ModelDownloadJob {
+  download_id: string;
+  catalog_model_id: string;
+  display_name: string;
+  destination_path: string;
+  status: "downloading" | "verifying" | "completed" | "canceled" | "failed";
+  bytes_downloaded: number;
+  total_bytes: number;
+  percent: number;
+  error?: string | null;
+  registration_id?: string | null;
+  started_at: string;
+  finished_at?: string | null;
+}
+
+export interface ModelsOverviewResponse {
+  catalog: CatalogModel[];
+  unsupported_policies: Record<string, string>;
+  registered: RegisteredModel[];
+  active_model_id?: string | null;
+  active_model?: RegisteredModel | null;
+  has_active_translation_job: boolean;
+  managed_models_dir: string;
+  downloads: ModelDownloadJob[];
+  server_match?: ModelServerMatchResult | null;
+}
+
+export interface ModelSelectResponse {
+  active_model_id: string;
+  selected_model: RegisteredModel;
+  server_match?: ModelServerMatchResult | null;
+}
+
+export interface BrowseLocalModelResponse {
+  canceled: boolean;
+  file_path: string | null;
+}
+
+export interface RegisterLocalModelRequest {
+  file_path: string;
+  expected_catalog_model_id?: string | null;
+  register_mode?: "reference" | "copy";
+  license_accepted: boolean;
+  set_active?: boolean;
+  replaces_registration_id?: string | null;
+}
+
+export interface StartModelDownloadRequest {
+  catalog_model_id: string;
+  license_accepted: boolean;
+  set_active?: boolean;
+  background?: boolean;
 }
 
 export interface AuthSessionResponse {
