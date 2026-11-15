@@ -1542,6 +1542,58 @@ def _rewrite_tounicode_cmap_smp_bytes(raw: bytes) -> bytes:
     return out
 
 
+def _preserve_page_transparency_groups(
+    src_doc: pymupdf.Document,
+    dst_doc: pymupdf.Document,
+    page_pairs: list[tuple[int, int]],
+) -> int:
+    """Copy page-level `/Group` transparency dicts and referenced color spaces from `src_doc` to `dst_doc`.
+
+    PyMuPDF's `insert_pdf()` and `show_pdf_page()` omit each page's `/Group` entry (such as
+    `<< /Type /Group /S /Transparency /CS ... >>`), causing CMYK/ICCBased or isolated-group pages
+    to blend under the default sRGB transparency space on re-render. Grafting the `/Group` object
+    via a shared `Graftmap` remaps all referenced indirect objects (e.g., `/ICCBased` streams)
+    into `dst_doc` cleanly, preserves attributes (`/CS`, `/S`, `/Type`, `/I`, `/K`), and
+    deduplicates shared ICC profile streams across pages without hardcoding resource names or xrefs.
+    All low-level MuPDF handles remain local so file descriptors release cleanly on close.
+    """
+    mupdf = getattr(pymupdf, "mupdf", None)
+    if mupdf is None or not page_pairs:
+        return 0
+    src_pdf = mupdf.pdf_specifics(src_doc.this)
+    dst_pdf = mupdf.pdf_specifics(dst_doc.this)
+    gmap = pymupdf.Graftmap(dst_doc)
+    restored = 0
+    src_len = len(src_doc)
+    dst_len = len(dst_doc)
+    for src_idx, dst_idx in page_pairs:
+        if src_idx < 0 or src_idx >= src_len or dst_idx < 0 or dst_idx >= dst_len:
+            continue
+        src_page_obj = mupdf.pdf_lookup_page_obj(src_pdf, src_idx)
+        src_group = mupdf.pdf_dict_gets(src_page_obj, "Group")
+        if src_group is None or getattr(src_group, "m_internal", None) is None or mupdf.pdf_is_null(src_group):
+            continue
+        if hasattr(mupdf, "pdf_is_dict") and not mupdf.pdf_is_dict(src_group):
+            continue
+        dst_page_obj = mupdf.pdf_lookup_page_obj(dst_pdf, dst_idx)
+        existing_group = mupdf.pdf_dict_gets(dst_page_obj, "Group")
+        if (
+            existing_group is not None
+            and getattr(existing_group, "m_internal", None) is not None
+            and not mupdf.pdf_is_null(existing_group)
+        ):
+            continue
+        dst_group = mupdf.pdf_graft_mapped_object(gmap.this, src_group)
+        if (
+            dst_group is not None
+            and getattr(dst_group, "m_internal", None) is not None
+            and not mupdf.pdf_is_null(dst_group)
+        ):
+            mupdf.pdf_dict_puts(dst_page_obj, "Group", dst_group)
+            restored += 1
+    return restored
+
+
 def _collect_document_tounicode_xrefs(doc: pymupdf.Document) -> set[int]:
     """Return the set of all `/ToUnicode` stream xrefs currently referenced anywhere in `doc`."""
     tu_xrefs: set[int] = set()
@@ -3820,6 +3872,11 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 target_font_tags=("F_JA", "F_MATH"),
                 protected_tounicode_xrefs=orig_tounicode_xrefs,
             )
+            _preserve_page_transparency_groups(
+                src_doc,
+                out_doc,
+                [(i, i) for i in range(min(len(src_doc), len(out_doc)))],
+            )
 
             if mono_output_path:
                 mono_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3868,9 +3925,12 @@ class NativePreservingAdapter(PdfEngineAdapter):
         src = pymupdf.open(str(original_path))
         dst = pymupdf.open()
         try:
+            page_pairs: list[tuple[int, int]] = []
             for idx in page_indices:
                 if 0 <= idx < len(src):
                     dst.insert_pdf(src, from_page=idx, to_page=idx)
+                    page_pairs.append((idx, len(dst) - 1))
+            _preserve_page_transparency_groups(src, dst, page_pairs)
             dst.save(str(temp_path), garbage=1, deflate=True)
         finally:
             dst.close()
@@ -3894,6 +3954,8 @@ class NativePreservingAdapter(PdfEngineAdapter):
         dual_doc = pymupdf.open()
 
         try:
+            orig_group_pairs: list[tuple[int, int]] = []
+            trans_group_pairs: list[tuple[int, int]] = []
             for out_idx, p_idx in enumerate(page_indices):
                 if p_idx < 0 or p_idx >= len(orig_doc):
                     continue
@@ -3903,11 +3965,16 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 h = float(orig_page.rect.height)
 
                 new_page = dual_doc.new_page(width=w * 2.0, height=h)
+                dual_page_idx = len(dual_doc) - 1
                 left_rect = pymupdf.Rect(0, 0, w, h)
                 right_rect = pymupdf.Rect(w, 0, w * 2.0, h)
                 new_page.show_pdf_page(left_rect, orig_doc, p_idx)
+                orig_group_pairs.append((p_idx, dual_page_idx))
                 if 0 <= trans_page_idx < len(trans_doc):
                     new_page.show_pdf_page(right_rect, trans_doc, trans_page_idx)
+                    trans_group_pairs.append((trans_page_idx, dual_page_idx))
+            _preserve_page_transparency_groups(orig_doc, dual_doc, orig_group_pairs)
+            _preserve_page_transparency_groups(trans_doc, dual_doc, trans_group_pairs)
             dual_doc.save(str(temp_dual), garbage=2, deflate=True)
         finally:
             dual_doc.close()
