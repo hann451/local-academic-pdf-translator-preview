@@ -178,6 +178,17 @@ class ProtectedItem(BaseModel):
         return [float(x) for x in v]
 
 
+class InlineMathSubRun(BaseModel):
+    """Per-character hierarchical script run inside InlineMathSpan.target_text (0-based offsets)."""
+
+    start: int = Field(..., ge=0)
+    end: int = Field(..., gt=0)
+    role: Literal["super", "sub"]
+    level: int = Field(..., ge=1)
+    scale: float = Field(..., gt=0)
+    dy_em: float
+
+
 class InlineMathSpan(BaseModel):
     """Structured geometric/typographic annotation for an inline mathematical element
     (superscript, subscript, circumflex hat over base symbol, or radical vinculum overbar)
@@ -216,6 +227,20 @@ class InlineMathSpan(BaseModel):
             "Optional 0-based word-boundary occurrence indices in block.source_text "
             "where this span is geometry-confirmed as script (used to mask math variables "
             "like `a_t` without corrupting colliding prose stopwords like `starts at`)."
+        ),
+    )
+    sub_runs: list[InlineMathSubRun] = Field(
+        default_factory=list,
+        description=(
+            "Optional hierarchical per-character sub-runs within target_text when nested "
+            "scripts (e.g., Level-1 subscript containing Level-2 sub-subscript) are present."
+        ),
+    )
+    unrepresentable_reason: str | None = Field(
+        default=None,
+        description=(
+            "Set when the inline math structure exceeds safely representable nesting/layout "
+            "(e.g. nesting depth >= 3) so rendering falls back to the original PDF."
         ),
     )
 

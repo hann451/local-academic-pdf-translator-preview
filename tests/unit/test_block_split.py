@@ -395,3 +395,136 @@ def test_db_manual_clear_consistency_and_atomic_rollback(tmp_path: Path) -> None
     assert [b.id for b in db.list_blocks(doc.id)] == ["b1"]
     assert db.get_document(doc.id).parse_revision == 0
     assert len(db.list_validation_issues("job-1")) == 1
+
+
+def test_eq4_rising_width_drag_split_and_t1_t2_preservation(tmp_path: Path) -> None:
+    """Dragging Eq.(4) ('Rising width = ... (4)') separates the protected formula
+    from the following prose ('Here, a_{t_1,t_2} represents ... from t_1 to t_2.'),
+    masks t_1/t_2 and a_{t_1,t_2}, and renders L1/L2 nested subscripts in the output PDF.
+    """
+    pdf_path = tmp_path / "eq4_split.pdf"
+    d = pymupdf.open()
+    pg = d.new_page(width=595, height=842)
+    f_helv = pymupdf.Font("helv")
+
+    def _emit_runs(start_x: float, base_y: float, runs: list[tuple[str, float, float]]) -> None:
+        cur_x = start_x
+        for txt, fs, dy in runs:
+            pg.insert_text((cur_x, base_y + dy), txt, fontsize=fs, fontname="helv")
+            cur_x += f_helv.text_length(txt, fontsize=fs) + 0.1
+
+    y_eq = 320.0
+    _emit_runs(
+        315.0,
+        y_eq,
+        [
+            ("Rising width = mean(a", 9.96, 0.0),
+            ("t", 6.97, 1.5),
+            ("0", 4.98, 2.5),
+            (",t", 6.97, 1.5),
+            ("0", 4.98, 2.5),
+            ("+9", 6.97, 1.5),
+            (") − mean(a", 9.96, 0.0),
+            ("t", 6.97, 1.5),
+            ("0", 4.98, 2.5),
+            ("−10,t", 6.97, 1.5),
+            ("0", 4.98, 2.5),
+            ("−1", 6.97, 1.5),
+            (")(4)", 9.96, 0.0),
+        ],
+    )
+
+    y_prose = y_eq + 12.5
+    _emit_runs(
+        315.0,
+        y_prose,
+        [
+            ("Here, a", 9.96, 0.0),
+            ("t", 6.97, 1.5),
+            ("1", 4.98, 2.5),
+            (",t", 6.97, 1.5),
+            ("2", 4.98, 2.5),
+            (" represents the data from t", 9.96, 0.0),
+            ("1", 6.97, 1.5),
+            (" to t", 9.96, 0.0),
+            ("2", 6.97, 1.5),
+            (".", 9.96, 0.0),
+        ],
+    )
+    d.save(str(pdf_path))
+    d.close()
+
+    doc = _make_doc(pdf_path, doc_id="doc-eq4-unit")
+    adapter = NativePreservingAdapter(config=AppConfig(runtime_dir=tmp_path / "rt_eq4"))
+    initial_blocks = adapter.parse_and_extract_blocks(doc, [0])
+    target_parent = next(b for b in initial_blocks if "Rising width" in b.source_text)
+    assert "Here," in target_parent.source_text
+
+    drag_bbox = [310.0, y_eq - 9.0, 545.0, y_eq + 3.0]
+    preview = adapter.preview_block_split(doc, 0, drag_bbox)
+    assert preview.valid, preview.rejection_reason
+    spec = BlockSplitSpec(
+        id="split-eq4",
+        document_id=doc.id,
+        page_index=0,
+        parent_block_id=target_parent.id,
+        parent_bbox=target_parent.bbox,
+        parent_source_hash=target_parent.source_text_hash,
+        requested_bbox=drag_bbox,
+        snapped_bbox=preview.snapped_bbox,
+    )
+    split_blocks = adapter.parse_and_extract_blocks(doc, [0], split_specs=[spec])
+    f_blk = next(b for b in split_blocks if b.split_role == "formula")
+    bot_blk = next(b for b in split_blocks if b.split_role == "bottom")
+    assert f_blk.status == BlockStatus.PROTECTED_SKIP
+    assert "Rising width" in f_blk.source_text
+    assert bot_blk.status == BlockStatus.PENDING
+    assert "Here," in bot_blk.source_text
+    origs = [it.original_text for it in bot_blk.protected_items]
+    assert origs == ["at1,t2", "t1", "t2"]
+    at12_span = next(m for m in bot_blk.inline_math_spans if m.context_text == "at1,t2")
+    assert [sr.level for sr in at12_span.sub_runs] == [1, 2, 1, 2]
+
+    from backend.domain.models import TranslationJobConfig
+
+    bot_tr = bot_blk.model_copy(
+        update={
+            "translation_text": "ここで、{v1} は {v2} から {v3} までのデータを表す。",
+            "status": BlockStatus.TRANSLATED,
+        }
+    )
+    export_blocks = [b if b.id != bot_blk.id else bot_tr for b in split_blocks]
+    mono_out = tmp_path / "eq4_mono.pdf"
+    dual_out = tmp_path / "eq4_dual.pdf"
+    updated, issues = adapter.typeset_and_export(
+        document=doc,
+        blocks=export_blocks,
+        page_indices=[0],
+        job_config=TranslationJobConfig(output_mono_pdf=True, output_dual_pdf=True),
+        mono_output_path=mono_out,
+        dual_output_path=dual_out,
+        job_id="job-eq4",
+    )
+    assert not issues
+    fitted_bot = (
+        next(b for b in updated if b.id == bot_blk.id).fitted_font_size_pt or 9.0
+    )
+    d_mono = pymupdf.open(str(mono_out))
+    bot_pd = d_mono[0].get_text("dict", clip=pymupdf.Rect(*bot_blk.bbox))
+    eq_txt = d_mono[0].get_text("text", clip=pymupdf.Rect(*f_blk.bbox))
+    d_mono.close()
+    assert "Rising width" in eq_txt
+    spans = [
+        s
+        for bi in bot_pd["blocks"]
+        if bi.get("type") == 0
+        for ln in bi["lines"]
+        for s in ln["spans"]
+    ]
+    sub_1_l2 = [s for s in spans if s["text"] == "1" and s["size"] < fitted_bot * 0.68]
+    sub_2_l2 = [s for s in spans if s["text"] == "2" and s["size"] < fitted_bot * 0.68]
+    sub_1_l1 = [s for s in spans if s["text"] == "1" and fitted_bot * 0.68 <= s["size"] < fitted_bot * 0.85]
+    sub_2_l1 = [s for s in spans if s["text"] == "2" and fitted_bot * 0.68 <= s["size"] < fitted_bot * 0.85]
+    assert sub_1_l2 and sub_2_l2 and sub_1_l1 and sub_2_l1
+    assert sub_1_l2[0]["origin"][1] > sub_1_l1[0]["origin"][1] + 0.3
+    assert sub_2_l2[0]["origin"][1] > sub_2_l1[0]["origin"][1] + 0.3

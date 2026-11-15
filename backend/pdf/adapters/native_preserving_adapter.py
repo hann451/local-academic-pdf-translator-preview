@@ -38,6 +38,7 @@ from backend.domain.models import (
     BlockStatus,
     Document,
     InlineMathSpan,
+    InlineMathSubRun,
     IssueSeverity,
     ProtectedItem,
     ProtectedItemKind,
@@ -200,17 +201,24 @@ _MATH_FUNC_CALL = (
     + _NON_PROSE_ARG
     + r"|(?!(?:"
     + _PROSE_SHORT_WORDS
-    + r")\b)[A-Za-z]{1,2}(?:[′″']+)+"
+    + r")\b)(?:"
+    + _HAT_CHARS
+    + r"\s*)?[A-Za-z]{1,2}(?:[′″']+)+"
     + _SUBSUP_TAIL
     + r"\([^()\n]+\)"
     + r"|(?!(?:"
     + _PROSE_SHORT_WORDS
-    + r")\b)[A-Za-z]{1,2}"
+    + r")\b)(?:"
+    + _HAT_CHARS
+    + r"\s*)?[A-Za-z]{1,2}"
     + _SUBSUP_TAIL
     + _NON_PROSE_ARG
     + r")"
 )
 _MATH_SET_ATOM = r"\{(?!v\d+\})[^}\n]*" + _SMP_OR_GREEK_OR_OP + r"[^}\n]*\}"
+_MATH_NORM_ATOM = (
+    r"∥(?![^\n∥]*\b[A-Za-z]{4,}\s+[A-Za-z]{4,}\b)[^∥\n]{1,48}∥" + _SUBSUP_TAIL
+)
 _MATH_DIM_ATOM = r"\b\d+(?:\.\d+)?(?:\s*[×±]\s*\d+(?:\.\d+)?)+\b"
 _MATH_SCI_ATOM = (
     r"(?<![A-Za-z\U0001d400-\U0001d7ff])\d+(?:\.\d+)?(?:e|E|\U0001d452)[+\-−]?\d+\b"
@@ -231,6 +239,8 @@ _MATH_ASCII_SUBSUP_ATOM = (
 _MATH_ATOM = (
     r"(?:"
     + _MATH_SET_ATOM
+    + r"|"
+    + _MATH_NORM_ATOM
     + r"|"
     + _MATH_FUNC_CALL
     + r"|"
@@ -409,6 +419,144 @@ def _merge_horizontal_visual_lines(raw_lines: list[dict]) -> list[dict]:
     return merged
 
 
+def _sub_runs_signature(
+    sub_runs: list[InlineMathSubRun],
+) -> tuple[tuple[int, int, str, int], ...]:
+    """Return a canonical structural signature for nested script sub-runs."""
+    return tuple((sr.start, sr.end, sr.role, sr.level) for sr in sub_runs)
+
+
+def _build_script_sub_runs(
+    part_records: list[tuple[str, float, float]],
+    role_lit: Literal["super", "sub"],
+    base_sz: float,
+    lead_ws: int,
+    end_ws_limit: int,
+) -> tuple[list[InlineMathSubRun], str | None]:
+    """Classify span size/offset tiers inside a compound super/sub group into L1/L2 `InlineMathSubRun`s.
+
+    Returns `(sub_runs, unrepresentable_reason)`. Single-tier L1 scripts yield `([], None)`.
+    Nesting depth >= 3 sets `unrepresentable_reason="UNREPRESENTABLE_DEEP_NESTED_MATH"`
+    so rendering falls back explicitly instead of silently flattening deep scripts.
+    """
+    non_ws_sizes = [p_sz for p_t, p_sz, _ in part_records if p_t.strip()]
+    if not non_ws_sizes:
+        return [], None
+    l1_sz = max(non_ws_sizes)
+    tier2_sizes = [sz for sz in non_ws_sizes if sz < l1_sz * 0.84]
+    if not tier2_sizes:
+        return [], None
+    l2_sz = max(tier2_sizes)
+    if any(sz < l2_sz * 0.84 for sz in tier2_sizes):
+        return [], "UNREPRESENTABLE_DEEP_NESTED_MATH"
+
+    t1_oys = [
+        p_oy for p_t, p_sz, p_oy in part_records if p_t.strip() and p_sz >= l1_sz * 0.84
+    ]
+    l1_ref_oy = statistics.median(t1_oys) if t1_oys else part_records[0][2]
+
+    sub_runs: list[InlineMathSubRun] = []
+    raw_cursor = 0
+    for p_t, p_sz, p_oy in part_records:
+        raw_s = raw_cursor
+        raw_e = raw_cursor + len(p_t)
+        raw_cursor = raw_e
+        cs = max(raw_s, lead_ws) - lead_ws
+        ce = min(raw_e, end_ws_limit) - lead_ws
+        if cs >= ce:
+            continue
+        if not p_t.strip() or p_sz >= l1_sz * 0.84:
+            sr_role: Literal["super", "sub"] = role_lit
+            sr_level = 1
+            sr_scale = 0.78
+            sr_dy = -0.29 if role_lit == "super" else 0.18
+        else:
+            sr_level = 2
+            sr_scale = round(
+                max(0.42, min(0.78 * 0.82, 0.78 * (p_sz / max(l1_sz, 1e-3)))),
+                3,
+            )
+            delta_oy_em = (p_oy - l1_ref_oy) / max(base_sz, 1e-3)
+            if role_lit == "sub":
+                if delta_oy_em >= 0.03:
+                    sr_role = "sub"
+                    sr_dy = round(0.18 + max(0.08, min(0.16, delta_oy_em)), 3)
+                elif delta_oy_em <= -0.03:
+                    sr_role = "super"
+                    sr_dy = round(0.18 + min(-0.07, max(-0.14, delta_oy_em)), 3)
+                else:
+                    sr_role = "sub"
+                    sr_dy = 0.18
+            else:
+                if delta_oy_em <= -0.03:
+                    sr_role = "super"
+                    sr_dy = round(-0.29 + min(-0.08, max(-0.16, delta_oy_em)), 3)
+                elif delta_oy_em >= 0.03:
+                    sr_role = "sub"
+                    sr_dy = round(-0.29 + max(0.07, min(0.14, delta_oy_em)), 3)
+                else:
+                    sr_role = "super"
+                    sr_dy = -0.29
+
+        if (
+            sub_runs
+            and sub_runs[-1].end == cs
+            and sub_runs[-1].role == sr_role
+            and sub_runs[-1].level == sr_level
+            and sub_runs[-1].scale == sr_scale
+            and sub_runs[-1].dy_em == sr_dy
+        ):
+            sub_runs[-1] = sub_runs[-1].model_copy(update={"end": ce})
+        else:
+            sub_runs.append(
+                InlineMathSubRun(
+                    start=cs,
+                    end=ce,
+                    role=sr_role,
+                    level=sr_level,
+                    scale=sr_scale,
+                    dy_em=sr_dy,
+                )
+            )
+    return sub_runs, None
+
+
+def _is_maskable_math_script_span(
+    prev_span_dict: dict | None,
+    base_tok: str,
+    group_text: str,
+    role_lit: Literal["super", "sub"],
+) -> bool:
+    """Return True if a base+script math token (e.g. `h_t`, `t_0`, `t_N`, `a_t`) should be masked,
+    while excluding English ordinals (`1st`, `2nd`) and upright prose footnotes (`method^1`).
+    """
+    if role_lit == "super" and base_tok.isdigit():
+        if group_text.lower() in ("st", "nd", "rd", "th"):
+            return False
+    prev_font = str(prev_span_dict.get("font", "")).lower() if prev_span_dict else ""
+    prev_is_math_font = any(
+        tok in prev_font for tok in ("cmmi", "cmsy", "cmex", "math", "italic", "oblique")
+    ) or bool(re.search(r"[\u0370-\u03ff\U0001d400-\U0001d7ff]", base_tok))
+    if role_lit == "super" and not prev_is_math_font:
+        if (
+            base_tok.isdigit()
+            and len(base_tok) >= 3
+            and re.fullmatch(r"[0-9,\s]+", group_text)
+        ):
+            return False
+        if (
+            base_tok.isascii()
+            and base_tok.isalpha()
+            and re.fullmatch(r"[0-9,\-−–\s*∗†‡§¶]+", group_text)
+            and (
+                (len(base_tok) >= 3 and not re.fullmatch(_KNOWN_MATH_FUNCS, base_tok))
+                or base_tok.lower() in _PROSE_STOPWORD_SET
+            )
+        ):
+            return False
+    return True
+
+
 def extract_inline_math_spans(
     raw_lines: list[dict],
     page_drawings: list[dict] | None = None,
@@ -445,18 +593,28 @@ def extract_inline_math_spans(
     block_text = " ".join(block_line_parts)
 
     spans_out: list[InlineMathSpan] = []
-    seen_keys: set[tuple[str, str, str]] = set()
+    seen_keys: set[tuple[str, str, str, tuple[tuple[int, int, str, int], ...]]] = set()
     script_char_ranges: dict[tuple[str, str, str], list[tuple[int, int]]] = {}
+    maskable_script_keys: set[tuple[str, str, str]] = set()
 
     def _add(
         item: InlineMathSpan,
         script_range: tuple[int, int] | None = None,
+        maskable: bool = False,
     ) -> None:
-        key = (item.role, item.context_text, item.target_text)
+        base_key = (item.role, item.context_text, item.target_text)
+        sig_key = (
+            item.role,
+            item.context_text,
+            item.target_text,
+            _sub_runs_signature(item.sub_runs),
+        )
         if script_range is not None:
-            script_char_ranges.setdefault(key, []).append(script_range)
-        if key not in seen_keys:
-            seen_keys.add(key)
+            script_char_ranges.setdefault(base_key, []).append(script_range)
+        if maskable:
+            maskable_script_keys.add(base_key)
+        if sig_key not in seen_keys:
+            seen_keys.add(sig_key)
             spans_out.append(item)
 
     for line_idx, line in enumerate(lines):
@@ -644,36 +802,78 @@ def extract_inline_math_spans(
                     role_lit: Literal["super", "sub"] = "super" if is_sup else "sub"
                     dy_val = -0.29 if is_sup else 0.18
 
-                    # Group contiguous same-role script spans (e.g., nested `t_0` inside `a_{t_0-10,t_0-1}`,
-                    # decimals/units `t_{1.5s}`, and comma/operator lists `,t_0+9`) into a single compound run.
+                    # Group contiguous same-role script spans (plus smaller-tier Level-2 nested scripts
+                    # even when their offset sits near/across baseline_y without rewinding under base)
+                    # into a single compound run tracking tier sizes and y-origins.
                     end_idx = cur_idx
-                    script_parts: list[str] = [raw_t.lstrip()]
+                    cur_s_orig = s.get("origin")
+                    cur_oy = (
+                        float(cur_s_orig[1])
+                        if isinstance(cur_s_orig, (list, tuple)) and len(cur_s_orig) >= 2
+                        else baseline_y
+                    )
+                    cur_sz = float(s.get("size", 10.0))
+                    part_records: list[tuple[str, float, float]] = [
+                        (raw_t.lstrip(), cur_sz, cur_oy)
+                    ]
+                    l1_anchor_sz = cur_sz
                     while end_idx + 1 < len(spans):
                         nxt = end_idx + 1
                         prev_box = spans[end_idx].get("bbox")
                         if not (isinstance(prev_box, (list, tuple)) and len(prev_box) == 4):
                             break
+                        nxt_s = spans[nxt]
                         nxt_role = span_roles[nxt]
+                        nxt_box = nxt_s.get("bbox")
+                        nxt_raw = normalize_for_pdf_rendering(str(nxt_s.get("text", "")))
+                        nxt_st = nxt_raw.strip()
+                        nxt_sz = float(nxt_s.get("size", 10.0))
+                        nxt_orig = nxt_s.get("origin")
+                        nxt_oy = (
+                            float(nxt_orig[1])
+                            if isinstance(nxt_orig, (list, tuple)) and len(nxt_orig) >= 2
+                            else baseline_y
+                        )
                         if nxt_role == role_lit:
-                            nxt_box = spans[nxt].get("bbox")
                             if not (isinstance(nxt_box, (list, tuple)) and len(nxt_box) == 4):
                                 break
                             gap_x = float(nxt_box[0]) - float(prev_box[2])
                             if -max_sz * 0.30 <= gap_x <= max(2.5, max_sz * 0.40):
-                                script_parts.append(
-                                    normalize_for_pdf_rendering(str(spans[nxt].get("text", "")))
-                                )
+                                part_records.append((nxt_raw, nxt_sz, nxt_oy))
+                                l1_anchor_sz = max(l1_anchor_sz, nxt_sz)
                                 end_idx = nxt
                                 continue
                             break
                         if (
+                            nxt_role in ("normal", "super", "sub")
+                            and isinstance(nxt_box, (list, tuple))
+                            and len(nxt_box) == 4
+                            and nxt_sz < l1_anchor_sz * 0.84
+                            and nxt_st not in ("", "ˆ")
+                            and not _EQUATION_NUM_ONLY_RE.match(nxt_raw)
+                        ):
+                            gap_x = float(nxt_box[0]) - float(prev_box[2])
+                            not_rewound = (
+                                nxt_role == "normal"
+                                or float(nxt_box[0]) >= float(prev_box[0]) + 0.5
+                            )
+                            if (
+                                not_rewound
+                                and not (nxt_raw[0].isspace() and gap_x > max_sz * 0.15)
+                                and -max_sz * 0.15 <= gap_x <= max(1.5, max_sz * 0.25)
+                            ):
+                                part_records.append((nxt_raw, nxt_sz, nxt_oy))
+                                end_idx = nxt
+                                continue
+                        if (
                             nxt_role == "space"
                             and nxt + 1 < len(spans)
                             and span_roles[nxt + 1] == role_lit
-                            and float(spans[nxt].get("size", 10.0)) < max_sz * 0.86
-                            and len(str(spans[nxt].get("text", ""))) <= 2
+                            and nxt_sz < max_sz * 0.86
+                            and len(str(nxt_s.get("text", ""))) <= 2
                         ):
-                            nxt2_box = spans[nxt + 1].get("bbox")
+                            nxt2_s = spans[nxt + 1]
+                            nxt2_box = nxt2_s.get("bbox")
                             if (
                                 isinstance(nxt2_box, (list, tuple))
                                 and len(nxt2_box) == 4
@@ -681,19 +881,37 @@ def extract_inline_math_spans(
                                 <= (float(nxt2_box[0]) - float(prev_box[2]))
                                 <= max(2.5, max_sz * 0.40)
                             ):
-                                script_parts.append(
-                                    normalize_for_pdf_rendering(str(spans[nxt].get("text", "")))
+                                nxt2_raw = normalize_for_pdf_rendering(
+                                    str(nxt2_s.get("text", ""))
                                 )
-                                script_parts.append(
-                                    normalize_for_pdf_rendering(str(spans[nxt + 1].get("text", "")))
+                                nxt2_sz = float(nxt2_s.get("size", 10.0))
+                                nxt2_orig = nxt2_s.get("origin")
+                                nxt2_oy = (
+                                    float(nxt2_orig[1])
+                                    if isinstance(nxt2_orig, (list, tuple))
+                                    and len(nxt2_orig) >= 2
+                                    else baseline_y
                                 )
+                                part_records.append((nxt_raw, nxt_sz, nxt_oy))
+                                part_records.append((nxt2_raw, nxt2_sz, nxt2_oy))
+                                l1_anchor_sz = max(l1_anchor_sz, nxt2_sz)
                                 end_idx = nxt + 1
                                 continue
                         break
 
-                    group_text = "".join(script_parts).strip()
+                    raw_group = "".join(p_t for p_t, _, _ in part_records)
+                    lead_ws = len(raw_group) - len(raw_group.lstrip())
+                    group_text = raw_group.strip()
                     if not group_text:
                         continue
+                    end_ws_limit = lead_ws + len(group_text)
+                    sub_runs, unrep_reason = _build_script_sub_runs(
+                        part_records=part_records,
+                        role_lit=role_lit,
+                        base_sz=max_sz,
+                        lead_ws=lead_ws,
+                        end_ws_limit=end_ws_limit,
+                    )
                     r0 = span_global_ranges.get((line_idx, cur_idx))
                     r1 = span_global_ranges.get((line_idx, end_idx))
                     script_rng: tuple[int, int] | None = None
@@ -716,8 +934,13 @@ def extract_inline_math_spans(
                                 role=role_lit,
                                 scale=0.78,
                                 dy_em=dy_val,
+                                sub_runs=sub_runs,
+                                unrepresentable_reason=unrep_reason,
                             ),
                             script_range=script_rng,
+                            maskable=_is_maskable_math_script_span(
+                                None, prev_script[0], group_text, role_lit
+                            ),
                         )
                         _add(
                             InlineMathSpan(
@@ -726,8 +949,13 @@ def extract_inline_math_spans(
                                 role=role_lit,
                                 scale=0.78,
                                 dy_em=dy_val,
+                                sub_runs=sub_runs,
+                                unrepresentable_reason=unrep_reason,
                             ),
                             script_range=script_rng,
+                            maskable=_is_maskable_math_script_span(
+                                None, prev_script[0], group_text, role_lit
+                            ),
                         )
                         idx = end_idx + 1
                     elif prev_script is not None:
@@ -743,6 +971,9 @@ def extract_inline_math_spans(
                         p_tok = p_parts[-1] if p_parts else ""
                         if p_tok:
                             base_tok = p_tok + "∗"
+                            is_m = _is_maskable_math_script_span(
+                                spans[pps_idx], p_tok, group_text, role_lit
+                            )
                             _add(
                                 InlineMathSpan(
                                     context_text=f"{base_tok} {group_text}",
@@ -750,8 +981,11 @@ def extract_inline_math_spans(
                                     role=role_lit,
                                     scale=0.78,
                                     dy_em=dy_val,
+                                    sub_runs=sub_runs,
+                                    unrepresentable_reason=unrep_reason,
                                 ),
                                 script_range=script_rng,
+                                maskable=is_m,
                             )
                             _add(
                                 InlineMathSpan(
@@ -760,8 +994,11 @@ def extract_inline_math_spans(
                                     role=role_lit,
                                     scale=0.78,
                                     dy_em=dy_val,
+                                    sub_runs=sub_runs,
+                                    unrepresentable_reason=unrep_reason,
                                 ),
                                 script_range=script_rng,
+                                maskable=is_m,
                             )
                             idx = end_idx + 1
                     else:
@@ -784,8 +1021,13 @@ def extract_inline_math_spans(
                                     role=role_lit,
                                     scale=0.78,
                                     dy_em=dy_val,
+                                    sub_runs=sub_runs,
+                                    unrepresentable_reason=unrep_reason,
                                 ),
                                 script_range=script_rng,
+                                maskable=_is_maskable_math_script_span(
+                                    ps, base_tok, group_text, role_lit
+                                ),
                             )
                             idx = end_idx + 1
 
@@ -795,11 +1037,17 @@ def extract_inline_math_spans(
     # Instead of silently dropping spans into flat plain text, mark conflicting spans `ambiguous=True`
     # so `typeset_and_export` safely falls back to original PDF with an explicit warning before redaction.
     if spans_out:
-        variants_by_ctx: dict[str, set[tuple[str, str]]] = {}
+        variants_by_ctx: dict[
+            str, set[tuple[str, str, tuple[tuple[int, int, str, int], ...]]]
+        ] = {}
         for item in spans_out:
             if item.role in ("super", "sub"):
                 variants_by_ctx.setdefault(item.context_text, set()).add(
-                    (item.role, item.target_text)
+                    (
+                        item.role,
+                        item.target_text,
+                        _sub_runs_signature(item.sub_runs),
+                    )
                 )
         if variants_by_ctx:
             normal_chunks: list[list[tuple[str, bool]]] = []
@@ -900,7 +1148,7 @@ def extract_inline_math_spans(
                             found_non_stopword_match = True
                             break
                     if found_non_stopword_match:
-                        vset.add(("normal", ctx))
+                        vset.add(("normal", ctx, ()))
                         break
 
             final_spans: list[InlineMathSpan] = []
@@ -914,11 +1162,15 @@ def extract_inline_math_spans(
                             final_spans.append(item.model_copy(update={"ambiguous": True}))
                         continue
                     ctx_clean = item.context_text.strip()
-                    if ctx_clean and ctx_clean.lower() in _PROSE_STOPWORD_SET:
-                        ranges = script_char_ranges.get(
-                            (item.role, item.context_text, item.target_text),
-                            [],
-                        )
+                    tgt_clean = item.target_text.strip()
+                    base_key = (item.role, item.context_text, item.target_text)
+                    is_compound_tgt = any(ch in tgt_clean for ch in ",+-−*/.")
+                    should_compute_occ = bool(ctx_clean) and not is_compound_tgt and (
+                        ctx_clean.lower() in _PROSE_STOPWORD_SET
+                        or base_key in maskable_script_keys
+                    )
+                    if should_compute_occ:
+                        ranges = script_char_ranges.get(base_key, [])
                         if ranges and block_text:
                             pat = _build_math_span_boundary_regex(ctx_clean)
                             occ_indices = [
@@ -1041,6 +1293,14 @@ def _build_styled_line_plan(
                         char_role[k] = mspan.role
                         char_scale[k] = mspan.scale
                         char_dy_em[k] = mspan.dy_em
+                    if mspan.sub_runs:
+                        for sr in mspan.sub_runs:
+                            s0 = max(0, sr.start)
+                            s1 = min(len(tgt), sr.end)
+                            for rel_k in range(s0, s1):
+                                k = t0 + rel_k
+                                char_scale[k] = sr.scale
+                                char_dy_em[k] = sr.dy_em
                 elif mspan.role == "radicand" and mspan.overbar and ctx.endswith(tgt):
                     t1 = pos + len(ctx)
                     t0 = t1 - len(tgt)
@@ -1179,6 +1439,10 @@ def _build_styled_line_plan(
     bot_em = 0.22
     if any(r == "sub" for r in char_role):
         bot_em = max(bot_em, 0.36)
+    for idx_c in range(n):
+        if char_role[idx_c] in ("super", "sub", "hat"):
+            top_em = max(top_em, round(-char_dy_em[idx_c] + 0.76 * char_scale[idx_c], 3))
+            bot_em = max(bot_em, round(char_dy_em[idx_c] + 0.24 * char_scale[idx_c], 3))
 
     return styled_runs, overbars, max_rendered_x1, top_em, bot_em
 
@@ -3315,6 +3579,32 @@ class NativePreservingAdapter(PdfEngineAdapter):
                             )
                             continue
 
+                    # Pre-redaction check 3b: Refuse to flatten depth >= 3 or unrepresentable nested math
+                    unrep_ctxs = sorted(
+                        {
+                            ms.context_text
+                            for ms in active_math_spans
+                            if ms.unrepresentable_reason and ms.context_text in render_ready_text
+                        }
+                    )
+                    if unrep_ctxs:
+                        if blk.status == BlockStatus.MANUALLY_EDITED:
+                            unrep_set = set(unrep_ctxs)
+                            active_math_spans = [
+                                ms for ms in active_math_spans if ms.context_text not in unrep_set
+                            ]
+                        else:
+                            _record_fallback(
+                                blk,
+                                "UNREPRESENTABLE_DEEP_NESTED_MATH_FALLBACK",
+                                (
+                                    f"安全に表現できない多重ネスト添字（{unrep_ctxs}）を含むため、"
+                                    "階層構造を潰さず原文要素を保持しました（要手動確認）。"
+                                ),
+                                {"unrepresentable_contexts": unrep_ctxs},
+                            )
+                            continue
+
                     # Fit Japanese lines within bbox respecting min_font_size_pt (Section 12).
                     # For split siblings adjacent to a protected formula seam, shift line 1 baseline
                     # down slightly (accounting for CJK ascender ~1.14em) and tighten vertical slack
@@ -3346,6 +3636,39 @@ class NativePreservingAdapter(PdfEngineAdapter):
                                 "min_font_size_pt": job_config.min_font_size_pt,
                                 "restored_text": restored_text,
                             },
+                        )
+                        continue
+
+                    compact_render = re.sub(r"\s+", "", render_ready_text)
+                    broken_nested_ctxs = sorted(
+                        {
+                            ms.context_text
+                            for ms in blk.inline_math_spans
+                            if not ms.ambiguous
+                            and any(sr.level >= 2 for sr in ms.sub_runs)
+                            and (
+                                ms.context_text in render_ready_text
+                                or (
+                                    len(re.sub(r"\s+", "", normalize_for_pdf_rendering(ms.context_text))) >= 4
+                                    and ms.context_text in blk.source_text
+                                    and re.sub(r"\s+", "", normalize_for_pdf_rendering(ms.context_text)) in compact_render
+                                )
+                            )
+                            and not any(
+                                normalize_for_pdf_rendering(ms.context_text) in wline
+                                for wline in wrapped_lines
+                            )
+                        }
+                    )
+                    if broken_nested_ctxs:
+                        _record_fallback(
+                            blk,
+                            "INLINE_MATH_HIERARCHY_FALLBACK",
+                            (
+                                f"ネスト添字を含む数式表現（{broken_nested_ctxs}）が折り返し行境界で分断され、"
+                                "階層構造を保持して組版できないため原文要素を保持しました。"
+                            ),
+                            {"broken_nested_contexts": broken_nested_ctxs},
                         )
                         continue
 
@@ -3665,6 +3988,8 @@ TYPESETTING_ISSUE_CODES: frozenset[str] = frozenset(
         "UNRESOLVED_PLACEHOLDER_FALLBACK",
         "UNRENDERABLE_GLYPH_FALLBACK",
         "AMBIGUOUS_INLINE_MATH_FALLBACK",
+        "UNREPRESENTABLE_DEEP_NESTED_MATH_FALLBACK",
+        "INLINE_MATH_HIERARCHY_FALLBACK",
         "TYPESETTING_OVERFLOW_FALLBACK",
         "PROTECTED_REGION_OVERLAP_FALLBACK",
     }
@@ -3772,7 +4097,7 @@ def mask_inline_protected_elements(
         }
         compound_candidates: list[str] = []
         seen_cand: set[str] = set()
-        stopword_occ_by_ctx: dict[str, set[int]] = {}
+        occ_by_ctx: dict[str, set[int]] = {}
         for ms in inline_math_spans:
             if ms.role not in ("super", "sub") or ms.ambiguous:
                 continue
@@ -3789,8 +4114,8 @@ def mask_inline_protected_elements(
                 if ctx not in seen_cand:
                     seen_cand.add(ctx)
                     compound_candidates.append(ctx)
-            elif ctx.lower() in _PROSE_STOPWORD_SET and ms.mask_occurrence_indices:
-                stopword_occ_by_ctx.setdefault(ctx, set()).update(
+            elif ms.mask_occurrence_indices:
+                occ_by_ctx.setdefault(ctx, set()).update(
                     idx for idx in ms.mask_occurrence_indices if idx >= 0
                 )
         compound_candidates.sort(key=len, reverse=True)
@@ -3802,11 +4127,11 @@ def mask_inline_protected_elements(
                 lambda m: _alloc_sentinel(ProtectedItemKind.INLINE_FORMULA, m.group(0)),
                 working,
             )
-        if stopword_occ_by_ctx:
-            for cand in sorted(stopword_occ_by_ctx, key=len, reverse=True):
+        if occ_by_ctx:
+            for cand in sorted(occ_by_ctx, key=len, reverse=True):
                 if sentinel_re.search(cand):
                     continue
-                occ_set = stopword_occ_by_ctx[cand]
+                occ_set = occ_by_ctx[cand]
                 if not occ_set:
                     continue
                 orig_to_work = _map_orig_chars_to_working(
