@@ -118,7 +118,9 @@ class DatabaseRepository:
                 CREATE TABLE IF NOT EXISTS translation_cache (
                     cache_key TEXT PRIMARY KEY,
                     model_output_text TEXT NOT NULL,
+                    model_id TEXT NOT NULL DEFAULT '',
                     model_name TEXT NOT NULL,
+                    model_hash TEXT NOT NULL DEFAULT '',
                     quantization TEXT NOT NULL,
                     is_mock INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
@@ -133,6 +135,18 @@ class DatabaseRepository:
                 CREATE INDEX IF NOT EXISTS idx_splits_doc_page ON block_splits(document_id, page_index);
                 """
             )
+            existing_cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(translation_cache)").fetchall()
+            }
+            if "model_id" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE translation_cache ADD COLUMN model_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "model_hash" not in existing_cols:
+                conn.execute(
+                    "ALTER TABLE translation_cache ADD COLUMN model_hash TEXT NOT NULL DEFAULT ''"
+                )
 
     # --- Document operations ---
     def save_document(self, doc: Document) -> None:
@@ -852,7 +866,9 @@ class DatabaseRepository:
             return {
                 "cache_key": row["cache_key"],
                 "model_output_text": row["model_output_text"],
+                "model_id": row["model_id"] if "model_id" in row.keys() else "",
                 "model_name": row["model_name"],
+                "model_hash": row["model_hash"] if "model_hash" in row.keys() else "",
                 "quantization": row["quantization"],
                 "is_mock": row_is_mock,
                 "created_at": row["created_at"],
@@ -865,20 +881,33 @@ class DatabaseRepository:
         model_name: str,
         quantization: str,
         is_mock: bool = False,
+        model_id: str = "",
+        model_hash: str = "",
     ) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO translation_cache (
-                    cache_key, model_output_text, model_name, quantization, is_mock, created_at
+                    cache_key, model_output_text, model_id, model_name, model_hash, quantization, is_mock, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(cache_key) DO UPDATE SET
                     model_output_text = excluded.model_output_text,
+                    model_id = excluded.model_id,
                     model_name = excluded.model_name,
+                    model_hash = excluded.model_hash,
                     quantization = excluded.quantization,
                     is_mock = excluded.is_mock,
                     created_at = excluded.created_at
                 """,
-                (cache_key, model_output_text, model_name, quantization, int(is_mock), utc_now_iso()),
+                (
+                    cache_key,
+                    model_output_text,
+                    model_id,
+                    model_name,
+                    model_hash,
+                    quantization,
+                    int(is_mock),
+                    utc_now_iso(),
+                ),
             )

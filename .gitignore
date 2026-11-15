@@ -20,7 +20,8 @@ frontend/tsconfig.tsbuildinfo
 .runtime_tools/
 runtime_data/
 tools/
-models/
+/models/
+!backend/models/
 *.db
 *.sqlite
 *.sqlite3

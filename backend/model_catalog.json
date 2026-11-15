@@ -1,0 +1,182 @@
+{
+  "schema_version": 1,
+  "catalog_id": "paperbridge-local-models",
+  "models": [
+    {
+      "model_id": "plamo-3-translate-0.8b-q4_k_m",
+      "display_name": "PLaMo 3 Translate 0.8B (Q4_K_M)",
+      "short_name": "PLaMo 3 Translate 0.8B",
+      "provider": "Preferred Networks, Inc.",
+      "family": "plamo-3-translate",
+      "parameter_size": "0.8B",
+      "quantization": "Q4_K_M",
+      "is_default": false,
+      "source_repo": "pfnet/plamo-3-translate-0.8b-GGUF",
+      "source_repo_type": "huggingface",
+      "pinned_revision": "1cf96ae02133958a20074bfdfab76517bb737d00",
+      "filename": "plamo-3-translate-0.8b-Q4_K_M.gguf",
+      "relative_subdir": "plamo-3-translate-0.8b-GGUF",
+      "download_url": "https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF/resolve/1cf96ae02133958a20074bfdfab76517bb737d00/plamo-3-translate-0.8b-Q4_K_M.gguf",
+      "model_card_url": "https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF",
+      "known_size_bytes": 573126848,
+      "known_sha256": "70891ec70dc7ab4205745a38307867c2881b99239f20327927633abfe4bc9ec6",
+      "accepted_artifacts": [
+        {
+          "revision": "1cf96ae02133958a20074bfdfab76517bb737d00",
+          "size_bytes": 573126848,
+          "sha256": "70891ec70dc7ab4205745a38307867c2881b99239f20327927633abfe4bc9ec6",
+          "label": "official-2026-11-09"
+        }
+      ],
+      "supported_backends": ["llama.cpp"],
+      "expected_gguf_architecture": "plamo3",
+      "expected_gguf_name_prefix": "plamo-3-translate-0.8b",
+      "prompt_format": "pfml3",
+      "prompt_version": "pfml3-v1",
+      "stop_tokens": ["<|plamo:tag|>", "<|plamo:bos|>"],
+      "context_length_default": 8192,
+      "context_length_max": 32768,
+      "launch_settings": {
+        "alias": "plamo-3-translate-0.8b-q4_k_m",
+        "context_length": 8192,
+        "parallel_slots": 1,
+        "gpu_layers_auto": 99,
+        "extra_args": ["--jinja", "--no-prefill-assistant"]
+      },
+      "catalog_verification_status": "catalog_verified_runtime_unverified",
+      "hardware_note_ja": "約 0.57 GB（573 MB）。軽量候補。Hugging Face メタデータ・SHA-256 確認済みですが、本アプリ実機での翻訳検証は未実施です。",
+      "license": {
+        "id": "plamo-community-license",
+        "name": "PLaMoコミュニティライセンス契約",
+        "tagline": "Built with PLaMo",
+        "url_ja": "https://plamo.preferredai.jp/info/plamo-community-license-ja",
+        "url_en": "https://plamo.preferredai.jp/info/plamo-community-license-en",
+        "model_card_url": "https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF",
+        "summary_ja": "本モデルには Preferred Networks (PFN) の PLaMo コミュニティライセンス契約が適用されます（PaperBridge Local 本体および推論サーバとは別契約・別配布です）。個人利用・学術用途を含む非商用利用は無償・事前登録不要です。売上10億円以下の商用利用は登録により無償利用可能、10億円超は別途契約が必要です。",
+        "disclosure_note_ja": "2026年11月9日改定ライセンスに関するPFN案内：書籍・論文などの独立した長文公表物の全部または実質的部分として公表する場合は、PLaMoを翻訳に利用した旨をPDF内に含めて明示する必要があります（本ツールは説明ページを自動追加しません）。",
+        "requires_agreement": true
+      }
+    },
+    {
+      "model_id": "plamo-3-translate-2b-q4_k_m",
+      "display_name": "PLaMo 3 Translate 2B (Q4_K_M)",
+      "short_name": "PLaMo 3 Translate 2B",
+      "provider": "Preferred Networks, Inc.",
+      "family": "plamo-3-translate",
+      "parameter_size": "2B",
+      "quantization": "Q4_K_M",
+      "is_default": true,
+      "source_repo": "pfnet/plamo-3-translate-2b-GGUF",
+      "source_repo_type": "huggingface",
+      "pinned_revision": "4f672106b847200bfdc0f6af6c321cd94eba1aed",
+      "filename": "plamo-3-translate-2b-Q4_K_M.gguf",
+      "relative_subdir": "plamo-3-translate-2b-GGUF",
+      "download_url": "https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF/resolve/4f672106b847200bfdc0f6af6c321cd94eba1aed/plamo-3-translate-2b-Q4_K_M.gguf",
+      "model_card_url": "https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF",
+      "known_size_bytes": 1807203040,
+      "known_sha256": "1ffd9073afcc70e35ccc942428aa2b73d7aa2b9ea779bf504b775369e0276c13",
+      "accepted_artifacts": [
+        {
+          "revision": "4f672106b847200bfdc0f6af6c321cd94eba1aed",
+          "size_bytes": 1807203040,
+          "sha256": "1ffd9073afcc70e35ccc942428aa2b73d7aa2b9ea779bf504b775369e0276c13",
+          "label": "official-2026-11-09"
+        },
+        {
+          "revision": "232fbd7916519edecddfdae0beae7e76fe70453f",
+          "size_bytes": 1807199392,
+          "sha256": "f36d0813dd95573a852ab5d76e374c543632d9e292929e922bcdbf7e53b494e0",
+          "label": "official-legacy-2026-11-06"
+        }
+      ],
+      "supported_backends": ["llama.cpp"],
+      "expected_gguf_architecture": "plamo3",
+      "expected_gguf_name_prefix": "plamo-3-translate-2b",
+      "prompt_format": "pfml3",
+      "prompt_version": "pfml3-v1",
+      "stop_tokens": ["<|plamo:tag|>", "<|plamo:bos|>"],
+      "context_length_default": 8192,
+      "context_length_max": 32768,
+      "launch_settings": {
+        "alias": "plamo-3-translate-2b-q4_k_m",
+        "context_length": 8192,
+        "parallel_slots": 1,
+        "gpu_layers_auto": 99,
+        "extra_args": ["--jinja", "--no-prefill-assistant"]
+      },
+      "catalog_verification_status": "verified_runtime",
+      "hardware_note_ja": "約 1.81 GB。標準・推奨モデル（8GB VRAM Vulkan GPU 環境および本アプリ実機での翻訳動作を確認済み）。",
+      "license": {
+        "id": "plamo-community-license",
+        "name": "PLaMoコミュニティライセンス契約",
+        "tagline": "Built with PLaMo",
+        "url_ja": "https://plamo.preferredai.jp/info/plamo-community-license-ja",
+        "url_en": "https://plamo.preferredai.jp/info/plamo-community-license-en",
+        "model_card_url": "https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF",
+        "summary_ja": "本モデルには Preferred Networks (PFN) の PLaMo コミュニティライセンス契約が適用されます（PaperBridge Local 本体および推論サーバとは別契約・別配布です）。個人利用・学術用途を含む非商用利用は無償・事前登録不要です。売上10億円以下の商用利用は登録により無償利用可能、10億円超は別途契約が必要です。",
+        "disclosure_note_ja": "2026年11月9日改定ライセンスに関するPFN案内：書籍・論文などの独立した長文公表物の全部または実質的部分として公表する場合は、PLaMoを翻訳に利用した旨をPDF内に含めて明示する必要があります（本ツールは説明ページを自動追加しません）。",
+        "requires_agreement": true
+      }
+    },
+    {
+      "model_id": "plamo-3-translate-8b-q4_k_m",
+      "display_name": "PLaMo 3 Translate 8B (Q4_K_M)",
+      "short_name": "PLaMo 3 Translate 8B",
+      "provider": "Preferred Networks, Inc.",
+      "family": "plamo-3-translate",
+      "parameter_size": "8B",
+      "quantization": "Q4_K_M",
+      "is_default": false,
+      "source_repo": "pfnet/plamo-3-translate-8b-GGUF",
+      "source_repo_type": "huggingface",
+      "pinned_revision": "c67efa4eefdc14d3c97bf8f4f35ee58e2ecd2f42",
+      "filename": "plamo-3-translate-8b-Q4_K_M.gguf",
+      "relative_subdir": "plamo-3-translate-8b-GGUF",
+      "download_url": "https://huggingface.co/pfnet/plamo-3-translate-8b-GGUF/resolve/c67efa4eefdc14d3c97bf8f4f35ee58e2ecd2f42/plamo-3-translate-8b-Q4_K_M.gguf",
+      "model_card_url": "https://huggingface.co/pfnet/plamo-3-translate-8b-GGUF",
+      "known_size_bytes": 5280445728,
+      "known_sha256": "94e5d3f91b421f7c8900ddaac27b11a19f7441426c954bbb25a2fd60a1640187",
+      "accepted_artifacts": [
+        {
+          "revision": "c67efa4eefdc14d3c97bf8f4f35ee58e2ecd2f42",
+          "size_bytes": 5280445728,
+          "sha256": "94e5d3f91b421f7c8900ddaac27b11a19f7441426c954bbb25a2fd60a1640187",
+          "label": "official-2026-11-09"
+        }
+      ],
+      "supported_backends": ["llama.cpp"],
+      "expected_gguf_architecture": "plamo3",
+      "expected_gguf_name_prefix": "plamo-3-translate-8b",
+      "prompt_format": "pfml3",
+      "prompt_version": "pfml3-v1",
+      "stop_tokens": ["<|plamo:tag|>", "<|plamo:bos|>"],
+      "context_length_default": 8192,
+      "context_length_max": 32768,
+      "launch_settings": {
+        "alias": "plamo-3-translate-8b-q4_k_m",
+        "context_length": 8192,
+        "parallel_slots": 1,
+        "gpu_layers_auto": 99,
+        "extra_args": ["--jinja", "--no-prefill-assistant"]
+      },
+      "catalog_verification_status": "catalog_verified_runtime_unverified",
+      "hardware_note_ja": "約 5.28 GB。上位モデル候補。Hugging Face メタデータ・SHA-256 確認済みですが本アプリ実機での翻訳検証は未実施です。8GB VRAM 環境ではメモリ不足になる場合があり、大容量VRAM環境またはCPUモード利用を推奨します。",
+      "license": {
+        "id": "plamo-community-license",
+        "name": "PLaMoコミュニティライセンス契約",
+        "tagline": "Built with PLaMo",
+        "url_ja": "https://plamo.preferredai.jp/info/plamo-community-license-ja",
+        "url_en": "https://plamo.preferredai.jp/info/plamo-community-license-en",
+        "model_card_url": "https://huggingface.co/pfnet/plamo-3-translate-8b-GGUF",
+        "summary_ja": "本モデルには Preferred Networks (PFN) の PLaMo コミュニティライセンス契約が適用されます（PaperBridge Local 本体および推論サーバとは別契約・別配布です）。個人利用・学術用途を含む非商用利用は無償・事前登録不要です。売上10億円以下の商用利用は登録により無償利用可能、10億円超は別途契約が必要です。",
+        "disclosure_note_ja": "2026年11月9日改定ライセンスに関するPFN案内：書籍・論文などの独立した長文公表物の全部または実質的部分として公表する場合は、PLaMoを翻訳に利用した旨をPDF内に含めて明示する必要があります（本ツールは説明ページを自動追加しません）。",
+        "requires_agreement": true
+      }
+    }
+  ],
+  "unsupported_policies": {
+    "multi_file_split_gguf": "分割 GGUF（split / multi-part .gguf）は初期版では対象外です。単一 GGUF ファイルを使用してください。",
+    "plamo_31b": "PLaMo 3 Translate 31B（約 19.53 GB）は一般的なデスクトップGPU/メモリ環境を大きく超えるため、初期版の導入対象外です。",
+    "unknown_or_non_plamo_gguf": "カタログ未検証の独自 GGUF や plamo3 以外のアーキテクチャは、2B モデル等として誤用・誤計上されることを防ぐため初期版では登録できません。"
+  }
+}

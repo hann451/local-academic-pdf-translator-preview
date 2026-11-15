@@ -73,6 +73,11 @@ class AppConfig:
         default_factory=lambda: int(os.environ.get("PAPERBRIDGE_PORT", "8080"))
     )
     runtime_dir: Path = field(default_factory=_default_runtime_dir)
+    model_catalog_path: Path | None = field(
+        default_factory=lambda: (
+            Path(p) if (p := os.environ.get("PAPERBRIDGE_MODEL_CATALOG_PATH", "").strip()) else None
+        )
+    )
 
     # Translation / llama.cpp settings
     llama_base_url: str = field(

@@ -25,6 +25,7 @@ from backend.translation.prompts.pfml3 import HistoryPair, filter_active_glossar
 def compute_translation_cache_key(
     masked_source_text: str,
     model_name: str,
+    model_id: str = "",
     model_hash: str = "",
     quantization: str = "Q4_K_M",
     temperature: float = 0.0,
@@ -56,6 +57,7 @@ def compute_translation_cache_key(
 
     key_payload = {
         "masked_source_text": masked_source_text.strip(),
+        "model_id": model_id,
         "model_name": model_name,
         "model_hash": model_hash,
         "quantization": quantization,

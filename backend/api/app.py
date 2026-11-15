@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 import secrets
 import shutil
+import subprocess
 import tempfile
 import threading
 import urllib.parse
@@ -46,6 +47,15 @@ from backend.domain.models import (
     ValidationIssue,
 )
 from backend.jobs.manager import JobManager
+from backend.models.catalog import CatalogModel
+from backend.models.registry import (
+    ModelDownloadJob,
+    ModelDownloadManager,
+    ModelServerMatchResult,
+    ModelValidationError,
+    RegisteredModel,
+)
+from backend.translation.adapters.llama_cpp_adapter import LlamaCppPlamoAdapter
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 _ALLOWED_ARTIFACT_TYPES = {
@@ -127,6 +137,70 @@ class RetypesetJobResponse(BaseModel):
     issues: list[ValidationIssue]
     requires_reparse_or_retranslate: bool = False
     llm_calls_made: int = 0
+
+
+class RegisterLocalModelRequest(BaseModel):
+    file_path: str = Field(..., min_length=1)
+    expected_catalog_model_id: str | None = None
+    register_mode: Literal["reference", "copy"] = "reference"
+    license_accepted: bool = False
+    set_active: bool = True
+    replaces_registration_id: str | None = None
+
+
+class StartModelDownloadRequest(BaseModel):
+    catalog_model_id: str = Field(..., min_length=1)
+    license_accepted: bool = False
+    set_active: bool = True
+    background: bool = True
+
+
+class ModelSelectResponse(BaseModel):
+    active_model_id: str
+    selected_model: RegisteredModel
+    server_match: ModelServerMatchResult | None = None
+
+
+class ModelsOverviewResponse(BaseModel):
+    catalog: list[CatalogModel]
+    unsupported_policies: dict[str, str]
+    registered: list[RegisteredModel]
+    active_model_id: str | None = None
+    active_model: RegisteredModel | None = None
+    has_active_translation_job: bool = False
+    managed_models_dir: str
+    downloads: list[ModelDownloadJob] = Field(default_factory=list)
+    server_match: ModelServerMatchResult | None = None
+
+
+def _open_windows_gguf_file_dialog(initial_dir: Path | None = None) -> str | None:
+    """Open a native Windows file dialog on localhost to select a GGUF file without copying it."""
+    if initial_dir and initial_dir.exists():
+        init_str = str(initial_dir).replace("'", "''")
+        init_line = f"$dlg.InitialDirectory = '{init_str}'; "
+    else:
+        init_line = ""
+    ps_script = (
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+        "Add-Type -AssemblyName System.Windows.Forms; "
+        "$dlg = New-Object System.Windows.Forms.OpenFileDialog; "
+        "$dlg.Title = '登録する GGUF モデルファイルを選択してください'; "
+        "$dlg.Filter = 'GGUF モデル (*.gguf)|*.gguf|すべてのファイル (*.*)|*.*'; "
+        "$dlg.CheckFileExists = $true; "
+        "$dlg.Multiselect = $false; "
+        + init_line
+        + "if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dlg.FileName }"
+    )
+    proc = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-STA", "-Command", ps_script],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=300,
+        check=False,
+    )
+    chosen = (proc.stdout or "").strip()
+    return chosen or None
 
 
 def _validate_safe_id(value: str, label: str = "id") -> str:
@@ -217,10 +291,12 @@ def create_app(
     job_manager: JobManager | None = None,
     session_token: str | None = None,
     frontend_dist_dir: Path | None = None,
+    model_download_manager: ModelDownloadManager | None = None,
 ) -> FastAPI:
     cfg = config or AppConfig()
     cfg.ensure_directories()
     mgr = job_manager or JobManager(config=cfg)
+    dl_mgr = model_download_manager or ModelDownloadManager(registry=mgr.model_registry)
     active_token = session_token or secrets.token_urlsafe(32)
 
     app = FastAPI(
@@ -230,6 +306,7 @@ def create_app(
     )
     app.state.config = cfg
     app.state.job_manager = mgr
+    app.state.model_download_manager = dl_mgr
     app.state.session_token = active_token
 
     # Section 4 & 16: Never allow wildcard '*' CORS
@@ -309,6 +386,209 @@ def create_app(
         _sec: None = Depends(verify_security_headers),
     ) -> SystemDiagnostics:
         return collect_system_diagnostics(config=cfg, probe_llama=probe_llama)
+
+    # --- Model Catalog & Local Registry Endpoints ---
+    def _probe_llama_health_quick() -> dict[str, Any] | None:
+        try:
+            active_reg, active_cat = mgr.model_registry.get_active_model()
+            alias = (
+                active_cat.launch_settings.alias
+                if active_cat is not None
+                else cfg.llama_model_alias
+            )
+            adapter = LlamaCppPlamoAdapter(config=cfg, model_alias=alias, timeout_sec=2.0)
+            res = adapter.check_health()
+            return res if isinstance(res, dict) else None
+        except Exception:
+            return None
+
+    @app.get("/api/models", response_model=ModelsOverviewResponse)
+    def list_models_overview(
+        probe_llama: bool = False,
+        _sec: None = Depends(verify_security_headers),
+    ) -> ModelsOverviewResponse:
+        catalog, reg = mgr.model_registry.get_registry_snapshot(auto_migrate=True, revalidate=True)
+        active = (
+            next((m for m in reg.models if m.registration_id == reg.active_model_id), None)
+            if reg.active_model_id
+            else None
+        )
+        server_match = (
+            mgr.model_registry.compare_with_running_server(_probe_llama_health_quick())
+            if probe_llama
+            else None
+        )
+        return ModelsOverviewResponse(
+            catalog=catalog.models,
+            unsupported_policies=catalog.unsupported_policies,
+            registered=reg.models,
+            active_model_id=reg.active_model_id,
+            active_model=active,
+            has_active_translation_job=mgr.has_any_active_job(),
+            managed_models_dir=str(mgr.model_registry.managed_models_dir),
+            downloads=dl_mgr.list_downloads(),
+            server_match=server_match,
+        )
+
+    @app.post("/api/models/browse-local-file")
+    async def browse_local_model_file(
+        _sec: None = Depends(verify_security_headers),
+    ) -> dict[str, Any]:
+        try:
+            chosen = await anyio.to_thread.run_sync(
+                lambda: _open_windows_gguf_file_dialog(mgr.model_registry.managed_models_dir)
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"ローカルファイル選択ダイアログを開けませんでした: {exc}",
+            ) from exc
+        if not chosen:
+            return {"canceled": True, "file_path": None}
+        return {"canceled": False, "file_path": chosen}
+
+    @app.post("/api/models/register-local", response_model=RegisteredModel)
+    async def register_local_model_endpoint(
+        req: RegisterLocalModelRequest,
+        _sec: None = Depends(verify_security_headers),
+    ) -> RegisteredModel:
+        if req.replaces_registration_id:
+            _validate_safe_id(req.replaces_registration_id, "replaces_registration_id")
+        try:
+            return await anyio.to_thread.run_sync(
+                lambda: mgr.model_registry.register_local_model(
+                    file_path=req.file_path,
+                    expected_catalog_model_id=req.expected_catalog_model_id,
+                    register_mode=req.register_mode,
+                    license_accepted=req.license_accepted,
+                    set_active=req.set_active,
+                    replaces_registration_id=req.replaces_registration_id,
+                    has_active_job=mgr.has_any_active_job(),
+                )
+            )
+        except ModelValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            if "ModelSwitchConflict" in str(exc):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise
+
+    @app.post("/api/models/{registration_id}/select", response_model=ModelSelectResponse)
+    def select_active_model_endpoint(
+        registration_id: str,
+        probe_llama: bool = True,
+        _sec: None = Depends(verify_security_headers),
+    ) -> ModelSelectResponse:
+        _validate_safe_id(registration_id, "registration_id")
+        try:
+            selected = mgr.model_registry.select_active_model(
+                registration_id,
+                has_active_job=mgr.has_any_active_job(),
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ModelValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            if "ModelSwitchConflict" in str(exc):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise
+        server_match = (
+            mgr.model_registry.compare_with_running_server(_probe_llama_health_quick())
+            if probe_llama
+            else None
+        )
+        return ModelSelectResponse(
+            active_model_id=selected.registration_id,
+            selected_model=selected,
+            server_match=server_match,
+        )
+
+    @app.delete("/api/models/{registration_id}")
+    def delete_registered_model_endpoint(
+        registration_id: str,
+        _sec: None = Depends(verify_security_headers),
+    ) -> dict[str, Any]:
+        _validate_safe_id(registration_id, "registration_id")
+        active_reg, _ = mgr.model_registry.get_active_model()
+        if (
+            active_reg is not None
+            and active_reg.registration_id == registration_id
+            and mgr.has_any_active_job()
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="ModelSwitchConflict: 翻訳ジョブ実行中に使用中モデルの登録を解除できません。",
+            )
+        deleted = mgr.model_registry.remove_registration(registration_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Registered model not found")
+        _cat, reg_after = mgr.model_registry.get_registry_snapshot(auto_migrate=False, revalidate=False)
+        return {
+            "deleted": True,
+            "registration_id": registration_id,
+            "active_model_id": reg_after.active_model_id,
+        }
+
+    @app.post("/api/models/downloads", response_model=ModelDownloadJob)
+    async def start_model_download_endpoint(
+        req: StartModelDownloadRequest,
+        _sec: None = Depends(verify_security_headers),
+    ) -> ModelDownloadJob:
+        try:
+            if not req.background:
+                return await anyio.to_thread.run_sync(
+                    lambda: dl_mgr.start_download(
+                        catalog_model_id=req.catalog_model_id,
+                        license_accepted=req.license_accepted,
+                        set_active=req.set_active,
+                        background=False,
+                        has_active_translation_job=mgr.has_any_active_job(),
+                    )
+                )
+            return dl_mgr.start_download(
+                catalog_model_id=req.catalog_model_id,
+                license_accepted=req.license_accepted,
+                set_active=req.set_active,
+                background=True,
+                has_active_translation_job=mgr.has_any_active_job(),
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ModelValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            if "ModelSwitchConflict" in str(exc):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise
+
+    @app.get("/api/models/downloads", response_model=list[ModelDownloadJob])
+    def list_model_downloads_endpoint(
+        _sec: None = Depends(verify_security_headers),
+    ) -> list[ModelDownloadJob]:
+        return dl_mgr.list_downloads()
+
+    @app.get("/api/models/downloads/{download_id}", response_model=ModelDownloadJob)
+    def get_model_download_endpoint(
+        download_id: str,
+        _sec: None = Depends(verify_security_headers),
+    ) -> ModelDownloadJob:
+        _validate_safe_id(download_id, "download_id")
+        job = dl_mgr.get_download(download_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Download task not found")
+        return job
+
+    @app.post("/api/models/downloads/{download_id}/cancel", response_model=ModelDownloadJob)
+    def cancel_model_download_endpoint(
+        download_id: str,
+        _sec: None = Depends(verify_security_headers),
+    ) -> ModelDownloadJob:
+        _validate_safe_id(download_id, "download_id")
+        job = dl_mgr.cancel_download(download_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Download task not found")
+        return job
 
     # --- Document Endpoints ---
     @app.post("/api/documents/upload", response_model=Document)
@@ -734,7 +1014,9 @@ def create_app(
                 raise RuntimeError(
                     f"JobConflict: Document '{document_id}' already has an active operation."
                 )
-            job = mgr.create_job(document_id, job_config=job_config)
+            resolved_cfg = mgr._resolve_job_model_config(job_config)
+            mgr.validate_real_model_preflight(resolved_cfg)
+            job = mgr.create_job(document_id, job_config=resolved_cfg)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -742,8 +1024,9 @@ def create_app(
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
-            if "JobConflict" in str(exc):
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            msg = str(exc)
+            if "JobConflict" in msg or "ModelMismatchConflict" in msg:
+                raise HTTPException(status_code=409, detail=msg) from exc
             raise
 
         if background:
@@ -856,6 +1139,14 @@ def create_app(
                 status_code=409,
                 detail=f"Document '{job.document_id}' / Job '{job_id}' is already running.",
             )
+        try:
+            mgr.validate_real_model_preflight(job.config)
+        except ModelValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            if "ModelMismatchConflict" in str(exc):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise
 
         if background:
             threading.Thread(
@@ -878,15 +1169,22 @@ def create_app(
         _sec: None = Depends(verify_security_headers),
     ) -> Job:
         _validate_safe_id(job_id, "job_id")
+        job_existing = mgr.db.get_job(job_id)
+        if not job_existing:
+            raise HTTPException(status_code=404, detail="Job not found")
         try:
+            mgr.validate_real_model_preflight(job_existing.config)
             return await anyio.to_thread.run_sync(
                 lambda: mgr.run_job(job_id, resume=True, target_block_ids=set(req.block_ids))
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ModelValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
-            if "JobConflict" in str(exc):
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            msg = str(exc)
+            if "JobConflict" in msg or "ModelMismatchConflict" in msg:
+                raise HTTPException(status_code=409, detail=msg) from exc
             raise
 
     @app.post("/api/jobs/{job_id}/retypeset", response_model=RetypesetJobResponse)

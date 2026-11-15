@@ -52,6 +52,7 @@ from backend.pdf.validation.preflight import (
 )
 from backend.storage.cache import compute_translation_cache_key
 from backend.storage.database import DatabaseRepository
+from backend.models.registry import ModelRegistryManager, ModelValidationError
 from backend.translation.adapters.base import (
     TranslationAdapter,
     TranslationConnectionError,
@@ -234,6 +235,10 @@ class JobManager:
         self.db = db or DatabaseRepository(self.config.db_path)
         self.pdf_adapter = pdf_adapter or NativePreservingAdapter(self.config)
         self.default_translation_adapter = translation_adapter
+        self.model_registry = ModelRegistryManager(
+            runtime_dir=self.config.runtime_dir,
+            catalog_path=self.config.model_catalog_path,
+        )
         self._cancel_flags: dict[str, threading.Event] = {}
         self._interrupt_flags: dict[str, threading.Event] = {}
         self._active_lock = threading.Lock()
@@ -244,6 +249,10 @@ class JobManager:
     def is_job_active(self, job_id: str) -> bool:
         with self._active_lock:
             return job_id in self._active_jobs
+
+    def has_any_active_job(self) -> bool:
+        with self._active_lock:
+            return bool(self._active_jobs)
 
     def has_active_document_operation(self, document_id: str) -> bool:
         with self._active_lock:
@@ -304,6 +313,112 @@ class JobManager:
         self.db.save_document(doc)
         return doc
 
+    def _resolve_job_model_config(self, cfg: TranslationJobConfig) -> TranslationJobConfig:
+        """Align job config with registered/catalog model metadata without forging identity."""
+        catalog, reg = self.model_registry.get_registry_snapshot(auto_migrate=True, revalidate=True)
+        resolved = cfg.model_copy(deep=True)
+        active_reg = (
+            next((m for m in reg.models if m.registration_id == reg.active_model_id), None)
+            if reg.active_model_id
+            else None
+        )
+
+        target_reg = None
+        if resolved.model_id:
+            if active_reg and active_reg.catalog_model_id == resolved.model_id:
+                target_reg = active_reg
+            else:
+                target_reg = next(
+                    (m for m in reg.models if m.catalog_model_id == resolved.model_id and m.is_usable),
+                    None,
+                )
+        elif active_reg is not None:
+            target_reg = active_reg
+
+        if resolved.only_roundtrip_preservation or resolved.use_mock_translator:
+            if target_reg is not None:
+                resolved.model_id = resolved.model_id or target_reg.catalog_model_id
+            return resolved
+
+        if target_reg is not None:
+            if not target_reg.is_usable:
+                raise ModelValidationError(
+                    target_reg.verification.validation_error
+                    or f"選択中のモデル「{target_reg.display_name}」は検証エラーまたはファイル欠落のため使用できません。"
+                )
+            cat_m = catalog.get_model(target_reg.catalog_model_id)
+            default_stem = "plamo-3-translate-2b-Q4_K_M"
+            if cat_m is not None:
+                cat_stem = (
+                    cat_m.filename[:-5] if cat_m.filename.lower().endswith(".gguf") else cat_m.filename
+                )
+                if not resolved.model_id or resolved.model_name == default_stem:
+                    resolved.model_name = cat_stem
+                resolved.model_id = cat_m.model_id
+                resolved.quantization = cat_m.quantization
+            else:
+                resolved.model_id = target_reg.catalog_model_id
+                resolved.quantization = target_reg.quantization
+            resolved.model_sha256 = target_reg.measured_sha256
+        elif resolved.model_id:
+            cat_m = catalog.get_model(resolved.model_id)
+            if cat_m is None:
+                raise ModelValidationError(
+                    f"指定されたモデルID '{resolved.model_id}' はモデルカタログに存在しません。"
+                )
+            cat_stem = (
+                cat_m.filename[:-5] if cat_m.filename.lower().endswith(".gguf") else cat_m.filename
+            )
+            if resolved.model_name == "plamo-3-translate-2b-Q4_K_M":
+                resolved.model_name = cat_stem
+            resolved.quantization = cat_m.quantization
+        return resolved
+
+    def validate_real_model_preflight(self, cfg: TranslationJobConfig) -> None:
+        """Preflight check ensuring active selected model matches any reachable llama-server."""
+        if cfg.use_mock_translator or cfg.only_roundtrip_preservation:
+            return
+        if self.default_translation_adapter is not None:
+            return
+        catalog, reg = self.model_registry.get_registry_snapshot(auto_migrate=True, revalidate=True)
+        active_reg = (
+            next((m for m in reg.models if m.registration_id == reg.active_model_id), None)
+            if reg.active_model_id
+            else None
+        )
+        if active_reg is not None and not active_reg.is_usable:
+            raise ModelValidationError(
+                active_reg.verification.validation_error
+                or f"選択中のモデル「{active_reg.display_name}」は無効またはファイル欠落のため開始できません。"
+            )
+        cat_m = catalog.get_model(cfg.model_id) if cfg.model_id else None
+        alias_for_probe = cat_m.launch_settings.alias if cat_m else self.config.llama_model_alias
+        try:
+            probe = LlamaCppPlamoAdapter(
+                config=self.config,
+                model_alias=alias_for_probe,
+                quantization=cfg.quantization,
+                timeout_sec=2.0,
+            )
+            health = probe.check_health()
+        except Exception:
+            return
+        if not isinstance(health, dict):
+            return
+        h_status = str(health.get("status", ""))
+        if h_status in ("model_load_failed", "model_not_found", "blocked_external_host"):
+            raise ModelValidationError(
+                str(health.get("detail") or f"推論サーバモデル異常 ({h_status})")
+            )
+        if h_status == "connected" and active_reg is not None:
+            if cfg.model_id and active_reg.catalog_model_id != cfg.model_id:
+                raise RuntimeError(
+                    f"ModelMismatchConflict: ジョブ構成モデル '{cfg.model_id}' と現在の選択中モデル '{active_reg.display_name}' が一致しません。"
+                )
+            match_res = self.model_registry.compare_with_running_server(health)
+            if match_res.match_status in ("mismatch", "selected_model_invalid"):
+                raise RuntimeError(f"ModelMismatchConflict: {match_res.message_ja}")
+
     def create_job(
         self,
         document_id: str,
@@ -312,7 +427,7 @@ class JobManager:
         doc = self.db.get_document(document_id)
         if not doc:
             raise KeyError(f"Document not found: {document_id}")
-        cfg = job_config or TranslationJobConfig()
+        cfg = self._resolve_job_model_config(job_config or TranslationJobConfig())
         pending_splits = [
             s
             for s in self.db.list_block_splits(document_id)
@@ -1086,11 +1201,25 @@ class JobManager:
             return self.default_translation_adapter
         if cfg.use_mock_translator:
             return MockPlamoAdapter(model_name=cfg.model_name, quantization=cfg.quantization)
-        return LlamaCppPlamoAdapter(
-            config=self.config,
-            model_alias=cfg.model_name,
-            quantization=cfg.quantization,
+        cat_m = None
+        if cfg.model_id:
+            try:
+                cat_m = self.model_registry.get_catalog().get_model(cfg.model_id)
+            except Exception:
+                cat_m = None
+        preferred_alias = (
+            cat_m.launch_settings.alias
+            if cat_m is not None
+            else (self.config.llama_model_alias or cfg.model_name)
         )
+        adapter = LlamaCppPlamoAdapter(
+            config=self.config,
+            model_alias=preferred_alias,
+            quantization=cfg.quantization,
+            prompt_version=cat_m.prompt_version if cat_m else None,
+            stop_tokens=cat_m.stop_tokens if cat_m else None,
+        )
+        return adapter
 
     def run_job(
         self,
@@ -1249,10 +1378,17 @@ class JobManager:
             engine_process = "none (roundtrip preservation)"
             endpoint_url = "none"
             model_file_used = job.config.model_name
+            model_display_used = job.config.model_name
+            model_sha256_used = job.config.model_sha256
+            active_reg_for_verify = None
             compute_backend = "not_applicable"
 
             # Stage 8 & 9: Translation & Validation (skipped in roundtrip-only mode)
             if not job.config.only_roundtrip_preservation:
+                if job.config.model_id:
+                    _cat_lookup = self.model_registry.get_catalog().get_model(job.config.model_id)
+                    if _cat_lookup is not None:
+                        model_display_used = _cat_lookup.display_name
                 translator = self._resolve_translator(job.config)
                 job.is_mock_run = translator.is_mock
                 if translator.is_mock:
@@ -1275,17 +1411,42 @@ class JobManager:
                             engine_process = f"llama-server.exe (PID {pid})"
                     except Exception:
                         pass
+                    health_checked: dict[str, Any] | None = None
                     try:
                         check_fn = getattr(translator, "check_health", None)
                         if callable(check_fn):
                             health = check_fn()
                             if isinstance(health, dict):
+                                health_checked = health
                                 if isinstance(health.get("model_file"), str) and health["model_file"]:
                                     model_file_used = str(health["model_file"])
                                 if isinstance(health.get("build_info"), str) and health["build_info"]:
                                     engine_process = f"{engine_process} [{health['build_info']}]"
                     except Exception:
                         pass
+
+                    if self.default_translation_adapter is None and isinstance(health_checked, dict):
+                        h_status = str(health_checked.get("status", ""))
+                        if h_status in ("model_load_failed", "model_not_found", "blocked_external_host"):
+                            raise RuntimeError(
+                                str(health_checked.get("detail") or f"ModelLoadError: {h_status}")
+                            )
+                        if h_status == "connected":
+                            served_id = health_checked.get("model_name")
+                            if isinstance(served_id, str) and served_id and hasattr(translator, "model_alias"):
+                                translator.model_alias = served_id
+                            active_reg, _ = self.model_registry.get_active_model()
+                            active_reg_for_verify = active_reg
+                            if active_reg is not None:
+                                if job.config.model_id and active_reg.catalog_model_id != job.config.model_id:
+                                    raise RuntimeError(
+                                        f"ModelMismatchConflict: ジョブ構成モデル '{job.config.model_id}' と現在選択中のモデル '{active_reg.display_name}' が一致しません。"
+                                    )
+                                match_res = self.model_registry.compare_with_running_server(health_checked)
+                                if match_res.match_status in ("mismatch", "selected_model_invalid"):
+                                    raise RuntimeError(f"ModelMismatchConflict: {match_res.message_ja}")
+                                model_display_used = active_reg.display_name
+                                model_sha256_used = active_reg.measured_sha256 or model_sha256_used
 
                 job.transition_to(JobState.TRANSLATING, "Stage 8: PLaMo PFML3 段落翻訳中")
                 self.db.save_job(job)
@@ -1583,8 +1744,11 @@ class JobManager:
                 "adapter_name": adapter_name,
                 "engine_process": engine_process,
                 "endpoint_url": endpoint_url,
+                "model_id": job.config.model_id,
+                "model_display_name": model_display_used,
                 "model_name": job.config.model_name,
                 "model_file": model_file_used,
+                "model_sha256": model_sha256_used,
                 "quantization": job.config.quantization,
                 "compute_backend": compute_backend,
                 "is_mock": job.is_mock_run,
@@ -1599,6 +1763,15 @@ class JobManager:
                 "protected_skip_blocks": protected_skip_blocks,
                 "fallback_original_blocks": fallback_original_blocks,
             }
+            if active_reg_for_verify is not None and not job.is_mock_run:
+                try:
+                    self.model_registry.mark_runtime_verified(
+                        active_reg_for_verify.registration_id,
+                        launch_verified=True,
+                        translation_verified=(newly_inferenced_blocks > 0),
+                    )
+                except Exception:
+                    pass
 
             issues = _deduplicate_validation_issues(issues)
             job.processed_blocks = sum(
@@ -2221,7 +2394,9 @@ class JobManager:
         masked_src = block.masked_source_text or block.source_text
         cache_key = compute_translation_cache_key(
             masked_source_text=masked_src,
+            model_id=job.config.model_id or "",
             model_name=job.config.model_name,
+            model_hash=job.config.model_sha256 or "",
             quantization=job.config.quantization,
             prompt_version=translator.prompt_version,
             source_lang=job.config.source_lang,
@@ -2350,7 +2525,9 @@ class JobManager:
                 self.db.put_cached_translation(
                     cache_key=cache_key,
                     model_output_text=candidate_text,
+                    model_id=job.config.model_id or "",
                     model_name=job.config.model_name,
+                    model_hash=job.config.model_sha256 or "",
                     quantization=job.config.quantization,
                     is_mock=translator.is_mock,
                 )

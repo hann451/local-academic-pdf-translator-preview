@@ -614,7 +614,9 @@ class TranslationJobConfig(BaseModel):
     source_lang: str = "en"
     target_lang: str = "ja"
     form: str = Field(default="plain", pattern="^(plain|polite)$")
+    model_id: str | None = None
     model_name: str = "plamo-3-translate-2b-Q4_K_M"
+    model_sha256: str | None = None
     quantization: str = "Q4_K_M"
     context_length: int = Field(default=8192, ge=1024, le=32768)
     translate_captions: bool = True
@@ -711,3 +713,12 @@ class SystemDiagnostics(BaseModel):
     )
     llama_server_pid: int | None = None
     loopback_only_enforced: bool = True
+    active_registration_id: str | None = None
+    active_catalog_model_id: str | None = None
+    active_model_display_name: str | None = None
+    active_model_file_path: str | None = None
+    active_model_status: str | None = None
+    running_server_model_path: str | None = None
+    model_server_match_status: str = "unknown"
+    model_server_match_message: str | None = None
+    model_server_mismatch: bool = False
