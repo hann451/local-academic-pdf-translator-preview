@@ -292,6 +292,7 @@ export interface TranslationJobConfig {
   only_roundtrip_preservation: boolean;
   pause_for_review: boolean;
   use_mock_translator: boolean;
+  allow_pending_splits?: boolean;
 }
 
 export interface AppliedBlockRevisionInfo {

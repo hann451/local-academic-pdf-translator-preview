@@ -499,11 +499,15 @@ describe("Screen 2: PDF Viewer & SVG Protection Editor (Section 6)", () => {
       screen.getByTestId("block-needs-retranslation-doc-abc123456789:page-1:block-0:b")
     ).toHaveTextContent("要再翻訳");
 
-    // Pending split status and reason are visible; delete button works
+    // Pending split status, job-start block & opt-in confirmation are visible; delete button works
     expect(screen.getByTestId("split-status-split-pending")).toHaveTextContent("適用保留（曖昧）");
     expect(screen.getByTestId("split-status-reason-split-pending")).toHaveTextContent(
       "親ブロック候補が複数一致"
     );
+    expect(screen.getByTestId("pending-splits-job-warning")).toBeInTheDocument();
+    expect(screen.getByTestId("screen2-start-job-btn")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("allow-pending-splits-checkbox"));
+    expect(screen.getByTestId("screen2-start-job-btn")).not.toBeDisabled();
     fireEvent.click(screen.getByTestId("delete-split-split-pending"));
     expect(onDeleteSplit).toHaveBeenCalledWith("split-pending");
 
@@ -906,6 +910,8 @@ describe("Screen 3: 13-Stage Progress, Cancel Distinction, Manual Edit & Retypes
     expect(screen.getByTestId("outputs-stale-banner")).toHaveTextContent(
       "ブロック分割が確定されたため最新構成と未同期"
     );
+    expect(screen.getByTestId("job-stale-badge")).toHaveTextContent("成果物未同期");
+    expect(screen.getByTestId("unprotected-pending-notice")).toHaveTextContent("1件");
     expect(
       screen.getByTestId("review-needs-retranslation-doc-abc123456789:page-1:block-0:b")
     ).toHaveTextContent("要再翻訳");

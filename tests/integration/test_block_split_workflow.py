@@ -919,3 +919,128 @@ def test_backward_compatibility_and_pending_ambiguous_split(
     assert splits_after[0]["applied_status"].startswith("pending_")
     assert splits_after[0]["status_reason"]
     assert all(b["split_spec_id"] != split_id for b in blocks_after)
+
+    # Starting a job with unresolved pending_* splits MUST reject with 409 by default
+    blocked_job = client.post(
+        f"/api/documents/{doc_id}/jobs",
+        json=TranslationJobConfig(use_mock_translator=True).model_dump(),
+        headers=headers,
+    )
+    assert blocked_job.status_code == 409
+    assert "PendingSplitsConflict" in blocked_job.json()["detail"]
+
+    # Explicit opt-in allow_pending_splits=True proceeds and records warning issue
+    allowed_job = client.post(
+        f"/api/documents/{doc_id}/jobs",
+        json=TranslationJobConfig(
+            use_mock_translator=True,
+            allow_pending_splits=True,
+        ).model_dump(),
+        headers=headers,
+    )
+    assert allowed_job.status_code == 200
+    allowed_data = allowed_job.json()
+    assert allowed_data["state"] == JobState.COMPLETED_WITH_WARNINGS.value
+    job_issues = client.get(f"/api/jobs/{allowed_data['id']}/issues", headers=headers).json()
+    assert any(iss["code"] == "PENDING_BLOCK_SPLIT_UNAPPLIED" for iss in job_issues)
+
+
+def test_preexisting_protection_region_and_partial_retypeset_stale_behavior(
+    tmp_path: Path,
+    isolated_config: AppConfig,
+) -> None:
+    """Verify:
+    1) Pre-existing manual ProtectionRegion over formula (even overlapping bottom edge) does
+       NOT re-protect split bottom prose; deleting split restores original priority cleanly.
+    2) Retypesetting while untranslated/needs_retranslation blocks remain keeps outputs_stale=True
+       and job state COMPLETED_WITH_WARNINGS across repeated retypesets.
+    """
+    pdf_path, drag_bbox = _create_synthetic_eq6_pdf(tmp_path / "prio_stale.pdf", with_top_prose=False)
+    spy = RecordingSpyAdapter()
+    mgr = JobManager(config=isolated_config, translation_adapter=spy)
+    app = create_app(config=isolated_config, job_manager=mgr, session_token="prio-tok")
+    client = TestClient(app)
+    headers = {"X-PaperBridge-Token": "prio-tok"}
+
+    with open(pdf_path, "rb") as fh:
+        doc_id = client.post(
+            "/api/documents/upload",
+            files={"file": ("prio_stale.pdf", fh, "application/pdf")},
+            headers=headers,
+        ).json()["id"]
+
+    # Add a slightly generous PROTECT_AS_FORMULA ProtectionRegion covering Eq.(6) + part of bottom prose
+    eq_reg = client.post(
+        f"/api/documents/{doc_id}/protection-regions",
+        json={
+            "page_index": 0,
+            "bbox": [drag_bbox[0] - 2.0, drag_bbox[1] - 2.0, drag_bbox[2] + 2.0, drag_bbox[3] + 18.0],
+            "mode": "protect_as_formula",
+            "note": "先につけた手動数式保護",
+        },
+        headers=headers,
+    )
+    assert eq_reg.status_code == 200
+    pre_split_blocks = client.post(f"/api/documents/{doc_id}/parse", headers=headers).json()
+    coupled = next(b for b in pre_split_blocks if "Falling width" in b["source_text"])
+    assert coupled["status"] == BlockStatus.PROTECTED_SKIP.value
+
+    # Now drag-split Eq.(6): bottom prose MUST remain translatable (pending, NOT protected_skip)
+    prev = client.post(
+        f"/api/documents/{doc_id}/block-splits/preview",
+        json={"page_index": 0, "requested_bbox": drag_bbox, "include_equation_number": True},
+        headers=headers,
+    ).json()
+    assert prev["valid"] is True
+    assert any(p["role"] == "bottom" and p["will_protect"] is False for p in prev["parts"])
+
+    conf = client.post(
+        f"/api/documents/{doc_id}/block-splits",
+        json={
+            "page_index": 0,
+            "requested_bbox": drag_bbox,
+            "include_equation_number": True,
+            "expected_protection_revision": prev["protection_revision"],
+            "expected_parse_revision": prev["parse_revision"],
+            "expected_parent_signature": prev["parent_signature"],
+        },
+        headers=headers,
+    ).json()
+    split_id = conf["split"]["id"]
+    split_blocks = [b for b in conf["blocks"] if b["split_spec_id"] == split_id]
+    f_blk = next(b for b in split_blocks if b["split_role"] == "formula")
+    b_blk = next(b for b in split_blocks if b["split_role"] == "bottom")
+    assert f_blk["status"] == BlockStatus.PROTECTED_SKIP.value
+    assert b_blk["status"] == BlockStatus.PENDING.value
+
+    # Run job 1: bottom prose gets translated while formula stays skipped
+    job1 = client.post(
+        f"/api/documents/{doc_id}/jobs",
+        json=TranslationJobConfig(use_mock_translator=True).model_dump(),
+        headers=headers,
+    ).json()
+    assert job1["state"] in (JobState.COMPLETED.value, JobState.COMPLETED_WITH_WARNINGS.value)
+
+    # Delete split -> restored parent must immediately recover pre-existing ProtectionRegion priority
+    del_res = client.delete(f"/api/documents/{doc_id}/block-splits/{split_id}", headers=headers)
+    assert del_res.status_code == 200
+    restored = next(b for b in del_res.json()["blocks"] if "Falling width" in b["source_text"])
+    assert restored["status"] == BlockStatus.PROTECTED_SKIP.value
+    assert "手動：数式として保護" in (restored["protection_reason"] or "")
+
+    # Remove manual region & mark restored parent translatable (still untranslated) -> retypeset twice without LLM
+    client.delete(f"/api/documents/{doc_id}/protection-regions/{eq_reg.json()['id']}", headers=headers)
+    reparsed = client.post(f"/api/documents/{doc_id}/parse", headers=headers).json()
+    unprot = next(b for b in reparsed if "Falling width" in b["source_text"])
+    assert unprot["status"] == BlockStatus.PENDING.value
+
+    for _ in range(2):
+        rt = client.post(
+            f"/api/jobs/{job1['id']}/retypeset",
+            json={"allow_validation_warnings": True},
+            headers=headers,
+        ).json()
+        assert rt["llm_calls_made"] == 0
+        assert rt["job"]["outputs_stale"] is True
+        assert rt["job"]["outputs_stale_reason"]
+        assert rt["job"]["state"] == JobState.COMPLETED_WITH_WARNINGS.value

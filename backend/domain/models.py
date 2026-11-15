@@ -591,6 +591,7 @@ class TranslationJobConfig(BaseModel):
     only_roundtrip_preservation: bool = False
     pause_for_review: bool = False
     use_mock_translator: bool = False
+    allow_pending_splits: bool = False
 
 
 class Job(BaseModel):

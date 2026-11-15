@@ -1191,6 +1191,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
         parent_block_id: str | None = None,
         parent_bbox: list[float] | None = None,
         parent_source_hash: str | None = None,
+        sibling_formula_bbox: list[float] | None = None,
     ) -> tuple[Block | None, bool]:
         if not lines:
             return None, in_references_section
@@ -1272,7 +1273,12 @@ class NativePreservingAdapter(PdfEngineAdapter):
             parent_bbox=list(parent_bbox) if parent_bbox else None,
             parent_source_hash=parent_source_hash,
         )
-        self._apply_protection_and_masking(blk, page_manual, cfg)
+        self._apply_protection_and_masking(
+            blk,
+            page_manual,
+            cfg,
+            sibling_formula_bbox=sibling_formula_bbox,
+        )
         return blk, in_references_section
 
     def parse_and_extract_blocks(
@@ -1437,6 +1443,9 @@ class NativePreservingAdapter(PdfEngineAdapter):
                                 parent_block_id=cand.base_block_id,
                                 parent_bbox=cand.bbox,
                                 parent_source_hash=cand.source_text_hash,
+                                sibling_formula_bbox=(
+                                    outcome.formula_bbox if c_role in ("top", "bottom") else None
+                                ),
                             )
                             if child_blk is not None:
                                 page_candidates.append(child_blk)
@@ -1522,6 +1531,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
         existing_splits: list[BlockSplitSpec] | None = None,
         include_equation_number: bool = True,
         manual_edit_block_ids: set[str] | None = None,
+        manual_regions: list[ProtectionRegion] | None = None,
     ) -> BlockSplitPreviewResult:
         """Compute live drag-split snapping/rejection preview from immutable original PDF."""
         mupdf_doc = pymupdf.open(document.safe_storage_path)
@@ -1573,6 +1583,34 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 include_equation_number=include_equation_number,
                 manual_edit_block_ids=manual_edit_block_ids,
             )
+            if preview.valid and manual_regions and preview.snapped_bbox:
+                page_manual = [r for r in manual_regions if r.page_index == page_index]
+                has_prose_region_overlap = False
+                for part in preview.parts:
+                    if part.role not in ("top", "bottom"):
+                        continue
+                    for reg in page_manual:
+                        if self._manual_region_suppressed_by_split_formula(
+                            part_role=part.role,
+                            part_bbox=part.bbox,
+                            reg=reg,
+                            sibling_formula_bbox=preview.snapped_bbox,
+                        ):
+                            continue
+                        if (
+                            bbox_intersection_ratio(part.bbox, reg.bbox) >= 0.35
+                            or bbox_iou(part.bbox, reg.bbox) >= 0.25
+                        ):
+                            if reg.mode != ProtectionMode.TRANSLATE_AS_BODY:
+                                part.will_protect = True
+                                has_prose_region_overlap = True
+                            elif reg.mode == ProtectionMode.TRANSLATE_AS_BODY:
+                                part.will_protect = False
+                                break
+                if has_prose_region_overlap:
+                    preview.warnings.append(
+                        "既存の手動保護領域が上下の本文部分とも大きく重なっているため、該当本文にも保護設定が引き継がれます。"
+                    )
             return preview
         finally:
             mupdf_doc.close()
@@ -2447,11 +2485,39 @@ class NativePreservingAdapter(PdfEngineAdapter):
             in_references_section,
         )
 
+    @staticmethod
+    def _manual_region_suppressed_by_split_formula(
+        *,
+        part_role: BlockSplitRole | None,
+        part_bbox: list[float],
+        reg: ProtectionRegion,
+        sibling_formula_bbox: list[float] | None,
+    ) -> bool:
+        """Avoid letting a formula-targeted manual ProtectionRegion re-protect split prose."""
+        if (
+            part_role not in ("top", "bottom")
+            or sibling_formula_bbox is None
+            or reg.mode
+            not in (
+                ProtectionMode.DO_NOT_TRANSLATE,
+                ProtectionMode.PROTECT_AS_FORMULA,
+                ProtectionMode.PROTECT_AS_FIGURE,
+            )
+        ):
+            return False
+        formula_cov = bbox_intersection_ratio(sibling_formula_bbox, reg.bbox)
+        if formula_cov < 0.50:
+            return False
+        if reg.mode == ProtectionMode.PROTECT_AS_FORMULA:
+            return True
+        return bbox_intersection_ratio(part_bbox, reg.bbox) < 0.85
+
     def _apply_protection_and_masking(
         self,
         block: Block,
         page_manual_regions: list[ProtectionRegion],
         cfg: TranslationJobConfig,
+        sibling_formula_bbox: list[float] | None = None,
     ) -> None:
         # -1. Split formula child blocks stay strictly protected regardless of force_translate or TRANSLATE_AS_BODY
         if block.split_role == "formula":
@@ -2484,6 +2550,13 @@ class NativePreservingAdapter(PdfEngineAdapter):
         # 1. Check if a manual protection region rectangle overrides this block (Stage 6)
         if not manual_override_translate:
             for reg in page_manual_regions:
+                if self._manual_region_suppressed_by_split_formula(
+                    part_role=block.split_role,
+                    part_bbox=block.bbox,
+                    reg=reg,
+                    sibling_formula_bbox=sibling_formula_bbox,
+                ):
+                    continue
                 overlap = bbox_intersection_ratio(block.bbox, reg.bbox)
                 iou = bbox_iou(block.bbox, reg.bbox)
                 if overlap >= 0.35 or iou >= 0.25:

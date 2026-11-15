@@ -289,6 +289,29 @@ class JobManager:
         if not doc:
             raise KeyError(f"Document not found: {document_id}")
         cfg = job_config or TranslationJobConfig()
+        pending_splits = [
+            s
+            for s in self.db.list_block_splits(document_id)
+            if s.applied_status.startswith("pending_")
+        ]
+        if pending_splits:
+            target_pages = (
+                set(parse_page_range_spec(cfg.page_range_spec, doc.page_count))
+                if doc.page_count > 0
+                else None
+            )
+            relevant_pending = [
+                s
+                for s in pending_splits
+                if target_pages is None or s.page_index in target_pages
+            ]
+            if relevant_pending and not cfg.allow_pending_splits:
+                pages_label = ", ".join(
+                    str(p + 1) for p in sorted({s.page_index for s in relevant_pending})
+                )
+                raise ValueError(
+                    f"PendingSplitsConflict: 適用保留（pending）の分割設定が {len(relevant_pending)} 件残っています（対象ページ: {pages_label}）。再解析・分割設定の削除または再ドラッグで解消するか、保留設定を除いて続行を許可（allow_pending_splits=True）してください。"
+                )
         job = Job(
             id=f"job-{uuid.uuid4().hex[:12]}",
             document_id=document_id,
@@ -604,7 +627,17 @@ class JobManager:
 
             target.user_protection_override = user_protection_override
             if isinstance(self.pdf_adapter, NativePreservingAdapter):
-                self.pdf_adapter._apply_protection_and_masking(target, manual_regions, cfg)
+                sibling_formula_bbox = None
+                if target.split_spec_id and target.split_role in ("top", "bottom"):
+                    split_spec = self.db.get_block_split(document_id, target.split_spec_id)
+                    if split_spec is not None:
+                        sibling_formula_bbox = split_spec.snapped_bbox
+                self.pdf_adapter._apply_protection_and_masking(
+                    target,
+                    manual_regions,
+                    cfg,
+                    sibling_formula_bbox=sibling_formula_bbox,
+                )
 
             target.translation_text = saved_trans
             target.manual_translation_text = saved_manual
@@ -738,6 +771,7 @@ class JobManager:
             raise ValueError("bbox must have 4 elements [x0, y0, x1, y1]")
         existing_splits = self.db.list_block_splits(doc.id, page_index=page_index)
         existing_blocks = self.db.list_blocks(doc.id, page_index=page_index)
+        manual_regions = self.db.list_protection_regions(doc.id, page_index=page_index)
         manual_edit_ids = {
             b.id
             for b in existing_blocks
@@ -752,6 +786,7 @@ class JobManager:
             existing_splits=existing_splits,
             include_equation_number=include_equation_number,
             manual_edit_block_ids=manual_edit_ids,
+            manual_regions=manual_regions,
         )
         preview.protection_revision = doc.protection_revision
         preview.parse_revision = doc.parse_revision
@@ -794,6 +829,7 @@ class JobManager:
 
             existing_splits = self.db.list_block_splits(doc.id, page_index=page_index)
             existing_page_blocks = self.db.list_blocks(doc.id, page_index=page_index)
+            manual_regions = self.db.list_protection_regions(doc.id, page_index=page_index)
             manual_edit_ids = {
                 b.id
                 for b in existing_page_blocks
@@ -809,6 +845,7 @@ class JobManager:
                 existing_splits=existing_splits,
                 include_equation_number=include_equation_number,
                 manual_edit_block_ids=manual_edit_ids,
+                manual_regions=manual_regions,
             )
             if not preview.valid:
                 raise ValueError(
@@ -846,7 +883,6 @@ class JobManager:
             )
 
             cfg = job_config or TranslationJobConfig()
-            manual_regions = self.db.list_protection_regions(doc.id, page_index=page_index)
             all_page_splits = existing_splits + [spec]
             updated_splits: list[BlockSplitSpec] = []
             new_page_blocks = self.pdf_adapter.parse_and_extract_blocks(
@@ -1124,6 +1160,27 @@ class JobManager:
                 return job
 
             issues: list[ValidationIssue] = self.db.list_validation_issues(job.id) if resume else []
+            if not resume:
+                latest_splits = self.db.list_block_splits(doc.id)
+                for sp in latest_splits:
+                    if sp.page_index in set(page_indices) and sp.applied_status.startswith("pending_"):
+                        issues.append(
+                            ValidationIssue(
+                                id=f"iss-{uuid.uuid4().hex[:10]}",
+                                job_id=job.id,
+                                document_id=doc.id,
+                                page_index=sp.page_index,
+                                bbox=sp.snapped_bbox,
+                                code="PENDING_BLOCK_SPLIT_UNAPPLIED",
+                                severity=IssueSeverity.WARNING,
+                                message=(
+                                    f"ページ {sp.page_index + 1} の分割設定 {sp.id} は"
+                                    f"保留状態（{sp.applied_status}）のため適用されず、"
+                                    "元の親ブロック構成で処理されました。"
+                                ),
+                                details={"split_id": sp.id, "applied_status": sp.applied_status, "reason": sp.status_reason},
+                            )
+                        )
             newly_inferenced_blocks = 0
             llm_api_calls_made = 0
             cache_hit_blocks = 0
@@ -1216,8 +1273,10 @@ class JobManager:
                     ):
                         blk.translation_provenance = "manual_edit"
                         continue
-                    if blk.status == BlockStatus.FALLBACK_ORIGINAL and (
-                        target_block_ids is None or blk.id not in target_block_ids
+                    if (
+                        blk.status == BlockStatus.FALLBACK_ORIGINAL
+                        and not blk.needs_retranslation
+                        and (target_block_ids is None or blk.id not in target_block_ids)
                     ):
                         blk.translation_provenance = "fallback_original"
                         continue
@@ -1619,6 +1678,9 @@ class JobManager:
             requires_reparse_or_retranslate = False
 
             protection_changed = doc.protection_revision != job.based_on_protection_revision
+            split_formula_bbox_by_spec = {
+                s.id: s.snapped_bbox for s in self.db.list_block_splits(doc.id)
+            }
 
             for blk in working_blocks:
                 blk.warnings = []
@@ -1633,6 +1695,11 @@ class JobManager:
                         blk,
                         manual_by_page.get(blk.page_index, []),
                         job.config,
+                        sibling_formula_bbox=(
+                            split_formula_bbox_by_spec.get(blk.split_spec_id)
+                            if blk.split_spec_id and blk.split_role in ("top", "bottom")
+                            else None
+                        ),
                     )
                     blk.translation_text = saved_trans
                     blk.manual_translation_text = saved_manual
@@ -1652,6 +1719,7 @@ class JobManager:
                             blk.status = BlockStatus.TRANSLATED
                         else:
                             requires_reparse_or_retranslate = True
+                            blk.needs_retranslation = True
                             blk.status = BlockStatus.FALLBACK_ORIGINAL
                             blk.warnings.append("UNTRANSLATED_AFTER_PROTECTION_CHANGE")
                             issues.append(
@@ -1671,6 +1739,28 @@ class JobManager:
                 elif blk.status == BlockStatus.PROTECTED_SKIP:
                     reevaluated_scopes_by_block.setdefault(blk.id, set()).update(
                         {"translation_validation", "typesetting", "protection_change"}
+                    )
+                elif blk.status == BlockStatus.PENDING or (
+                    blk.needs_retranslation and saved_manual is None
+                ):
+                    requires_reparse_or_retranslate = True
+                    blk.needs_retranslation = True
+                    reevaluated_scopes_by_block.setdefault(blk.id, set()).add("protection_change")
+                    blk.status = BlockStatus.FALLBACK_ORIGINAL
+                    blk.warnings.append("UNTRANSLATED_AFTER_PROTECTION_CHANGE")
+                    issues.append(
+                        ValidationIssue(
+                            id=f"iss-{uuid.uuid4().hex[:10]}",
+                            job_id=job.id,
+                            document_id=doc.id,
+                            page_index=blk.page_index,
+                            block_id=blk.id,
+                            bbox=blk.bbox,
+                            code="UNTRANSLATED_AFTER_PROTECTION_CHANGE",
+                            severity=IssueSeverity.WARNING,
+                            message="再翻訳待ちまたは未翻訳のブロックが残った状態で再組版されたため、該当箇所は原文を保持しています。",
+                            fallback_applied=True,
+                        )
                     )
 
                 if blk.status in (BlockStatus.TRANSLATED, BlockStatus.MANUALLY_EDITED):
@@ -1980,16 +2070,38 @@ class JobManager:
             job.applied_block_revisions = applied_revisions
             job.original_hash_verified = original_intact
             job.warning_count = len(issues)
-            job.outputs_stale = False
-            job.outputs_stale_reason = None
+
+            untranslated_remaining = [
+                b
+                for b in working_blocks
+                if b.status == BlockStatus.PENDING
+                or (
+                    b.needs_retranslation
+                    and b.status != BlockStatus.PROTECTED_SKIP
+                    and b.manual_translation_text is None
+                )
+            ]
+            if untranslated_remaining or requires_reparse_or_retranslate:
+                job.outputs_stale = True
+                job.outputs_stale_reason = (
+                    f"未翻訳または再翻訳待ちのブロックが {len(untranslated_remaining)} 件残った状態で再組版されました"
+                    "（未翻訳箇所は原文のまま保持されています）。完全な翻訳成果物にするには「ブロック再翻訳」または新規翻訳を実行してから再組版してください。"
+                )
+            else:
+                job.outputs_stale = False
+                job.outputs_stale_reason = None
 
             has_fallbacks = any(
                 b.status == BlockStatus.FALLBACK_ORIGINAL for b in working_blocks
             )
-            if issues or has_fallbacks:
+            if issues or has_fallbacks or untranslated_remaining or requires_reparse_or_retranslate:
                 job.transition_to(
                     JobState.COMPLETED_WITH_WARNINGS,
-                    f"再組版完了（rev {next_rev}・要確認警告 {len(issues)} 件）",
+                    (
+                        f"暫定再組版完了（rev {next_rev}・未翻訳 {len(untranslated_remaining)} 件残存・要再翻訳）"
+                        if untranslated_remaining
+                        else f"再組版完了（rev {next_rev}・要確認警告 {len(issues)} 件）"
+                    ),
                 )
             else:
                 job.transition_to(

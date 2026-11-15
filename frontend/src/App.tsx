@@ -257,16 +257,21 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
     }
   };
 
-  const handleStartTranslationJob = async () => {
+  const handleStartTranslationJob = async (options?: {
+    allowPendingSplits?: boolean;
+  }) => {
     if (!currentDocument) return;
     setIsStartingJob(true);
     setJobStartError(null);
     setRetypesetMessage(null);
     setRetypesetError(null);
     try {
+      const effectiveConfig: TranslationJobConfig = options?.allowPendingSplits
+        ? { ...jobConfig, allow_pending_splits: true }
+        : jobConfig;
       const job = await startTranslationJob(
         currentDocument.id,
-        jobConfig,
+        effectiveConfig,
         runJobsInBackground
       );
       setCurrentJob(job);
@@ -742,6 +747,7 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
             onCreateBlockSplit={handleCreateBlockSplit}
             onDeleteBlockSplit={handleDeleteBlockSplit}
             onProceedToStartJob={handleStartTranslationJob}
+            jobStartError={jobStartError}
             onSetBlockOverride={handleSetBlockOverride}
             onReapplyAutoProtection={handleReapplyAutoProtection}
           />

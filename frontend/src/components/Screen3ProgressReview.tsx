@@ -368,6 +368,12 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
                 {job.is_mock_run ? "[MOCK 疑似翻訳]" : "[実機 PLaMo 3 Translate 2B]"}
               </span>
 
+              {job.outputs_stale && (
+                <span data-testid="job-stale-badge" className="badge badge-warning">
+                  ⚠ 成果物未同期（要再翻訳・再組版）
+                </span>
+              )}
+
               {/* Explicit Distinction: Cancel Requested vs Cancel Completed */}
               {isCancelRequestedWaiting && (
                 <span
@@ -417,16 +423,26 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
                 </div>
               </div>
             )}
-            {blocks.some((b) => b.status === "pending") && (
-              <div
-                data-testid="unprotected-pending-notice"
-                className="badge badge-warning"
-                style={{ marginTop: "6px" }}
-              >
-                保護解除により未翻訳のブロックがあります（
-                {blocks.filter((b) => b.status === "pending").length}件）。ブロックを選択して「再翻訳」を実行し、再組版してください。
-              </div>
-            )}
+            {(() => {
+              const untranslatedCount = blocks.filter(
+                (b) =>
+                  b.status === "pending" ||
+                  (b.needs_retranslation &&
+                    b.status !== "protected_skip" &&
+                    b.manual_translation_text == null)
+              ).length;
+              if (untranslatedCount === 0) return null;
+              return (
+                <div
+                  data-testid="unprotected-pending-notice"
+                  className="badge badge-warning"
+                  style={{ marginTop: "6px" }}
+                >
+                  未翻訳・再翻訳待ちのブロックがあります（
+                  {untranslatedCount}件）。ブロックを選択して「再翻訳」を実行し、再組版してください。
+                </div>
+              );
+            })()}
           </div>
 
           <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>

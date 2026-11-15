@@ -13,7 +13,7 @@
  *   tiny accidental clicks, and out-of-bounds clamping.
  */
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import type {
   Block,
   BlockKind,
@@ -66,7 +66,8 @@ export interface Screen2Props {
     expected_parent_signature?: string | null;
   }) => Promise<unknown>;
   onDeleteBlockSplit?: (splitId: string) => Promise<void>;
-  onProceedToStartJob: () => Promise<void>;
+  onProceedToStartJob: (options?: { allowPendingSplits?: boolean }) => Promise<void>;
+  jobStartError?: string | null;
   onSetBlockOverride?: (
     blockId: string,
     override: "force_translate" | "force_protect" | null
@@ -222,6 +223,7 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
   onCreateBlockSplit,
   onDeleteBlockSplit,
   onProceedToStartJob,
+  jobStartError = null,
 }) => {
   const [displayPage, setDisplayPage] = useState<number>(1);
   const [scale, setScale] = useState<number>(1.0);
@@ -240,6 +242,18 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
   const [selectedRegionId, setSelectedRegionId] = useState<string | null>(null);
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
   const [dragNotice, setDragNotice] = useState<string | null>(null);
+  const [allowPendingSplitsStart, setAllowPendingSplitsStart] = useState<boolean>(false);
+
+  const pendingSplits = blockSplits.filter((sp) =>
+    sp.applied_status.startsWith("pending_")
+  );
+  const pendingSplitSignature = pendingSplits
+    .map((sp) => `${sp.id}:${sp.applied_status}`)
+    .join("|");
+
+  useEffect(() => {
+    setAllowPendingSplitsStart(false);
+  }, [pendingSplitSignature]);
 
   const [dragStart, setDragStart] = useState<[number, number] | null>(null);
   const [dragCurrent, setDragCurrent] = useState<[number, number] | null>(null);
@@ -560,12 +574,61 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
               type="button"
               className="btn btn-primary"
               data-testid="screen2-start-job-btn"
-              onClick={() => void onProceedToStartJob()}
+              disabled={pendingSplits.length > 0 && !allowPendingSplitsStart}
+              onClick={() =>
+                void onProceedToStartJob(
+                  allowPendingSplitsStart ? { allowPendingSplits: true } : undefined
+                )
+              }
             >
               この設定で翻訳を開始 ▶
             </button>
           </div>
         </div>
+
+        {pendingSplits.length > 0 && (
+          <div
+            role="alert"
+            data-testid="pending-splits-job-warning"
+            className="alert alert-warning"
+            style={{ marginTop: "10px", fontSize: "13px" }}
+          >
+            <div>
+              <strong>⚠ 適用保留中（pending）の分割設定が {pendingSplits.length} 件あります:</strong>{" "}
+              対象ページ:{" "}
+              {Array.from(new Set(pendingSplits.map((s) => `${s.page_index + 1}`))).join(", ")}。
+              保留状態のまま翻訳を開始すると、該当箇所は数式分離されず元の親ブロックのまま処理されます。不要な場合は右側の「分割指定一覧」から削除・再設定してください。
+            </div>
+            <label
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "6px",
+                marginTop: "6px",
+                fontWeight: 600,
+              }}
+            >
+              <input
+                type="checkbox"
+                data-testid="allow-pending-splits-checkbox"
+                checked={allowPendingSplitsStart}
+                onChange={(ev) => setAllowPendingSplitsStart(ev.target.checked)}
+              />
+              適用保留中の分割設定を除いてそのまま翻訳を開始することを了承する
+            </label>
+          </div>
+        )}
+
+        {jobStartError && (
+          <div
+            role="alert"
+            data-testid="screen2-job-start-error"
+            className="alert alert-error"
+            style={{ marginTop: "10px", fontSize: "13px" }}
+          >
+            <strong>ジョブ開始エラー:</strong> {jobStartError}
+          </div>
+        )}
 
         {/* Legend (Color + Icon + Line Style + Source Distinction) */}
         <div
