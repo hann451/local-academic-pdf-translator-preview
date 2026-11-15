@@ -386,9 +386,18 @@ class JobManager:
     @staticmethod
     def _inline_spans_signature(
         spans: list[InlineMathSpan],
-    ) -> tuple[tuple[str, str, str, bool, bool], ...]:
+    ) -> tuple[tuple[str, str, str, bool, bool, tuple[int, ...] | None], ...]:
         return tuple(
-            (s.context_text, s.target_text, s.role, s.overbar, s.ambiguous)
+            (
+                s.context_text,
+                s.target_text,
+                s.role,
+                s.overbar,
+                s.ambiguous,
+                tuple(s.mask_occurrence_indices)
+                if s.mask_occurrence_indices is not None
+                else None,
+            )
             for s in spans
         )
 

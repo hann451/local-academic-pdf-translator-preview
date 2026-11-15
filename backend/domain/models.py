@@ -210,6 +210,14 @@ class InlineMathSpan(BaseModel):
         default=False,
         description="True when conflicting super/sub/normal roles exist for this context in the block",
     )
+    mask_occurrence_indices: list[int] | None = Field(
+        default=None,
+        description=(
+            "Optional 0-based word-boundary occurrence indices in block.source_text "
+            "where this span is geometry-confirmed as script (used to mask math variables "
+            "like `a_t` without corrupting colliding prose stopwords like `starts at`)."
+        ),
+    )
 
 
 class ContinuationCandidate(BaseModel):

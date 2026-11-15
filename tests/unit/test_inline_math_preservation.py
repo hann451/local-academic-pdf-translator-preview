@@ -2786,3 +2786,175 @@ def test_compound_subscript_grouping_masking_and_rendering(tmp_path: Path) -> No
             assert same_line_normals
             assert ss["origin"][1] > same_line_normals[0]["origin"][1] + 1.0
 
+
+def test_stopword_colliding_subscript_variables_masked_by_occurrence_and_rendered(
+    tmp_path: Path,
+) -> None:
+    """Geometry-confirmed script variables whose spelling collides with English stopwords
+    (e.g. subscript `a_t` vs prose `'starts at the'`, or `i_n` vs `'in this'`) must be:
+      1) Annotated with exact `mask_occurrence_indices` rather than `ambiguous=True`,
+      2) Masked to `{vN}` ONLY at the script occurrences (never corrupting prose prepositions),
+      3) Rejected by `validate_translation_output` if dropped by the translator,
+      4) Rendered as proper subscripts in final mono & dual PDFs.
+    """
+    raw_lines = [
+        {
+            "spans": [
+                {"text": "the window ", "size": 9.96, "font": "CMR10", "origin": [50.0, 110.0], "bbox": [50.0, 100.0, 100.0, 112.0]},
+                {"text": "starts at the", "size": 9.96, "font": "CMR10", "origin": [101.0, 110.0], "bbox": [101.0, 100.0, 155.0, 112.0]},
+                {"text": " initial frame with ", "size": 9.96, "font": "CMR10", "origin": [156.0, 110.0], "bbox": [156.0, 100.0, 240.0, 112.0]},
+            ]
+        },
+        {
+            "spans": [
+                {"text": "ˆ", "size": 9.96, "font": "CMR10", "origin": [51.5, 119.5], "bbox": [51.5, 112.0, 56.5, 121.0]},
+                {"text": "H", "size": 9.96, "font": "CMMI10", "origin": [50.0, 122.0], "bbox": [50.0, 112.0, 58.0, 124.0]},
+                {"text": "m,n,k,t", "size": 6.97, "font": "CMMI7", "origin": [58.2, 123.5], "bbox": [58.2, 117.0, 82.0, 125.0]},
+                {"text": " per window, we define the value ", "size": 9.96, "font": "CMR10", "origin": [83.0, 122.0], "bbox": [83.0, 112.0, 232.0, 124.0]},
+                {"text": "a", "size": 9.96, "font": "CMMI10", "origin": [233.0, 122.0], "bbox": [233.0, 112.0, 238.5, 124.0]},
+                {"text": "t", "size": 6.97, "font": "CMMI7", "origin": [238.6, 123.5], "bbox": [238.6, 117.0, 242.0, 125.0]},
+                {"text": " of", "size": 9.96, "font": "CMR10", "origin": [243.0, 122.0], "bbox": [243.0, 112.0, 256.0, 124.0]},
+            ]
+        },
+    ]
+
+    extracted = extract_inline_math_spans(raw_lines, [])
+    at_span = next(s for s in extracted if s.context_text == "at")
+    assert at_span.role == "sub"
+    assert at_span.target_text == "t"
+    assert at_span.ambiguous is False
+    assert at_span.mask_occurrence_indices == [1]
+
+    source_text = (
+        "the window starts at the initial frame with "
+        "ˆHm,n,k,t per window, we define the value at of"
+    )
+    masked, items = mask_inline_protected_elements(source_text, inline_math_spans=extracted)
+    assert "starts at the" in masked
+    assert masked.endswith("define the value {v2} of")
+    assert [(it.placeholder, it.original_text) for it in items] == [
+        ("{v1}", "ˆHm,n,k,t"),
+        ("{v2}", "at"),
+    ]
+    assert unmask_inline_protected_elements(masked, items) == source_text
+
+    # Translator dropping `{v2}` (omitting `a_t`) must be rejected by validator
+    bad_val = validate_translation_output(
+        source_text,
+        masked,
+        "{v1}の分散を用いて、の値を定義する。",
+        items,
+    )
+    assert bad_val.is_valid is False
+    assert "PLACEHOLDER_MISSING" in bad_val.error_codes
+
+    ok_tr = "ウィンドウは初期フレームから始まり、{v1}の分散を用いて、{v2}の値を定義する。"
+    ok_val = validate_translation_output(source_text, masked, ok_tr, items)
+    assert ok_val.is_valid is True
+
+    # Generalized stopword check (`in` -> `i_n` alongside prose `"in this"` and `"at"` prose + 2x `a_t`)
+    multi_lines = [
+        {
+            "spans": [
+                {"text": "In prose, we stay ", "size": 10.0, "font": "CMR10", "origin": [50.0, 100.0], "bbox": [50.0, 90.0, 130.0, 102.0]},
+                {"text": "in", "size": 10.0, "font": "CMR10", "origin": [132.0, 100.0], "bbox": [132.0, 90.0, 141.0, 102.0]},
+                {"text": " the loop at first, then ", "size": 10.0, "font": "CMR10", "origin": [143.0, 100.0], "bbox": [143.0, 90.0, 240.0, 102.0]},
+                {"text": "i", "size": 10.0, "font": "CMMI10", "origin": [242.0, 100.0], "bbox": [242.0, 90.0, 246.0, 102.0]},
+                {"text": "n", "size": 7.0, "font": "CMMI7", "origin": [246.1, 101.8], "bbox": [246.1, 95.0, 250.0, 103.5]},
+                {"text": " updates ", "size": 10.0, "font": "CMR10", "origin": [252.0, 100.0], "bbox": [252.0, 90.0, 290.0, 102.0]},
+                {"text": "a", "size": 10.0, "font": "CMMI10", "origin": [291.0, 100.0], "bbox": [291.0, 90.0, 296.0, 102.0]},
+                {"text": "t", "size": 7.0, "font": "CMMI7", "origin": [296.1, 101.8], "bbox": [296.1, 95.0, 299.5, 103.5]},
+                {"text": " and ", "size": 10.0, "font": "CMR10", "origin": [301.0, 100.0], "bbox": [301.0, 90.0, 322.0, 102.0]},
+                {"text": "a", "size": 10.0, "font": "CMMI10", "origin": [323.0, 100.0], "bbox": [323.0, 90.0, 328.0, 102.0]},
+                {"text": "t", "size": 7.0, "font": "CMMI7", "origin": [328.1, 101.8], "bbox": [328.1, 95.0, 331.5, 103.5]},
+                {"text": ".", "size": 10.0, "font": "CMR10", "origin": [332.0, 100.0], "bbox": [332.0, 90.0, 335.0, 102.0]},
+            ]
+        }
+    ]
+    multi_spans = extract_inline_math_spans(multi_lines, [])
+    multi_src = "In prose, we stay in the loop at first, then in updates at and at."
+    multi_masked, multi_items = mask_inline_protected_elements(multi_src, inline_math_spans=multi_spans)
+    assert multi_masked == "In prose, we stay in the loop at first, then {v1} updates {v2} and {v3}."
+    assert [(it.placeholder, it.original_text) for it in multi_items] == [
+        ("{v1}", "in"),
+        ("{v2}", "at"),
+        ("{v3}", "at"),
+    ]
+    assert unmask_inline_protected_elements(multi_masked, multi_items) == multi_src
+
+    # End-to-end PDF typesetting confirms subscript `t` rendering in Japanese prose
+    pdf_path = tmp_path / "at_sub_src.pdf"
+    pdf_doc = pymupdf.open()
+    pg = pdf_doc.new_page(width=595, height=842)
+    pg.insert_textbox(pymupdf.Rect(50.0, 95.0, 290.0, 165.0), source_text, fontsize=9.96)
+    pdf_doc.save(str(pdf_path))
+    pdf_doc.close()
+
+    doc_model = Document(
+        id="doc-at-sub",
+        original_filename="at_sub_src.pdf",
+        safe_storage_path=str(pdf_path),
+        sha256_hash=compute_sha256(pdf_path),
+        file_size_bytes=pdf_path.stat().st_size,
+        page_count=1,
+    )
+    blk = Block(
+        id="doc-at-sub:page-1:block-1",
+        page_index=0,
+        bbox=[50.0, 95.0, 290.0, 165.0],
+        kind=BlockKind.PARAGRAPH,
+        source_text=source_text,
+        masked_source_text=masked,
+        protected_items=items,
+        inline_math_spans=extracted,
+        translation_text=ok_tr,
+        status=BlockStatus.TRANSLATED,
+        font_size_pt=9.96,
+    )
+    adapter = NativePreservingAdapter(config=AppConfig(runtime_dir=tmp_path / "rt_at"))
+    mono_out = tmp_path / "at_sub_mono.pdf"
+    dual_out = tmp_path / "at_sub_dual.pdf"
+    updated, issues = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=[blk],
+        page_indices=[0],
+        job_config=TranslationJobConfig(output_mono_pdf=True, output_dual_pdf=True),
+        mono_output_path=mono_out,
+        dual_output_path=dual_out,
+        job_id="job-at-sub",
+    )
+    assert not issues
+    assert updated[0].status == BlockStatus.TRANSLATED
+    fitted = updated[0].fitted_font_size_pt or 9.0
+
+    for out_file, is_dual in [(mono_out, False), (dual_out, True)]:
+        d_out = pymupdf.open(str(out_file))
+        clip = (
+            pymupdf.Rect(50.0 + 595.0, 95.0, 290.0 + 595.0, 165.0)
+            if is_dual and d_out[0].rect.width > 700
+            else pymupdf.Rect(50.0, 95.0, 290.0, 165.0)
+        )
+        pd = d_out[0].get_text("dict", clip=clip)
+        d_out.close()
+        rendered_spans = [
+            s
+            for b_item in pd["blocks"]
+            if b_item.get("type") == 0
+            for ln in b_item["lines"]
+            for s in ln["spans"]
+        ]
+        full_text = "".join(s["text"] for s in rendered_spans).replace("\xa0", " ")
+        assert "{v" not in full_text
+        assert "atの値を定義する" in full_text
+
+        sub_t_spans = [s for s in rendered_spans if s["text"] == "t" and s["size"] < fitted * 0.85]
+        assert sub_t_spans
+        for ss in sub_t_spans:
+            same_line_normals = [
+                ns
+                for ns in rendered_spans
+                if ns["size"] >= fitted * 0.90 and abs(ns["origin"][1] - ss["origin"][1]) < 6.0
+            ]
+            assert same_line_normals
+            assert ss["origin"][1] > same_line_normals[0]["origin"][1] + 1.0
+

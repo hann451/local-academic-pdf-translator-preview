@@ -93,6 +93,89 @@ _SUBSUP_TAIL = (
 _PROSE_SHORT_WORDS = (
     r"(?:in|of|on|to|at|by|or|as|is|it|we|be|do|no|so|up|us|an|if|he|me|my|go|am)"
 )
+_PROSE_STOPWORD_SET: frozenset[str] = frozenset(_PROSE_SHORT_WORDS[3:-1].split("|")) | {
+    "the",
+    "and",
+    "for",
+    "not",
+    "but",
+    "are",
+    "was",
+    "has",
+    "had",
+    "can",
+    "may",
+    "out",
+    "off",
+    "per",
+    "via",
+}
+_WORD_MATH_CHAR_RE = re.compile(r"[A-Za-z0-9\U0001d400-\U0001d7ff]")
+
+
+def _build_math_span_boundary_regex(cand: str) -> re.Pattern[str]:
+    """Compile a word-boundary-aware regex for matching `cand` without splitting ASCII/math tokens."""
+    left_guard = (
+        r"(?<![A-Za-z0-9\U0001d400-\U0001d7ff])"
+        if cand and _WORD_MATH_CHAR_RE.match(cand[0])
+        else ""
+    )
+    right_guard = (
+        r"(?![A-Za-z0-9\U0001d400-\U0001d7ff])"
+        if cand and _WORD_MATH_CHAR_RE.match(cand[-1])
+        else ""
+    )
+    return re.compile(left_guard + re.escape(cand) + right_guard)
+
+
+def _join_line_spans_with_ranges(
+    spans: list[dict],
+) -> tuple[str, list[tuple[int, int] | None]]:
+    """Join raw spans in a PDF line inserting missing horizontal word gaps, and return span char ranges."""
+    line_sizes = [float(s.get("size", 10.0)) for s in spans if str(s.get("text", "")).strip()]
+    max_line_size = max(line_sizes) if line_sizes else 10.0
+    line_parts: list[str] = []
+    span_ranges: list[tuple[int, int] | None] = [None] * len(spans)
+    cur_len = 0
+    prev_span: dict | None = None
+
+    for s_idx, s in enumerate(spans):
+        t = str(s.get("text", "")).replace("\xa0", " ")
+        if not t:
+            continue
+        if prev_span is not None:
+            prev_t = str(prev_span.get("text", "")).replace("\xa0", " ")
+            prev_bbox = prev_span.get("bbox")
+            cur_bbox = s.get("bbox")
+            if (
+                prev_t
+                and not prev_t[-1].isspace()
+                and not t[0].isspace()
+                and isinstance(prev_bbox, (list, tuple))
+                and len(prev_bbox) == 4
+                and isinstance(cur_bbox, (list, tuple))
+                and len(cur_bbox) == 4
+            ):
+                dx = float(cur_bbox[0]) - float(prev_bbox[2])
+                if dx >= max(1.8, max_line_size * 0.22):
+                    has_prose_boundary = bool(
+                        re.search(r"(?:[A-Za-z]{2,}|\b[aI])$", prev_t)
+                        or re.match(r"^\(?([A-Za-z]{2,}|[aI])\b", t)
+                    )
+                    if (
+                        has_prose_boundary
+                        and t[0] not in ".,;:!?)]}’”'"
+                        and prev_t[-1] not in "([{‘“"
+                    ):
+                        line_parts.append(" ")
+                        cur_len += 1
+        span_start = cur_len
+        line_parts.append(t)
+        cur_len += len(t)
+        span_ranges[s_idx] = (span_start, cur_len)
+        prev_span = s
+
+    return "".join(line_parts), span_ranges
 # Disallow 3+ letter plain ASCII prose words inside math function args unless they are known math functions
 _NON_PROSE_ARG = (
     r"\((?!(?:(?!"
@@ -335,16 +418,48 @@ def extract_inline_math_spans(
     vector line drawings. Never guesses superscripts/subscripts from plain text.
     """
     lines = _merge_horizontal_visual_lines(raw_lines)
+    block_line_parts: list[str] = []
+    block_cursor = 0
+    span_global_ranges: dict[tuple[int, int], tuple[int, int]] = {}
+    for line_idx, line in enumerate(lines):
+        spans = line.get("spans", [])
+        if not spans:
+            continue
+        joined_line, local_ranges = _join_line_spans_with_ranges(spans)
+        stripped_line = joined_line.strip()
+        if not stripped_line:
+            continue
+        lstrip_delta = len(joined_line) - len(joined_line.lstrip())
+        if block_line_parts:
+            block_cursor += 1
+        line_base = block_cursor
+        for s_idx, rng in enumerate(local_ranges):
+            if rng is None:
+                continue
+            ls, le = rng
+            gs = line_base + max(0, ls - lstrip_delta)
+            ge = line_base + max(0, min(le - lstrip_delta, len(stripped_line)))
+            span_global_ranges[(line_idx, s_idx)] = (gs, ge)
+        block_line_parts.append(stripped_line)
+        block_cursor += len(stripped_line)
+    block_text = " ".join(block_line_parts)
+
     spans_out: list[InlineMathSpan] = []
     seen_keys: set[tuple[str, str, str]] = set()
+    script_char_ranges: dict[tuple[str, str, str], list[tuple[int, int]]] = {}
 
-    def _add(item: InlineMathSpan) -> None:
+    def _add(
+        item: InlineMathSpan,
+        script_range: tuple[int, int] | None = None,
+    ) -> None:
         key = (item.role, item.context_text, item.target_text)
+        if script_range is not None:
+            script_char_ranges.setdefault(key, []).append(script_range)
         if key not in seen_keys:
             seen_keys.add(key)
             spans_out.append(item)
 
-    for line in lines:
+    for line_idx, line in enumerate(lines):
         spans = line["spans"]
         line_sizes = [
             float(s.get("size", 10.0)) for s in spans if str(s.get("text", "")).strip()
@@ -579,6 +694,17 @@ def extract_inline_math_spans(
                     group_text = "".join(script_parts).strip()
                     if not group_text:
                         continue
+                    r0 = span_global_ranges.get((line_idx, cur_idx))
+                    r1 = span_global_ranges.get((line_idx, end_idx))
+                    script_rng: tuple[int, int] | None = None
+                    if r0 is not None and r1 is not None:
+                        s0, s1 = r0[0], r1[1]
+                        while s0 < s1 and block_text[s0].isspace():
+                            s0 += 1
+                        while s1 > s0 and block_text[s1 - 1].isspace():
+                            s1 -= 1
+                        if s1 > s0:
+                            script_rng = (s0, s1)
 
                     prev_script = script_base_by_idx.get(ps_idx)
                     if prev_script is not None and prev_script[1] != role_lit:
@@ -590,7 +716,8 @@ def extract_inline_math_spans(
                                 role=role_lit,
                                 scale=0.78,
                                 dy_em=dy_val,
-                            )
+                            ),
+                            script_range=script_rng,
                         )
                         _add(
                             InlineMathSpan(
@@ -599,7 +726,8 @@ def extract_inline_math_spans(
                                 role=role_lit,
                                 scale=0.78,
                                 dy_em=dy_val,
-                            )
+                            ),
+                            script_range=script_rng,
                         )
                         idx = end_idx + 1
                     elif prev_script is not None:
@@ -622,7 +750,8 @@ def extract_inline_math_spans(
                                     role=role_lit,
                                     scale=0.78,
                                     dy_em=dy_val,
-                                )
+                                ),
+                                script_range=script_rng,
                             )
                             _add(
                                 InlineMathSpan(
@@ -631,7 +760,8 @@ def extract_inline_math_spans(
                                     role=role_lit,
                                     scale=0.78,
                                     dy_em=dy_val,
-                                )
+                                ),
+                                script_range=script_rng,
                             )
                             idx = end_idx + 1
                     else:
@@ -654,7 +784,8 @@ def extract_inline_math_spans(
                                     role=role_lit,
                                     scale=0.78,
                                     dy_em=dy_val,
-                                )
+                                ),
+                                script_range=script_rng,
                             )
                             idx = end_idx + 1
 
@@ -671,23 +802,6 @@ def extract_inline_math_spans(
                     (item.role, item.target_text)
                 )
         if variants_by_ctx:
-            _PROSE_STOPWORD_SET = frozenset(_PROSE_SHORT_WORDS[3:-1].split("|")) | {
-                "the",
-                "and",
-                "for",
-                "not",
-                "but",
-                "are",
-                "was",
-                "has",
-                "had",
-                "can",
-                "may",
-                "out",
-                "off",
-                "per",
-                "via",
-            }
             normal_chunks: list[list[tuple[str, bool]]] = []
             for line in lines:
                 spans = line["spans"]
@@ -752,19 +866,8 @@ def extract_inline_math_spans(
                 if cur_normal:
                     normal_chunks.append(cur_normal)
 
-            _WORD_MATH_CH_RE = re.compile(r"[A-Za-z0-9\U0001d400-\U0001d7ff]")
             for ctx, vset in variants_by_ctx.items():
-                left_guard = (
-                    r"(?<![A-Za-z0-9\U0001d400-\U0001d7ff])"
-                    if ctx and _WORD_MATH_CH_RE.match(ctx[0])
-                    else ""
-                )
-                right_guard = (
-                    r"(?![A-Za-z0-9\U0001d400-\U0001d7ff])"
-                    if ctx and _WORD_MATH_CH_RE.match(ctx[-1])
-                    else ""
-                )
-                pat = re.compile(left_guard + re.escape(ctx) + right_guard)
+                pat = _build_math_span_boundary_regex(ctx)
                 is_lower_stopword = ctx.islower() and ctx in _PROSE_STOPWORD_SET
                 for chunk_parts in normal_chunks:
                     chunk_text = "".join(t for t, _ in chunk_parts)
@@ -810,6 +913,26 @@ def extract_inline_math_spans(
                             seen_ambiguous.add(key)
                             final_spans.append(item.model_copy(update={"ambiguous": True}))
                         continue
+                    ctx_clean = item.context_text.strip()
+                    if ctx_clean and ctx_clean.lower() in _PROSE_STOPWORD_SET:
+                        ranges = script_char_ranges.get(
+                            (item.role, item.context_text, item.target_text),
+                            [],
+                        )
+                        if ranges and block_text:
+                            pat = _build_math_span_boundary_regex(ctx_clean)
+                            occ_indices = [
+                                occ_i
+                                for occ_i, m in enumerate(pat.finditer(block_text))
+                                if any(
+                                    rs >= m.start() and re_ <= m.end()
+                                    for rs, re_ in ranges
+                                )
+                            ]
+                            if occ_indices:
+                                item = item.model_copy(
+                                    update={"mask_occurrence_indices": occ_indices}
+                                )
                 final_spans.append(item)
             spans_out = final_spans
 
@@ -2085,8 +2208,6 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 continue
             line_sizes = [float(s.get("size", 10.0)) for s in spans if s.get("text", "").strip()]
             max_line_size = max(line_sizes) if line_sizes else 10.0
-            line_parts: list[str] = []
-            prev_span: dict | None = None
 
             for s in spans:
                 t = str(s.get("text", "")).replace("\xa0", " ")
@@ -2102,36 +2223,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 if (flags & 1) or (sz < max_line_size * 0.78 and len(t.strip()) <= 4):
                     has_sub_super = True
 
-                if prev_span is not None:
-                    prev_t = str(prev_span.get("text", "")).replace("\xa0", " ")
-                    prev_bbox = prev_span.get("bbox")
-                    cur_bbox = s.get("bbox")
-                    if (
-                        prev_t
-                        and not prev_t[-1].isspace()
-                        and not t[0].isspace()
-                        and isinstance(prev_bbox, (list, tuple))
-                        and len(prev_bbox) == 4
-                        and isinstance(cur_bbox, (list, tuple))
-                        and len(cur_bbox) == 4
-                    ):
-                        dx = float(cur_bbox[0]) - float(prev_bbox[2])
-                        if dx >= max(1.8, max_line_size * 0.22):
-                            has_prose_boundary = bool(
-                                re.search(r"(?:[A-Za-z]{2,}|\b[aI])$", prev_t)
-                                or re.match(r"^\(?([A-Za-z]{2,}|[aI])\b", t)
-                            )
-                            if (
-                                has_prose_boundary
-                                and t[0] not in ".,;:!?)]}’”'"
-                                and prev_t[-1] not in "([{‘“"
-                            ):
-                                line_parts.append(" ")
-
-                line_parts.append(t)
-                prev_span = s
-
-            joined_line = "".join(line_parts)
+            joined_line, _ = _join_line_spans_with_ranges(spans)
             if joined_line.strip():
                 text_lines.append(joined_line)
 
@@ -3582,6 +3674,30 @@ TYPESETTING_ISSUE_CODES: frozenset[str] = frozenset(
 # ----------------------------------------------------------------------
 # Helper functions for Inline Formula Masking & Kinsoku Japanese Fitting
 # ----------------------------------------------------------------------
+def _map_orig_chars_to_working(
+    working_str: str,
+    orig_text: str,
+    items_list: list[tuple[ProtectedItemKind, str]],
+    sentinel_base_cp: int,
+) -> dict[int, int] | None:
+    """Map unmasked original character offsets in `orig_text` to current indices in `working_str`."""
+    orig_to_work: dict[int, int] = {}
+    orig_pos = 0
+    item_count = len(items_list)
+    for work_pos, ch in enumerate(working_str):
+        code = ord(ch) - sentinel_base_cp
+        if 0 <= code < item_count:
+            orig_pos += len(items_list[code][1])
+        else:
+            if orig_pos >= len(orig_text) or orig_text[orig_pos] != ch:
+                return None
+            orig_to_work[orig_pos] = work_pos
+            orig_pos += 1
+    if orig_pos != len(orig_text):
+        return None
+    return orig_to_work
+
+
 def mask_inline_protected_elements(
     text: str,
     inline_math_spans: list[InlineMathSpan] | None = None,
@@ -3656,40 +3772,73 @@ def mask_inline_protected_elements(
         }
         compound_candidates: list[str] = []
         seen_cand: set[str] = set()
+        stopword_occ_by_ctx: dict[str, set[int]] = {}
         for ms in inline_math_spans:
             if ms.role not in ("super", "sub") or ms.ambiguous:
                 continue
             ctx = ms.context_text.strip()
             tgt = ms.target_text.strip()
-            if not ctx or not tgt or not any(ch in tgt for ch in ",+-−*/."):
+            if not ctx or not tgt:
                 continue
-            if ctx[0] in hat_prefixes:
-                hat_ctx = f"ˆ{ctx}"
-                if hat_ctx not in seen_cand:
-                    seen_cand.add(hat_ctx)
-                    compound_candidates.append(hat_ctx)
-            if ctx not in seen_cand:
-                seen_cand.add(ctx)
-                compound_candidates.append(ctx)
+            if any(ch in tgt for ch in ",+-−*/."):
+                if ctx[0] in hat_prefixes:
+                    hat_ctx = f"ˆ{ctx}"
+                    if hat_ctx not in seen_cand:
+                        seen_cand.add(hat_ctx)
+                        compound_candidates.append(hat_ctx)
+                if ctx not in seen_cand:
+                    seen_cand.add(ctx)
+                    compound_candidates.append(ctx)
+            elif ctx.lower() in _PROSE_STOPWORD_SET and ms.mask_occurrence_indices:
+                stopword_occ_by_ctx.setdefault(ctx, set()).update(
+                    idx for idx in ms.mask_occurrence_indices if idx >= 0
+                )
         compound_candidates.sort(key=len, reverse=True)
         for cand in compound_candidates:
             if sentinel_re.search(cand):
                 continue
-            l_guard = (
-                r"(?<![A-Za-z0-9\U0001d400-\U0001d7ff])"
-                if re.match(r"[A-Za-z0-9\U0001d400-\U0001d7ff]", cand[0])
-                else ""
-            )
-            r_guard = (
-                r"(?![A-Za-z0-9\U0001d400-\U0001d7ff])"
-                if re.match(r"[A-Za-z0-9\U0001d400-\U0001d7ff]", cand[-1])
-                else ""
-            )
-            cand_re = re.compile(l_guard + re.escape(cand) + r_guard)
+            cand_re = _build_math_span_boundary_regex(cand)
             working = cand_re.sub(
                 lambda m: _alloc_sentinel(ProtectedItemKind.INLINE_FORMULA, m.group(0)),
                 working,
             )
+        if stopword_occ_by_ctx:
+            for cand in sorted(stopword_occ_by_ctx, key=len, reverse=True):
+                if sentinel_re.search(cand):
+                    continue
+                occ_set = stopword_occ_by_ctx[cand]
+                if not occ_set:
+                    continue
+                orig_to_work = _map_orig_chars_to_working(
+                    working, text, pending_items, base_cp
+                )
+                if orig_to_work is None:
+                    continue
+                cand_re = _build_math_span_boundary_regex(cand)
+                replacements: list[tuple[int, int, str]] = []
+                for occ_idx, m in enumerate(cand_re.finditer(text)):
+                    if occ_idx not in occ_set:
+                        continue
+                    m_start, m_end = m.start(), m.end()
+                    if (
+                        m_start > 0
+                        and cand[0] in hat_prefixes
+                        and text[m_start - 1] == "ˆ"
+                        and (m_start - 1) in orig_to_work
+                    ):
+                        m_start -= 1
+                    if not all(pos in orig_to_work for pos in range(m_start, m_end)):
+                        continue
+                    w_start = orig_to_work[m_start]
+                    w_end = orig_to_work[m_end - 1] + 1
+                    if w_end - w_start != m_end - m_start:
+                        continue
+                    replacements.append((w_start, w_end, text[m_start:m_end]))
+                for w_start, w_end, orig_slice in reversed(replacements):
+                    sentinel = _alloc_sentinel(
+                        ProtectedItemKind.INLINE_FORMULA, orig_slice
+                    )
+                    working = working[:w_start] + sentinel + working[w_end:]
 
     items: list[ProtectedItem] = []
     counter = 0
