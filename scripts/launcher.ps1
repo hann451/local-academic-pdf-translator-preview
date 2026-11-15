@@ -16,12 +16,11 @@ Add-Type -AssemblyName System.Drawing
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptDir
+. (Join-Path $ScriptDir "model_registry_common.ps1")
 $FrontendDistIndex = Join-Path $ProjectRoot "frontend\dist\index.html"
 $VenvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 $VulkanServerExe = Join-Path $ProjectRoot "tools\llama.cpp\b12167-vulkan-x64\llama-server.exe"
 $CpuServerExe = Join-Path $ProjectRoot "tools\llama.cpp\b12167-cpu-x64\llama-server.exe"
-$ModelFileName = "plamo-3-translate-2b-Q4_K_M.gguf"
-$ExpectedModelSize = 1807199392L
 
 $RuntimeProfilePath = Join-Path $ProjectRoot ".runtime_tools\runtime_profile.json"
 $profileUserDataDir = ""
@@ -49,8 +48,6 @@ if ([string]::IsNullOrWhiteSpace($UserDataDir)) {
 $LogsDir = Join-Path $UserDataDir "logs"
 $LauncherLogPath = Join-Path $LogsDir "launcher.log"
 $EdgeProfileDir = Join-Path $UserDataDir "edge_profile"
-$UserModelPath = Join-Path $UserDataDir "models\plamo-3-translate-2b-GGUF\$ModelFileName"
-$RepoModelPath = Join-Path $ProjectRoot "models\plamo-3-translate-2b-GGUF\$ModelFileName"
 
 foreach ($d in @($UserDataDir, $LogsDir, $EdgeProfileDir)) {
     if (-not (Test-Path -LiteralPath $d)) {
@@ -376,24 +373,6 @@ function Wait-EndpointOrCrash {
     return @{ Ready = $false; Exited = $false; ExitCode = $null; ErrTail = $errTailTimeout }
 }
 
-function Test-ValidModelQuick {
-    param([string]$ModelPath)
-    if (-not (Test-Path -LiteralPath $ModelPath)) { return $false }
-    $info = Get-Item -LiteralPath $ModelPath
-    if ($info.Length -ne $ExpectedModelSize) { return $false }
-    $fs = $null
-    try {
-        $fs = [System.IO.File]::OpenRead($ModelPath)
-        $buf = New-Object byte[] 4
-        $r = $fs.Read($buf, 0, 4)
-        return ($r -eq 4 -and $buf[0] -eq 0x47 -and $buf[1] -eq 0x47 -and $buf[2] -eq 0x55 -and $buf[3] -eq 0x46)
-    } catch {
-        return $false
-    } finally {
-        if ($fs) { $fs.Close() }
-    }
-}
-
 function Find-EdgeExecutable {
     $candidates = @(
         "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
@@ -530,30 +509,31 @@ try {
         }
     }
 
-    # 2. Verify Model Presence
-    $resolvedModelPath = $null
-    if (Test-ValidModelQuick -ModelPath $RepoModelPath) {
-        $resolvedModelPath = $RepoModelPath
-    } elseif (Test-ValidModelQuick -ModelPath $UserModelPath) {
-        $resolvedModelPath = $UserModelPath
-    }
-
-    if (-not $resolvedModelPath) {
-        Write-LaunchLog "検証済み翻訳モデルが見つかりません (確認先: $RepoModelPath / $UserModelPath)" "WARN"
+    # 2. Verify Active Model from Registry (with automatic legacy 2B migration)
+    $launchModel = Resolve-PaperBridgeActiveModelForLaunch -UserDataDir $UserDataDir -ProjectRoot $ProjectRoot
+    if ($launchModel.Status -ne "Ready") {
+        Write-LaunchLog "有効なアクティブモデルが見つかりません (Status=$($launchModel.Status), Reason=$($launchModel.Reason))" "WARN"
         if (-not $NoBrowser) {
             $modelSetupScript = Join-Path $ScriptDir "model_setup.ps1"
-            $userModelDir = Split-Path -Parent $UserModelPath
-            $pModel = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$modelSetupScript`"", "-TargetModelDir", "`"$userModelDir`"") -Wait -PassThru
-            if ($pModel.ExitCode -ne 0 -or -not (Test-ValidModelQuick -ModelPath $UserModelPath)) {
-                Show-UserError -Title "翻訳モデル未設定" -Message "有効な PLaMo 3 Translate 2B モデルが配置されなかったため起動を中止します。"
+            $setupArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$modelSetupScript`"", "-UserDataDir", "`"$UserDataDir`"")
+            if ($launchModel.Entry -and $launchModel.Entry.catalog_model_id) {
+                $setupArgs += @("-ModelId", "`"$($launchModel.Entry.catalog_model_id)`"")
+            }
+            $pModel = Start-Process -FilePath "powershell.exe" -ArgumentList $setupArgs -Wait -PassThru
+            $launchModel = Resolve-PaperBridgeActiveModelForLaunch -UserDataDir $UserDataDir -ProjectRoot $ProjectRoot
+            if ($pModel.ExitCode -ne 0 -or $launchModel.Status -ne "Ready") {
+                $detailReason = if ($launchModel.Reason) { "`n`n理由: $($launchModel.Reason)" } else { "" }
+                Show-UserError -Title "翻訳モデル未設定" -Message "有効な翻訳モデルが設定・検証されなかったため起動を中止します。$detailReason"
                 exit 1
             }
-            $resolvedModelPath = $UserModelPath
         } else {
-            throw "有効な翻訳モデルが見つかりません: $UserModelPath"
+            throw "有効な翻訳モデルが見つかりません (Status=$($launchModel.Status)): $($launchModel.Reason)"
         }
     }
-    Write-LaunchLog "使用モデル確定: $resolvedModelPath"
+    $resolvedModelPath = [string]$launchModel.Entry.file_path
+    $resolvedCatalogModel = $launchModel.CatalogModel
+    $resolvedDisplayName = [string]$launchModel.Entry.display_name
+    Write-LaunchLog "使用モデル確定: $resolvedDisplayName (RegId=$($launchModel.Entry.registration_id), Path=$resolvedModelPath)"
 
     # 3. Check Port Availability (Never kill external unknown processes)
     if (Test-PortInUse -Port $LlamaPort) {
@@ -572,18 +552,7 @@ try {
     $activeModeLabel = ""
 
     if (-not $UseCpuInference -and (Test-Path -LiteralPath $VulkanServerExe)) {
-        $vulkanArgs = @(
-            "--model", $resolvedModelPath,
-            "--alias", "plamo-3-translate",
-            "--host", "127.0.0.1",
-            "--port", "$LlamaPort",
-            "-c", "8192",
-            "-np", "1",
-            "-ngl", "99",
-            "--jinja",
-            "--no-prefill-assistant",
-            "--cors-origins", "localhost"
-        )
+        $vulkanArgs = Get-PaperBridgeLlamaLaunchArgs -ModelPath $resolvedModelPath -CatalogModel $resolvedCatalogModel -LlamaPort $LlamaPort
         $llamaServer = Start-TrackedServer -Label "llama-server (Vulkan)" -ExePath $VulkanServerExe -ArgList $vulkanArgs -WorkingDir (Split-Path -Parent $VulkanServerExe) -OutLog $llamaOut -ErrLog $llamaErr
         $waitLlama = Wait-EndpointOrCrash -ServerInfo $llamaServer -HealthUrl $llamaHealthUrl -TimeoutSeconds 45
         if (-not $waitLlama.Ready) {
@@ -606,18 +575,7 @@ try {
             Show-UserError -Title "推論サーバー起動エラー" -Message "CPU推論バイナリが見つかりません: $CpuServerExe"
             exit 1
         }
-        $cpuArgs = @(
-            "--model", $resolvedModelPath,
-            "--alias", "plamo-3-translate",
-            "--host", "127.0.0.1",
-            "--port", "$LlamaPort",
-            "-c", "8192",
-            "-np", "1",
-            "-ngl", "0",
-            "--jinja",
-            "--no-prefill-assistant",
-            "--cors-origins", "localhost"
-        )
+        $cpuArgs = Get-PaperBridgeLlamaLaunchArgs -ModelPath $resolvedModelPath -CatalogModel $resolvedCatalogModel -LlamaPort $LlamaPort -UseCpu
         $llamaServer = Start-TrackedServer -Label "llama-server (CPU)" -ExePath $CpuServerExe -ArgList $cpuArgs -WorkingDir (Split-Path -Parent $CpuServerExe) -OutLog $llamaOut -ErrLog $llamaErr
         $waitCpu = Wait-EndpointOrCrash -ServerInfo $llamaServer -HealthUrl $llamaHealthUrl -TimeoutSeconds 60
         if (-not $waitCpu.Ready) {
