@@ -407,15 +407,19 @@ def create_app(
         probe_llama: bool = False,
         _sec: None = Depends(verify_security_headers),
     ) -> ModelsOverviewResponse:
-        catalog, reg = mgr.model_registry.get_registry_snapshot(auto_migrate=True, revalidate=True)
-        active = (
-            next((m for m in reg.models if m.registration_id == reg.active_model_id), None)
-            if reg.active_model_id
-            else None
-        )
+        # Probe first when requested so exact server match promotes launch_verified in the returned snapshot.
         server_match = (
             mgr.model_registry.compare_with_running_server(_probe_llama_health_quick())
             if probe_llama
+            else None
+        )
+        catalog, reg = mgr.model_registry.get_registry_snapshot(
+            auto_migrate=not probe_llama,
+            revalidate=not probe_llama,
+        )
+        active = (
+            next((m for m in reg.models if m.registration_id == reg.active_model_id), None)
+            if reg.active_model_id
             else None
         )
         return ModelsOverviewResponse(
@@ -498,6 +502,17 @@ def create_app(
             if probe_llama
             else None
         )
+        if server_match is not None and server_match.match_status == "matched":
+            _cat, reg_after = mgr.model_registry.get_registry_snapshot(
+                auto_migrate=False,
+                revalidate=False,
+            )
+            refreshed = next(
+                (m for m in reg_after.models if m.registration_id == selected.registration_id),
+                None,
+            )
+            if refreshed is not None:
+                selected = refreshed
         return ModelSelectResponse(
             active_model_id=selected.registration_id,
             selected_model=selected,

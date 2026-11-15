@@ -542,15 +542,14 @@ function Test-ModelMatchesCatalog {
         throw "選択されたファイルは「$($match.CatalogModel.display_name)」ですが、指定された導入先モデル「$expName」と一致しません。正しいファイルを選択するか、該当モデルを選んで登録してください。"
     }
 
-    $launchVerified = ($match.CatalogModel.catalog_verification_status -eq "verified_runtime")
     $now = [DateTime]::UtcNow.ToString("o")
     $ver = [ordered]@{
         file_exists          = $true
         format_valid         = $true
         hash_status          = "matched_known"
         backend_compatible   = (@($match.CatalogModel.supported_backends) -contains "llama.cpp")
-        launch_verified      = $launchVerified
-        translation_verified = $launchVerified
+        launch_verified      = $false
+        translation_verified = $false
         matched_revision     = [string]$match.Artifact.revision
         matched_label        = [string]$match.Artifact.label
         validation_error     = $null
@@ -654,6 +653,57 @@ function New-RegisteredModelObject {
         created_at          = $cAt
         updated_at          = $now
     }
+}
+
+function Get-PaperBridgeVerificationStageLabel {
+    param(
+        $Verification,
+        [bool]$FileExistsOverride = $true
+    )
+    if (-not $FileExistsOverride -or -not $Verification -or -not [bool]$Verification.file_exists -or ([string]$Verification.hash_status -eq "missing_file")) {
+        return "未検証（ファイル欠損）"
+    }
+    if (-not [bool]$Verification.format_valid -or ([string]$Verification.hash_status -eq "mismatch")) {
+        return "未検証（整合性エラー）"
+    }
+    if (([string]$Verification.hash_status -ne "matched_known") -or -not [bool]$Verification.backend_compatible) {
+        return "未検証"
+    }
+    if ([bool]$Verification.translation_verified) {
+        return "実翻訳確認済み"
+    }
+    if ([bool]$Verification.launch_verified) {
+        return "起動確認済み"
+    }
+    return "ファイル検証済み"
+}
+
+function Set-PaperBridgeModelLaunchVerified {
+    param(
+        [string]$UserDataDir,
+        [string]$RegistrationId
+    )
+    if ([string]::IsNullOrWhiteSpace($UserDataDir) -or [string]::IsNullOrWhiteSpace($RegistrationId)) {
+        return $false
+    }
+    $reg = Read-ModelsRegistry -UserDataDir $UserDataDir
+    $changed = $false
+    $now = [DateTime]::UtcNow.ToString("o")
+    foreach ($m in $reg.models) {
+        if ($m.registration_id -eq $RegistrationId -and $m.verification) {
+            $fileOk = ([bool]$m.verification.file_exists -and [bool]$m.verification.format_valid -and ([string]$m.verification.hash_status -eq "matched_known") -and [bool]$m.verification.backend_compatible)
+            if ($fileOk -and -not [bool]$m.verification.launch_verified) {
+                $m.verification.launch_verified = $true
+                $m.updated_at = $now
+                $changed = $true
+            }
+            break
+        }
+    }
+    if ($changed) {
+        Write-ModelsRegistry -UserDataDir $UserDataDir -Registry $reg
+    }
+    return $changed
 }
 
 function Sync-ModelsRegistryWithLegacy {
@@ -841,6 +891,19 @@ function Register-PaperBridgeLocalModel {
     if ($existingEntry) {
         $regId = [string]$existingEntry.registration_id
         $createdAt = [string]$existingEntry.created_at
+        $samePathAndArtifact = (
+            ((Get-NormalizedModelPathKey -FilePath ([string]$existingEntry.file_path)) -eq $finalKey) -and
+            (-not [string]::IsNullOrWhiteSpace([string]$existingEntry.measured_sha256)) -and
+            ([string]$existingEntry.measured_sha256).ToLowerInvariant() -eq ([string]$insp.sha256).ToLowerInvariant() -and
+            ([string]$existingEntry.catalog_model_id -eq [string]$actualCat.model_id)
+        )
+        if ($samePathAndArtifact -and $existingEntry.verification) {
+            if ([bool]$existingEntry.verification.launch_verified) { $ver.launch_verified = $true }
+            if ([bool]$existingEntry.verification.translation_verified) {
+                $ver.launch_verified = $true
+                $ver.translation_verified = $true
+            }
+        }
     } else {
         $slug = ConvertTo-SafeSlug -Text $actualCat.model_id
         $regId = "reg-$slug-{0}" -f ([guid]::NewGuid().ToString("N").Substring(0, 8))

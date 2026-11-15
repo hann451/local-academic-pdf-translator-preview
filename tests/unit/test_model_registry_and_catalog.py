@@ -444,3 +444,148 @@ def test_server_match_matrix_detects_exact_copy_mismatch_and_unverified(tmp_path
     p2b.unlink()
     m_invalid = mgr.compare_with_running_server({"status": "connected"})
     assert m_invalid.match_status == "selected_model_invalid" and not m_invalid.is_matched
+
+
+def test_four_stage_verification_lifecycle_and_fail_closed_transitions(tmp_path: Path) -> None:
+    """Verify honest 4-stage progression (unverified / file_verified / launch_verified / translation_verified)."""
+    bytes_2b = build_synthetic_gguf(architecture="plamo3", model_name="plamo-3-translate-2b", extra_padding=b"4STAGE_2B")
+    bytes_2b_alt = build_synthetic_gguf(architecture="plamo3", model_name="plamo-3-translate-2b", extra_padding=b"4STAGE_2B_ALT")
+    bytes_08b = build_synthetic_gguf(architecture="plamo3", model_name="plamo-3-translate-0.8b", extra_padding=b"4STAGE_08B")
+    cat_path = build_temp_catalog(
+        tmp_path,
+        [
+            {"model_id": "plamo-3-translate-2b-q4_k_m", "primary_bytes": bytes_2b, "legacy_bytes": bytes_2b_alt},
+            {"model_id": "plamo-3-translate-0.8b-q4_k_m", "primary_bytes": bytes_08b},
+        ],
+    )
+    mgr = ModelRegistryManager(runtime_dir=tmp_path / "rt_stages", catalog_path=cat_path)
+
+    # Sanity check: production 2B catalog metadata still carries verified_runtime without leaking into fresh instance flags.
+    cat_2b = mgr.get_catalog().get_model("plamo-3-translate-2b-q4_k_m")
+    assert cat_2b is not None and cat_2b.catalog_verification_status == "verified_runtime"
+
+    p2b = tmp_path / "plamo-3-translate-2b-Q4_K_M.gguf"
+    p2b.write_bytes(bytes_2b)
+    p2b_dup = tmp_path / "dup" / "plamo-3-translate-2b-Q4_K_M.gguf"
+    p2b_dup.parent.mkdir()
+    p2b_dup.write_bytes(bytes_2b)
+    p08b = tmp_path / "plamo-3-translate-0.8b-Q4_K_M.gguf"
+    p08b.write_bytes(bytes_08b)
+
+    # 1. Fresh registration of 2B starts at file_verified (NOT launch_verified / translation_verified)
+    reg2 = mgr.register_local_model(file_path=p2b, license_accepted=True, set_active=True)
+    assert reg2.verification.hash_status == "matched_known"
+    assert reg2.verification.launch_verified is False
+    assert reg2.verification.translation_verified is False
+    assert reg2.verification.verification_stage == "file_verified"
+
+    # 2. Ambiguous / mismatched server probes MUST NOT promote launch_verified
+    m_diff = mgr.compare_with_running_server(
+        {
+            "status": "connected",
+            "model_name": "plamo-3-translate-2b-q4_k_m",
+            "model_path_full": str(p2b_dup),
+            "model_file": p2b_dup.name,
+        }
+    )
+    assert m_diff.match_status == "matched_same_model_different_path"
+    m_unver = mgr.compare_with_running_server({"status": "connected", "model_name": "plamo-3-translate-2b-q4_k_m"})
+    assert m_unver.match_status == "server_path_unverified"
+    m_mismatch = mgr.compare_with_running_server(
+        {
+            "status": "connected",
+            "model_name": "plamo-3-translate-0.8b-q4_k_m",
+            "model_path_full": str(p08b),
+            "model_file": p08b.name,
+        }
+    )
+    assert m_mismatch.match_status == "mismatch"
+
+    after_ambiguous, _ = mgr.get_active_model()
+    assert after_ambiguous is not None
+    assert after_ambiguous.verification.launch_verified is False
+    assert after_ambiguous.verification.translation_verified is False
+    assert after_ambiguous.verification.verification_stage == "file_verified"
+
+    # 3. Exact server match promotes launch_verified only (still not translation_verified)
+    m_exact = mgr.compare_with_running_server(
+        {
+            "status": "connected",
+            "model_name": "plamo-3-translate-2b-q4_k_m",
+            "model_path_full": str(p2b),
+            "model_file": p2b.name,
+        }
+    )
+    assert m_exact.match_status == "matched"
+    after_launch, _ = mgr.get_active_model()
+    assert after_launch is not None
+    assert after_launch.verification.launch_verified is True
+    assert after_launch.verification.translation_verified is False
+    assert after_launch.verification.verification_stage == "launch_verified"
+
+    # 4. Translation verification sets translation_verified (and propagates launch_verified)
+    mgr.mark_runtime_verified(reg2.registration_id, launch_verified=False, translation_verified=True)
+    after_trans, _ = mgr.get_active_model()
+    assert after_trans is not None
+    assert after_trans.verification.launch_verified is True
+    assert after_trans.verification.translation_verified is True
+    assert after_trans.verification.verification_stage == "translation_verified"
+
+    # 5. Swapping file contents to another accepted hash on the same path resets runtime flags -> file_verified
+    p2b.write_bytes(bytes_2b_alt)
+    after_swap_reval, _ = mgr.get_active_model()
+    assert after_swap_reval is not None
+    assert after_swap_reval.verification.launch_verified is False
+    assert after_swap_reval.verification.translation_verified is False
+    assert after_swap_reval.verification.verification_stage == "file_verified"
+
+    # Re-promote to translation_verified, then verify register_local_model with swapped hash on same path also resets
+    mgr.mark_runtime_verified(reg2.registration_id, launch_verified=True, translation_verified=True)
+    p2b.write_bytes(bytes_2b)
+    re_reg = mgr.register_local_model(file_path=p2b, license_accepted=True, set_active=True)
+    assert re_reg.verification.launch_verified is False
+    assert re_reg.verification.translation_verified is False
+    assert re_reg.verification.verification_stage == "file_verified"
+
+    # Re-registering identical file+hash on same path preserves runtime verification
+    mgr.mark_runtime_verified(re_reg.registration_id, launch_verified=True, translation_verified=True)
+    re_reg_same = mgr.register_local_model(file_path=p2b, license_accepted=True, set_active=True)
+    assert re_reg_same.verification.launch_verified is True
+    assert re_reg_same.verification.translation_verified is True
+    assert re_reg_same.verification.verification_stage == "translation_verified"
+
+    # 6. Deleting file drops verification_stage -> unverified immediately and blocks mark_runtime_verified
+    p2b.unlink()
+    missing_active, _ = mgr.get_active_model()
+    assert missing_active is not None
+    assert missing_active.is_usable is False
+    assert missing_active.verification.hash_status == "missing_file"
+    assert missing_active.verification.verification_stage == "unverified"
+
+    # Tampered/corrupt file on same path clears runtime flags -> unverified
+    p2b.write_bytes(b"CORRUPT_NON_GGUF_BYTES")
+    corrupt_active, _ = mgr.get_active_model()
+    assert corrupt_active is not None
+    assert corrupt_active.is_usable is False
+    assert corrupt_active.verification.launch_verified is False
+    assert corrupt_active.verification.translation_verified is False
+    assert corrupt_active.verification.verification_stage == "unverified"
+
+    # mark_runtime_verified MUST refuse to promote any unusable (corrupt or missing) entry
+    mgr.mark_runtime_verified(re_reg_same.registration_id, launch_verified=True, translation_verified=True)
+    p2b.unlink()
+    missing_fresh, _ = mgr.get_active_model()
+    assert missing_fresh is not None
+    assert missing_fresh.verification.verification_stage == "unverified"
+    assert missing_fresh.verification.launch_verified is False
+    assert missing_fresh.verification.translation_verified is False
+    mgr.mark_runtime_verified(re_reg_same.registration_id, launch_verified=True, translation_verified=True)
+    _, snap_no_reval = mgr.get_registry_snapshot(revalidate=False)
+    still_missing = next(
+        (m for m in snap_no_reval.models if m.registration_id == re_reg_same.registration_id),
+        None,
+    )
+    assert still_missing is not None
+    assert still_missing.verification.verification_stage == "unverified"
+    assert still_missing.verification.launch_verified is False
+    assert still_missing.verification.translation_verified is False

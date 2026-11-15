@@ -387,3 +387,232 @@ def test_active_job_locks_switching_and_real_preflight_blocks_server_mismatch(
     assert prov["is_mock"] is True
     assert prov["model_id"] == "plamo-3-translate-0.8b-q4_k_m"
     assert prov["model_display_name"] == "PLaMo 3 Translate 0.8B (Q4_K_M)"
+
+
+def test_four_stage_verification_progression_across_api_and_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+    generated_pdfs: dict[str, Path],
+    tmp_path: Path,
+) -> None:
+    """Verify 4-stage verification progression end-to-end across /api/models, /select, and /jobs."""
+    from backend.translation.adapters.base import TranslationAdapterResponse
+
+    bytes_2b = build_synthetic_gguf(architecture="plamo3", model_name="plamo-3-translate-2b", extra_padding=b"PROG_2B")
+    bytes_08b = build_synthetic_gguf(architecture="plamo3", model_name="plamo-3-translate-0.8b", extra_padding=b"PROG_08B")
+    cat_path = build_temp_catalog(
+        tmp_path,
+        [
+            {"model_id": "plamo-3-translate-2b-q4_k_m", "primary_bytes": bytes_2b},
+            {"model_id": "plamo-3-translate-0.8b-q4_k_m", "primary_bytes": bytes_08b},
+        ],
+    )
+    cfg = AppConfig(runtime_dir=tmp_path / "rt_prog", model_catalog_path=cat_path)
+    cfg.ensure_directories()
+    mgr = JobManager(config=cfg)
+
+    def transport_handler(request: httpx.Request) -> httpx.Response:
+        payload = bytes_2b if "2b" in str(request.url).lower() else bytes_08b
+        return httpx.Response(200, headers={"Content-Length": str(len(payload))}, content=payload)
+
+    dl_mgr = ModelDownloadManager(
+        registry=mgr.model_registry,
+        http_client_factory=lambda: httpx.Client(transport=httpx.MockTransport(transport_handler)),
+    )
+    app = create_app(config=cfg, job_manager=mgr, model_download_manager=dl_mgr, session_token="test-tok")
+    client = TestClient(app)
+
+    server_health: dict[str, Any] = {"status": "server_unreachable"}
+    monkeypatch.setattr("backend.api.app.LlamaCppPlamoAdapter.check_health", lambda self: dict(server_health))
+    monkeypatch.setattr("backend.jobs.manager.LlamaCppPlamoAdapter.check_health", lambda self: dict(server_health))
+
+    def fake_translate_segment(self: Any, source_text: str, **kwargs: Any) -> TranslationAdapterResponse:
+        return TranslationAdapterResponse(
+            translated_text=f"テスト翻訳: {source_text}",
+            raw_output=f"テスト翻訳: {source_text}",
+            prompt_used=source_text,
+            model_name="plamo-3-translate-2b-q4_k_m",
+            quantization="Q4_K_M",
+            finish_reason="stop",
+            is_mock=False,
+            prompt_tokens=16,
+            completion_tokens=16,
+        )
+
+    monkeypatch.setattr("backend.jobs.manager.LlamaCppPlamoAdapter.translate_segment", fake_translate_segment)
+
+    # 1. Downloaded 2B starts honestly at file_verified (never pre-stamped launch/translation verified)
+    dl_resp = client.post(
+        "/api/models/downloads",
+        headers=_auth_headers(),
+        json={"catalog_model_id": "plamo-3-translate-2b-q4_k_m", "license_accepted": True, "background": False},
+    )
+    assert dl_resp.status_code == 200
+    assert dl_resp.json()["status"] == "completed"
+    dl_reg_id = dl_resp.json()["registration_id"]
+    dl_path = dl_resp.json()["destination_path"]
+
+    ov_dl = client.get("/api/models?probe_llama=true", headers=_auth_headers()).json()
+    assert ov_dl["active_model_id"] == dl_reg_id
+    assert ov_dl["active_model"]["verification"]["verification_stage"] == "file_verified"
+    assert ov_dl["active_model"]["verification"]["launch_verified"] is False
+    assert ov_dl["active_model"]["verification"]["translation_verified"] is False
+
+    # Register local 0.8B and secondary local 2B -> both start at file_verified
+    p08 = tmp_path / "plamo-3-translate-0.8b-Q4_K_M.gguf"
+    p08.write_bytes(bytes_08b)
+    reg_08_resp = client.post(
+        "/api/models/register-local",
+        headers=_auth_headers(),
+        json={"file_path": str(p08), "license_accepted": True, "set_active": False},
+    )
+    assert reg_08_resp.status_code == 200
+    assert reg_08_resp.json()["verification"]["verification_stage"] == "file_verified"
+    reg_08_id = reg_08_resp.json()["registration_id"]
+
+    p2_alt = tmp_path / "alt_copy" / "plamo-3-translate-2b-Q4_K_M.gguf"
+    p2_alt.parent.mkdir()
+    p2_alt.write_bytes(bytes_2b)
+    reg_2_alt_resp = client.post(
+        "/api/models/register-local",
+        headers=_auth_headers(),
+        json={"file_path": str(p2_alt), "license_accepted": True, "set_active": False},
+    )
+    assert reg_2_alt_resp.status_code == 200
+    assert reg_2_alt_resp.json()["verification"]["verification_stage"] == "file_verified"
+    reg_2_alt_id = reg_2_alt_resp.json()["registration_id"]
+
+    # 2. Immediate launch_verified on POST /api/models/{id}/select?probe_llama=true when server matches 0.8B
+    server_health = {
+        "status": "connected",
+        "model_name": "plamo-3-translate-0.8b-q4_k_m",
+        "model_path_full": str(p08),
+        "model_file": p08.name,
+    }
+    sel_08 = client.post(f"/api/models/{reg_08_id}/select?probe_llama=true", headers=_auth_headers())
+    assert sel_08.status_code == 200
+    sel_08_ver = sel_08.json()["selected_model"]["verification"]
+    assert sel_08_ver["verification_stage"] == "launch_verified"
+    assert sel_08_ver["launch_verified"] is True
+    assert sel_08_ver["translation_verified"] is False
+
+    # 3. Immediate launch_verified in first GET /api/models?probe_llama=true after matching downloaded 2B
+    sel_dl_no_probe = client.post(f"/api/models/{dl_reg_id}/select?probe_llama=false", headers=_auth_headers())
+    assert sel_dl_no_probe.status_code == 200
+    assert sel_dl_no_probe.json()["selected_model"]["verification"]["verification_stage"] == "file_verified"
+
+    server_health = {
+        "status": "connected",
+        "model_name": "plamo-3-translate-2b-q4_k_m",
+        "model_path_full": dl_path,
+        "model_file": Path(dl_path).name,
+    }
+    ov_first_probe = client.get("/api/models?probe_llama=true", headers=_auth_headers()).json()
+    dl_ver_after_probe = ov_first_probe["active_model"]["verification"]
+    assert dl_ver_after_probe["verification_stage"] == "launch_verified"
+    assert dl_ver_after_probe["launch_verified"] is True
+    assert dl_ver_after_probe["translation_verified"] is False
+
+    # Upload documents for job tests
+    with open(generated_pdfs["single_col_math"], "rb") as f:
+        doc1_id = client.post(
+            "/api/documents/upload",
+            files={"file": ("doc1.pdf", f, "application/pdf")},
+            headers=_auth_headers(),
+        ).json()["id"]
+    with open(generated_pdfs["single_col_math"], "rb") as f:
+        doc2_id = client.post(
+            "/api/documents/upload",
+            files={"file": ("doc2.pdf", f, "application/pdf")},
+            headers=_auth_headers(),
+        ).json()["id"]
+
+    # 4. Mock & roundtrip-only jobs MUST NOT mark translation_verified
+    mock_res = client.post(
+        f"/api/documents/{doc1_id}/jobs",
+        headers=_auth_headers(),
+        json={"model_id": "plamo-3-translate-2b-q4_k_m", "use_mock_translator": True},
+    )
+    assert mock_res.status_code == 200
+    assert mock_res.json()["state"] == "completed"
+
+    rt_res = client.post(
+        f"/api/documents/{doc1_id}/jobs",
+        headers=_auth_headers(),
+        json={
+            "model_id": "plamo-3-translate-2b-q4_k_m",
+            "use_mock_translator": False,
+            "only_roundtrip_preservation": True,
+        },
+    )
+    assert rt_res.status_code == 200
+    assert rt_res.json()["state"] == "completed"
+
+    ov_after_mock_rt = client.get("/api/models", headers=_auth_headers()).json()
+    assert ov_after_mock_rt["active_model"]["verification"]["verification_stage"] == "launch_verified"
+    assert ov_after_mock_rt["active_model"]["verification"]["translation_verified"] is False
+
+    # 5. Real non-mock job with newly_inferenced_blocks > 0 promotes downloaded 2B -> translation_verified (and populates cache)
+    real_res = client.post(
+        f"/api/documents/{doc1_id}/jobs",
+        headers=_auth_headers(),
+        json={"model_id": "plamo-3-translate-2b-q4_k_m", "use_mock_translator": False},
+    )
+    assert real_res.status_code == 200
+    real_job = real_res.json()
+    assert real_job["state"] in ("completed", "completed_with_warnings")
+    assert real_job["execution_provenance"]["newly_inferenced_blocks"] > 0
+
+    ov_after_real = client.get("/api/models", headers=_auth_headers()).json()
+    assert ov_after_real["active_model"]["verification"]["verification_stage"] == "translation_verified"
+    assert ov_after_real["active_model"]["verification"]["launch_verified"] is True
+    assert ov_after_real["active_model"]["verification"]["translation_verified"] is True
+
+    # 6. Cache-hit-only real job on secondary 2B registration (newly_inferenced_blocks == 0) MUST stay at launch_verified
+    server_health = {
+        "status": "connected",
+        "model_name": "plamo-3-translate-2b-q4_k_m",
+        "model_path_full": str(p2_alt),
+        "model_file": p2_alt.name,
+    }
+    sel_alt = client.post(f"/api/models/{reg_2_alt_id}/select?probe_llama=true", headers=_auth_headers())
+    assert sel_alt.status_code == 200
+    assert sel_alt.json()["selected_model"]["verification"]["verification_stage"] == "launch_verified"
+
+    cache_hit_res = client.post(
+        f"/api/documents/{doc2_id}/jobs",
+        headers=_auth_headers(),
+        json={"model_id": "plamo-3-translate-2b-q4_k_m", "use_mock_translator": False},
+    )
+    assert cache_hit_res.status_code == 200
+    cache_job = cache_hit_res.json()
+    assert cache_job["state"] in ("completed", "completed_with_warnings")
+    assert cache_job["execution_provenance"]["cache_hit_blocks"] > 0
+    assert cache_job["execution_provenance"]["newly_inferenced_blocks"] == 0
+    assert cache_job["execution_provenance"]["llm_api_calls_made"] == 0
+
+    ov_after_cache = client.get("/api/models", headers=_auth_headers()).json()
+    assert ov_after_cache["active_model"]["verification"]["verification_stage"] == "launch_verified"
+    assert ov_after_cache["active_model"]["verification"]["translation_verified"] is False
+
+    # 7. Fresh uncached document with newly_inferenced_blocks > 0 transitions secondary 2B -> translation_verified
+    with open(generated_pdfs["two_col_figures_tables_2p"], "rb") as f:
+        doc3_id = client.post(
+            "/api/documents/upload",
+            files={"file": ("doc3.pdf", f, "application/pdf")},
+            headers=_auth_headers(),
+        ).json()["id"]
+
+    fresh_res = client.post(
+        f"/api/documents/{doc3_id}/jobs",
+        headers=_auth_headers(),
+        json={"model_id": "plamo-3-translate-2b-q4_k_m", "use_mock_translator": False},
+    )
+    assert fresh_res.status_code == 200
+    fresh_job = fresh_res.json()
+    assert fresh_job["state"] in ("completed", "completed_with_warnings")
+    assert fresh_job["execution_provenance"]["newly_inferenced_blocks"] > 0
+
+    ov_final = client.get("/api/models", headers=_auth_headers()).json()
+    assert ov_final["active_model"]["verification"]["verification_stage"] == "translation_verified"
+    assert ov_final["active_model"]["verification"]["launch_verified"] is True
+    assert ov_final["active_model"]["verification"]["translation_verified"] is True

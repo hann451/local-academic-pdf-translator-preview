@@ -15,7 +15,7 @@ import type {
 } from "../types/api";
 import { validateAndParsePageRange } from "../utils/pageRange";
 import { ModelLicenseNotice, resolveActiveCatalogModel } from "./ModelLicenseNotice";
-import { ModelSelectionPanel } from "./ModelSelectionPanel";
+import { ModelSelectionPanel, verificationStatusLabel } from "./ModelSelectionPanel";
 
 export interface Screen1Props {
   currentDocument: Document | null;
@@ -570,6 +570,20 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
                             ? `${activeModel.display_name} (${activeModel.quantization})`
                             : "未登録（画面4または下ボタンからダウンロード・参照登録してください）"}
                         </span>
+                        {activeModel &&
+                          (() => {
+                            const verInfo = verificationStatusLabel(activeModel);
+                            return (
+                              <span
+                                data-testid="screen1-active-model-verification-badge"
+                                data-verification-stage={verInfo.stage}
+                                className={`badge ${verInfo.badgeClass}`}
+                                style={{ marginLeft: "8px" }}
+                              >
+                                {verInfo.label}
+                              </span>
+                            );
+                          })()}
                       </div>
                       <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
                         {hasModelActions && (

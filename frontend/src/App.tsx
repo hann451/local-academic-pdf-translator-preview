@@ -240,6 +240,18 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
     return () => window.clearInterval(timer);
   }, [activeModelDownload?.download_id, activeModelDownload?.status, refreshModelsOverview]);
 
+  const maybeRefreshModelsAfterRealJob = useCallback(
+    (job: Job) => {
+      if (
+        (job.state === "completed" || job.state === "completed_with_warnings") &&
+        !job.is_mock_run
+      ) {
+        void refreshModelsOverview(false);
+      }
+    },
+    [refreshModelsOverview]
+  );
+
   const refreshJobDetails = useCallback(
     async (jobId: string, docId: string) => {
       const [job, blks, iss, arts, doc, splits] = await Promise.all([
@@ -288,14 +300,15 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
 
     const timer = window.setInterval(async () => {
       try {
-        await refreshJobDetails(currentJob.id, currentDocument.id);
+        const updatedJob = await refreshJobDetails(currentJob.id, currentDocument.id);
+        maybeRefreshModelsAfterRealJob(updatedJob);
       } catch {
         // ignore transient poll error
       }
     }, 600);
 
     return () => window.clearInterval(timer);
-  }, [currentJob?.id, currentJob?.state, currentDocument?.id, refreshJobDetails]);
+  }, [currentJob?.id, currentJob?.state, currentDocument?.id, refreshJobDetails, maybeRefreshModelsAfterRealJob]);
 
   const handleNavigate = (targetScreen: ScreenId) => {
     if (activeScreen === "screen3" && isScreen3Dirty && targetScreen !== "screen3") {
@@ -377,7 +390,8 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
         runJobsInBackground
       );
       setCurrentJob(job);
-      await refreshJobDetails(job.id, currentDocument.id);
+      const refreshedJob = await refreshJobDetails(job.id, currentDocument.id);
+      maybeRefreshModelsAfterRealJob(refreshedJob);
       setActiveScreen("screen3");
     } catch (err) {
       setJobStartError(err instanceof Error ? err.message : String(err));
@@ -591,7 +605,8 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
         runJobsInBackground
       );
       setCurrentJob(resumed);
-      await refreshJobDetails(currentJob.id, currentDocument.id);
+      const refreshedJob = await refreshJobDetails(currentJob.id, currentDocument.id);
+      maybeRefreshModelsAfterRealJob(refreshedJob);
     } finally {
       setIsResumingJob(false);
     }
@@ -625,7 +640,8 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
     try {
       const job = await retranslateSpecificBlocks(currentJob.id, [blockId]);
       setCurrentJob(job);
-      await refreshJobDetails(job.id, currentDocument.id);
+      const refreshedJob = await refreshJobDetails(job.id, currentDocument.id);
+      maybeRefreshModelsAfterRealJob(refreshedJob);
     } finally {
       setIsRetranslatingBlock(false);
     }

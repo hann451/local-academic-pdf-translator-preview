@@ -12,6 +12,7 @@ import type {
   RegisteredModel,
   RegisterLocalModelRequest,
   StartModelDownloadRequest,
+  VerificationStage,
 } from "../types/api";
 import { formatBytesHuman } from "./ModelLicenseNotice";
 
@@ -37,20 +38,81 @@ const SOURCE_TYPE_LABELS: Record<RegisteredModel["source_type"], string> = {
   migrated_legacy: "既存2B自動移行",
 };
 
-function verificationStatusLabel(
-  reg: RegisteredModel,
-  cat: CatalogModel | undefined
-): { label: string; badgeClass: string } {
-  if (!reg.verification.file_exists || reg.verification.hash_status === "missing_file") {
-    return { label: "ファイル欠損（要再指定）", badgeClass: "badge-error" };
+export function resolveVerificationStage(
+  verification: RegisteredModel["verification"]
+): VerificationStage {
+  const fileOk =
+    verification.file_exists &&
+    verification.format_valid &&
+    verification.hash_status === "matched_known" &&
+    verification.backend_compatible;
+  if (!fileOk) {
+    return "unverified";
   }
-  if (!reg.verification.format_valid || reg.verification.hash_status === "mismatch") {
-    return { label: "整合性エラー", badgeClass: "badge-error" };
+  if (verification.translation_verified) {
+    return "translation_verified";
   }
-  if (cat?.catalog_verification_status === "verified_runtime" || reg.verification.translation_verified) {
-    return { label: "SHA-256検証済 / 実機動作済", badgeClass: "badge-success" };
+  if (verification.launch_verified) {
+    return "launch_verified";
   }
-  return { label: "カタログ・SHA-256検証済（実機未検証）", badgeClass: "badge-info" };
+  return "file_verified";
+}
+
+export function verificationStatusLabel(
+  reg: RegisteredModel
+): {
+  stage: VerificationStage;
+  label: string;
+  badgeClass: string;
+  detailText: string;
+} {
+  const v = reg.verification;
+  if (!v.file_exists || v.hash_status === "missing_file") {
+    return {
+      stage: "unverified",
+      label: "未検証（ファイル欠損・要再指定）",
+      badgeClass: "badge-error",
+      detailText: "モデルファイルが見つかりません。場所の再指定または再ダウンロードを行ってください。",
+    };
+  }
+  if (!v.format_valid || v.hash_status === "mismatch") {
+    return {
+      stage: "unverified",
+      label: "未検証（整合性エラー）",
+      badgeClass: "badge-error",
+      detailText: "GGUF形式またはSHA-256がカタログ定義と一致しません。",
+    };
+  }
+  if (v.hash_status === "unverified" || !v.backend_compatible) {
+    return {
+      stage: "unverified",
+      label: "未検証",
+      badgeClass: "badge-warning",
+      detailText: "ファイル整合性または推論バックエンド互換性の確認が未完了です。",
+    };
+  }
+  if (v.translation_verified) {
+    return {
+      stage: "translation_verified",
+      label: "実翻訳確認済み",
+      badgeClass: "badge-success",
+      detailText: "SHA-256検証・実機サーバー起動・実翻訳推論完了を確認済みです。",
+    };
+  }
+  if (v.launch_verified) {
+    return {
+      stage: "launch_verified",
+      label: "起動確認済み",
+      badgeClass: "badge-launch",
+      detailText: "SHA-256検証および実機 llama-server 起動・一致確認済み（実翻訳は未実施）。",
+    };
+  }
+  return {
+    stage: "file_verified",
+    label: "ファイル検証済み",
+    badgeClass: "badge-info",
+    detailText: "ファイル存在・GGUF形式・SHA-256確認済み（実機サーバー起動・翻訳は未確認）。",
+  };
 }
 
 export const ModelSelectionPanel: React.FC<ModelSelectionPanelProps> = ({
@@ -387,7 +449,7 @@ export const ModelSelectionPanel: React.FC<ModelSelectionPanelProps> = ({
             {overview.registered.map((reg) => {
               const isActive = reg.registration_id === overview.active_model_id;
               const cat = catalog.find((c) => c.model_id === reg.catalog_model_id);
-              const verInfo = verificationStatusLabel(reg, cat);
+              const verInfo = verificationStatusLabel(reg);
               const isUsable =
                 reg.verification.file_exists &&
                 reg.verification.format_valid &&
@@ -425,7 +487,13 @@ export const ModelSelectionPanel: React.FC<ModelSelectionPanelProps> = ({
                           使用中
                         </span>
                       )}
-                      <span className={`badge ${verInfo.badgeClass}`}>{verInfo.label}</span>
+                      <span
+                        data-testid={`verification-badge-${reg.registration_id}`}
+                        data-verification-stage={verInfo.stage}
+                        className={`badge ${verInfo.badgeClass}`}
+                      >
+                        {verInfo.label}
+                      </span>
                       <span className="badge badge-neutral">
                         {SOURCE_TYPE_LABELS[reg.source_type]}
                       </span>
@@ -480,6 +548,12 @@ export const ModelSelectionPanel: React.FC<ModelSelectionPanelProps> = ({
                     {formatBytesHuman(reg.file_size_bytes)} / SHA-256:{" "}
                     <code>{reg.measured_sha256 ? reg.measured_sha256.slice(0, 12) : "未計測"}</code>）
                   </div>
+                  <div
+                    data-testid={`verification-detail-${reg.registration_id}`}
+                    style={{ marginTop: "2px", color: "#475569", fontSize: "11px" }}
+                  >
+                    検証段階: {verInfo.detailText}
+                  </div>
                   {reg.verification.validation_error && (
                     <div style={{ marginTop: "4px", color: "#b91c1c" }}>
                       {reg.verification.validation_error}
@@ -523,7 +597,7 @@ export const ModelSelectionPanel: React.FC<ModelSelectionPanelProps> = ({
             {catalog.map((c) => {
               const tag =
                 c.catalog_verification_status === "verified_runtime"
-                  ? "推奨・実機動作済"
+                  ? "標準推奨・カタログ実機確認済"
                   : "カタログ検証済・実機未検証";
               return (
                 <option key={c.model_id} value={c.model_id}>

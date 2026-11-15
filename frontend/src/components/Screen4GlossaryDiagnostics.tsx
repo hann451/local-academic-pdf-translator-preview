@@ -15,7 +15,7 @@ import type {
 } from "../types/api";
 import { parseGlossaryInput, type GlossaryParseReport } from "../utils/glossaryParser";
 import { ModelLicenseNotice, resolveActiveCatalogModel } from "./ModelLicenseNotice";
-import { ModelSelectionPanel } from "./ModelSelectionPanel";
+import { ModelSelectionPanel, verificationStatusLabel } from "./ModelSelectionPanel";
 
 export interface Screen4Props {
   glossaries: Glossary[];
@@ -701,6 +701,20 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
                 <dd data-testid="diag-active-model">
                   {diagnostics.active_model_display_name || "未登録 / 既定"} (
                   {diagnostics.active_model_status || "unregistered"})
+                  {modelsOverview?.active_model &&
+                    (() => {
+                      const verInfo = verificationStatusLabel(modelsOverview.active_model);
+                      return (
+                        <span
+                          data-testid="diag-active-model-verification-badge"
+                          data-verification-stage={verInfo.stage}
+                          className={`badge ${verInfo.badgeClass}`}
+                          style={{ marginLeft: "6px" }}
+                        >
+                          {verInfo.label}
+                        </span>
+                      );
+                    })()}
                   {diagnostics.active_model_file_path && (
                     <>
                       <br />

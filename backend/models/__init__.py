@@ -17,6 +17,7 @@ from backend.models.registry import (
     ModelServerMatchResult,
     ModelVerificationState,
     RegisteredModel,
+    VerificationStage,
 )
 
 __all__ = [
@@ -32,6 +33,7 @@ __all__ = [
     "ModelServerMatchResult",
     "ModelVerificationState",
     "RegisteredModel",
+    "VerificationStage",
     "default_catalog_path",
     "inspect_gguf_file",
     "load_model_catalog",

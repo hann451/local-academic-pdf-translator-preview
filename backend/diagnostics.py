@@ -418,8 +418,13 @@ def collect_system_diagnostics(
         runtime_dir=cfg.runtime_dir,
         catalog_path=cfg.model_catalog_path,
     )
-    active_reg, _active_cat = reg_mgr.get_active_model()
     match_res = reg_mgr.compare_with_running_server(health_payload)
+    _cat_diag, reg_diag = reg_mgr.get_registry_snapshot(auto_migrate=False, revalidate=False)
+    active_reg = (
+        next((m for m in reg_diag.models if m.registration_id == reg_diag.active_model_id), None)
+        if reg_diag.active_model_id
+        else None
+    )
     if active_reg is None:
         active_status = "none"
     elif active_reg.is_usable:

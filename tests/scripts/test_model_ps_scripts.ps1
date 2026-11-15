@@ -251,6 +251,37 @@ try {
     Assert-True (($out4 -join "`n") -match "VALID_MODEL_PRESENT:") "NonInteractive output confirms VALID_MODEL_PRESENT"
     Write-Output "[PASS] 5. model_setup.ps1 CLI (-PreselectedPath, -Mode Select, -NonInteractive) passed."
 
+    # 7. Four-stage verification lifecycle checks in PowerShell helpers
+    $stageRt = Join-Path $tmpRoot "stage_ps_runtime"
+    New-Item -ItemType Directory -Path $stageRt -Force | Out-Null
+    $f2CopySrc = Join-Path $tmpRoot "stage_2b.gguf"
+    [System.IO.File]::Copy($f2, $f2CopySrc, $true)
+    $regPs2 = Register-PaperBridgeLocalModel -UserDataDir $stageRt -ProjectRoot $ProjectRoot -FilePath $f2CopySrc -RegisterMode "reference" -LicenseAccepted $true -SetActive $true
+    $regPs08 = Register-PaperBridgeLocalModel -UserDataDir $stageRt -ProjectRoot $ProjectRoot -FilePath $f08 -RegisterMode "reference" -LicenseAccepted $true -SetActive $false
+
+    Assert-True (-not [bool]$regPs2.Registration.verification.launch_verified) "Fresh 2B PS registration starts with launch_verified=$false"
+    Assert-True (-not [bool]$regPs2.Registration.verification.translation_verified) "Fresh 2B PS registration starts with translation_verified=$false"
+    Assert-True ((Get-PaperBridgeVerificationStageLabel -Verification $regPs2.Registration.verification) -eq "ファイル検証済み") "Fresh 2B PS stage label is ファイル検証済み"
+    Assert-True ((Get-PaperBridgeVerificationStageLabel -Verification $regPs08.Registration.verification) -eq "ファイル検証済み") "Fresh 0.8B PS stage label is ファイル検証済み"
+
+    $launchedOk = Set-PaperBridgeModelLaunchVerified -UserDataDir $stageRt -RegistrationId $regPs2.Registration.registration_id
+    Assert-True $launchedOk "Set-PaperBridgeModelLaunchVerified transitions launch_verified -> $true"
+    $regStore = Read-ModelsRegistry -UserDataDir $stageRt
+    $ps2Entry = $regStore.models | Where-Object { $_.registration_id -eq $regPs2.Registration.registration_id } | Select-Object -First 1
+    Assert-True ([bool]$ps2Entry.verification.launch_verified -and -not [bool]$ps2Entry.verification.translation_verified) "2B after Set-PaperBridgeModelLaunchVerified has launch_verified=$true translation_verified=$false"
+    Assert-True ((Get-PaperBridgeVerificationStageLabel -Verification $ps2Entry.verification) -eq "起動確認済み") "2B after launch check renders 起動確認済み"
+
+    $ps2Entry.verification.translation_verified = $true
+    Write-ModelsRegistry -UserDataDir $stageRt -Registry $regStore
+    $regStore2 = Read-ModelsRegistry -UserDataDir $stageRt
+    $ps2Entry2 = $regStore2.models | Where-Object { $_.registration_id -eq $regPs2.Registration.registration_id } | Select-Object -First 1
+    Assert-True ((Get-PaperBridgeVerificationStageLabel -Verification $ps2Entry2.verification) -eq "実翻訳確認済み") "2B with translation_verified=$true renders 実翻訳確認済み"
+
+    Remove-Item -LiteralPath $f2CopySrc -Force
+    $missingLabel = Get-PaperBridgeVerificationStageLabel -Verification $ps2Entry2.verification -FileExistsOverride (Test-Path -LiteralPath $f2CopySrc)
+    Assert-True ($missingLabel -eq "未検証（ファイル欠損）") "Deleted file renders 未検証（ファイル欠損）"
+    Write-Output "[PASS] 6. Four-stage verification lifecycle checks in PowerShell passed."
+
     Write-Output "ALL_PS_MODEL_TESTS_PASSED"
 } finally {
     if ($null -eq $prevCatalogEnv) {

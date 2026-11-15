@@ -1381,6 +1381,7 @@ class JobManager:
             model_display_used = job.config.model_name
             model_sha256_used = job.config.model_sha256
             active_reg_for_verify = None
+            match_res_for_verify = None
             compute_backend = "not_applicable"
 
             # Stage 8 & 9: Translation & Validation (skipped in roundtrip-only mode)
@@ -1443,6 +1444,7 @@ class JobManager:
                                         f"ModelMismatchConflict: ジョブ構成モデル '{job.config.model_id}' と現在選択中のモデル '{active_reg.display_name}' が一致しません。"
                                     )
                                 match_res = self.model_registry.compare_with_running_server(health_checked)
+                                match_res_for_verify = match_res
                                 if match_res.match_status in ("mismatch", "selected_model_invalid"):
                                     raise RuntimeError(f"ModelMismatchConflict: {match_res.message_ja}")
                                 model_display_used = active_reg.display_name
@@ -1765,11 +1767,17 @@ class JobManager:
             }
             if active_reg_for_verify is not None and not job.is_mock_run:
                 try:
-                    self.model_registry.mark_runtime_verified(
-                        active_reg_for_verify.registration_id,
-                        launch_verified=True,
-                        translation_verified=(newly_inferenced_blocks > 0),
+                    verified_translation = newly_inferenced_blocks > 0
+                    verified_launch = verified_translation or (
+                        match_res_for_verify is not None
+                        and getattr(match_res_for_verify, "match_status", None) == "matched"
                     )
+                    if verified_launch or verified_translation:
+                        self.model_registry.mark_runtime_verified(
+                            active_reg_for_verify.registration_id,
+                            launch_verified=verified_launch,
+                            translation_verified=verified_translation,
+                        )
                 except Exception:
                     pass
 

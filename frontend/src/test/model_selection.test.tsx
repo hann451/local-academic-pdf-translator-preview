@@ -539,4 +539,398 @@ describe("Model Selection, Download, Local Registry & Consistency UI", () => {
     expect(container.textContent).not.toContain("Preferred Networks");
     expect(container.textContent).not.toContain("pfnet");
   });
+
+  it("distinguishes all four verification stages without catalog override across Screen 4 and Screen 1", () => {
+    const reg2FileOnly = makeRegistered({
+      registration_id: "reg-2b-file",
+      catalog_model_id: "plamo-3-translate-2b-q4_k_m",
+      verification: {
+        file_exists: true,
+        format_valid: true,
+        hash_status: "matched_known",
+        backend_compatible: true,
+        launch_verified: false,
+        translation_verified: false,
+        validation_error: null,
+        validated_at: "2026-11-15T12:00:00Z",
+      },
+    });
+    const reg08LaunchOnly = makeRegistered({
+      registration_id: "reg-08-launch",
+      catalog_model_id: "plamo-3-translate-0.8b-q4_k_m",
+      display_name: "PLaMo 3 Translate 0.8B (Q4_K_M)",
+      short_name: "PLaMo 3 Translate 0.8B",
+      parameter_size: "0.8B",
+      verification: {
+        file_exists: true,
+        format_valid: true,
+        hash_status: "matched_known",
+        backend_compatible: true,
+        launch_verified: true,
+        translation_verified: false,
+        validation_error: null,
+        validated_at: "2026-11-15T12:00:00Z",
+      },
+    });
+    const reg2TranslationVerified = makeRegistered({
+      registration_id: "reg-2b-trans",
+      catalog_model_id: "plamo-3-translate-2b-q4_k_m",
+      verification: {
+        file_exists: true,
+        format_valid: true,
+        hash_status: "matched_known",
+        backend_compatible: true,
+        launch_verified: true,
+        translation_verified: true,
+        validation_error: null,
+        validated_at: "2026-11-15T12:00:00Z",
+      },
+    });
+    const regMissing = makeRegistered({
+      registration_id: "reg-missing",
+      catalog_model_id: "plamo-3-translate-2b-q4_k_m",
+      verification: {
+        file_exists: false,
+        format_valid: false,
+        hash_status: "missing_file",
+        backend_compatible: false,
+        launch_verified: true,
+        translation_verified: true,
+        validation_error: "ファイル欠損",
+        validated_at: "2026-11-15T12:00:00Z",
+      },
+    });
+    const regCorrupt = makeRegistered({
+      registration_id: "reg-corrupt",
+      catalog_model_id: "plamo-3-translate-2b-q4_k_m",
+      verification: {
+        file_exists: true,
+        format_valid: false,
+        hash_status: "mismatch",
+        backend_compatible: true,
+        launch_verified: true,
+        translation_verified: true,
+        validation_error: "SHA-256 mismatch",
+        validated_at: "2026-11-15T12:00:00Z",
+      },
+    });
+    const regUnverifiedHash = makeRegistered({
+      registration_id: "reg-unver-hash",
+      catalog_model_id: "plamo-3-translate-0.8b-q4_k_m",
+      verification: {
+        file_exists: true,
+        format_valid: true,
+        hash_status: "unverified",
+        backend_compatible: true,
+        launch_verified: false,
+        translation_verified: false,
+        validation_error: null,
+        validated_at: "2026-11-15T12:00:00Z",
+      },
+    });
+    const regIncompatBackend = makeRegistered({
+      registration_id: "reg-incompat",
+      catalog_model_id: "plamo-3-translate-2b-q4_k_m",
+      verification: {
+        file_exists: true,
+        format_valid: true,
+        hash_status: "matched_known",
+        backend_compatible: false,
+        launch_verified: true,
+        translation_verified: true,
+        validation_error: null,
+        validated_at: "2026-11-15T12:00:00Z",
+      },
+    });
+
+    const baseOverview: ModelsOverviewResponse = {
+      catalog: makeCatalog(),
+      unsupported_policies: {},
+      registered: [
+        reg2FileOnly,
+        reg08LaunchOnly,
+        reg2TranslationVerified,
+        regMissing,
+        regCorrupt,
+        regUnverifiedHash,
+        regIncompatBackend,
+      ],
+      active_model_id: reg2FileOnly.registration_id,
+      active_model: reg2FileOnly,
+      has_active_translation_job: false,
+      managed_models_dir: "C:\\runtime\\models",
+      downloads: [],
+      server_match: {
+        match_status: "server_unreachable",
+        is_matched: false,
+        active_registration_id: reg2FileOnly.registration_id,
+        active_catalog_model_id: reg2FileOnly.catalog_model_id,
+        active_display_name: reg2FileOnly.display_name,
+        active_file_path: reg2FileOnly.file_path,
+        message_ja: "未接続",
+      },
+    };
+
+    const { rerender } = render(
+      <Screen4GlossaryDiagnostics
+        glossaries={[]}
+        diagnostics={makeDiagnostics()}
+        hasProbedLlama={true}
+        isLoadingDiagnostics={false}
+        diagnosticsError={null}
+        modelsOverview={baseOverview}
+        activeModelDownload={null}
+        onRefreshDiagnostics={vi.fn().mockResolvedValue(undefined)}
+        onRefreshModels={vi.fn().mockResolvedValue(undefined)}
+        onBrowseLocalModelFile={vi.fn().mockResolvedValue(null)}
+        onRegisterLocalModel={vi.fn()}
+        onSelectModel={vi.fn().mockResolvedValue(undefined)}
+        onDeleteModel={vi.fn().mockResolvedValue(undefined)}
+        onStartModelDownload={vi.fn()}
+        onCancelModelDownload={vi.fn().mockResolvedValue(undefined)}
+        onCreateGlossary={vi.fn()}
+        onUpdateGlossary={vi.fn()}
+        onDeleteGlossary={vi.fn()}
+        onPurgeTempData={vi.fn()}
+        onRotateToken={vi.fn()}
+      />
+    );
+
+    // Registered list cards show all 4 stages accurately (2B catalog verified_runtime does NOT override file_verified)
+    const bFile = screen.getByTestId("verification-badge-reg-2b-file");
+    expect(bFile).toHaveAttribute("data-verification-stage", "file_verified");
+    expect(bFile).toHaveTextContent("ファイル検証済み");
+
+    const bLaunch = screen.getByTestId("verification-badge-reg-08-launch");
+    expect(bLaunch).toHaveAttribute("data-verification-stage", "launch_verified");
+    expect(bLaunch).toHaveTextContent("起動確認済み");
+
+    const bTrans = screen.getByTestId("verification-badge-reg-2b-trans");
+    expect(bTrans).toHaveAttribute("data-verification-stage", "translation_verified");
+    expect(bTrans).toHaveTextContent("実翻訳確認済み");
+
+    const bMissing = screen.getByTestId("verification-badge-reg-missing");
+    expect(bMissing).toHaveAttribute("data-verification-stage", "unverified");
+    expect(bMissing).toHaveTextContent("未検証（ファイル欠損・要再指定）");
+
+    const bCorrupt = screen.getByTestId("verification-badge-reg-corrupt");
+    expect(bCorrupt).toHaveAttribute("data-verification-stage", "unverified");
+    expect(bCorrupt).toHaveTextContent("未検証（整合性エラー）");
+
+    const bUnverHash = screen.getByTestId("verification-badge-reg-unver-hash");
+    expect(bUnverHash).toHaveAttribute("data-verification-stage", "unverified");
+    expect(bUnverHash.textContent?.trim()).toBe("未検証");
+
+    const bIncompat = screen.getByTestId("verification-badge-reg-incompat");
+    expect(bIncompat).toHaveAttribute("data-verification-stage", "unverified");
+    expect(bIncompat.textContent?.trim()).toBe("未検証");
+
+    // Screen 4 Diagnostics active badge tracks active stage transitions
+    expect(screen.getByTestId("diag-active-model-verification-badge")).toHaveAttribute(
+      "data-verification-stage",
+      "file_verified"
+    );
+    expect(screen.getByTestId("diag-active-model-verification-badge")).toHaveTextContent("ファイル検証済み");
+
+    rerender(
+      <Screen4GlossaryDiagnostics
+        glossaries={[]}
+        diagnostics={makeDiagnostics()}
+        hasProbedLlama={true}
+        isLoadingDiagnostics={false}
+        diagnosticsError={null}
+        modelsOverview={{ ...baseOverview, active_model_id: reg08LaunchOnly.registration_id, active_model: reg08LaunchOnly }}
+        activeModelDownload={null}
+        onRefreshDiagnostics={vi.fn().mockResolvedValue(undefined)}
+        onRefreshModels={vi.fn().mockResolvedValue(undefined)}
+        onBrowseLocalModelFile={vi.fn().mockResolvedValue(null)}
+        onRegisterLocalModel={vi.fn()}
+        onSelectModel={vi.fn().mockResolvedValue(undefined)}
+        onDeleteModel={vi.fn().mockResolvedValue(undefined)}
+        onStartModelDownload={vi.fn()}
+        onCancelModelDownload={vi.fn().mockResolvedValue(undefined)}
+        onCreateGlossary={vi.fn()}
+        onUpdateGlossary={vi.fn()}
+        onDeleteGlossary={vi.fn()}
+        onPurgeTempData={vi.fn()}
+        onRotateToken={vi.fn()}
+      />
+    );
+    expect(screen.getByTestId("diag-active-model-verification-badge")).toHaveAttribute(
+      "data-verification-stage",
+      "launch_verified"
+    );
+    expect(screen.getByTestId("diag-active-model-verification-badge")).toHaveTextContent("起動確認済み");
+
+    rerender(
+      <Screen4GlossaryDiagnostics
+        glossaries={[]}
+        diagnostics={makeDiagnostics()}
+        hasProbedLlama={true}
+        isLoadingDiagnostics={false}
+        diagnosticsError={null}
+        modelsOverview={{
+          ...baseOverview,
+          active_model_id: reg2TranslationVerified.registration_id,
+          active_model: reg2TranslationVerified,
+        }}
+        activeModelDownload={null}
+        onRefreshDiagnostics={vi.fn().mockResolvedValue(undefined)}
+        onRefreshModels={vi.fn().mockResolvedValue(undefined)}
+        onBrowseLocalModelFile={vi.fn().mockResolvedValue(null)}
+        onRegisterLocalModel={vi.fn()}
+        onSelectModel={vi.fn().mockResolvedValue(undefined)}
+        onDeleteModel={vi.fn().mockResolvedValue(undefined)}
+        onStartModelDownload={vi.fn()}
+        onCancelModelDownload={vi.fn().mockResolvedValue(undefined)}
+        onCreateGlossary={vi.fn()}
+        onUpdateGlossary={vi.fn()}
+        onDeleteGlossary={vi.fn()}
+        onPurgeTempData={vi.fn()}
+        onRotateToken={vi.fn()}
+      />
+    );
+    expect(screen.getByTestId("diag-active-model-verification-badge")).toHaveAttribute(
+      "data-verification-stage",
+      "translation_verified"
+    );
+    expect(screen.getByTestId("diag-active-model-verification-badge")).toHaveTextContent("実翻訳確認済み");
+
+    // Screen 1 active model badge also tracks all 4 stages accurately
+    const cfg: TranslationJobConfig = {
+      page_range_spec: null,
+      source_lang: "en",
+      target_lang: "ja",
+      form: "plain",
+      model_name: "plamo-3-translate-2b-Q4_K_M",
+      model_id: "plamo-3-translate-2b-q4_k_m",
+      quantization: "Q4_K_M",
+      context_length: 8192,
+      translate_captions: true,
+      translate_tables: false,
+      translate_references: false,
+      translate_figures: false,
+      min_font_size_pt: 8,
+      glossary_id: null,
+      output_mono_pdf: true,
+      output_dual_pdf: true,
+      only_roundtrip_preservation: false,
+      pause_for_review: false,
+      use_mock_translator: false,
+    };
+
+    const s1 = render(
+      <Screen1HomePreflight
+        currentDocument={null}
+        jobConfig={cfg}
+        glossaries={[]}
+        modelsOverview={baseOverview}
+        isUploading={false}
+        uploadError={null}
+        isStartingJob={false}
+        jobStartError={null}
+        onUploadFile={vi.fn()}
+        onUpdateJobConfig={vi.fn()}
+        onOpenProtectionScreen={vi.fn()}
+        onOpenModelsScreen={vi.fn()}
+        onRefreshModels={vi.fn().mockResolvedValue(undefined)}
+        onBrowseLocalModelFile={vi.fn().mockResolvedValue(null)}
+        onRegisterLocalModel={vi.fn()}
+        onSelectModel={vi.fn().mockResolvedValue(undefined)}
+        onDeleteModel={vi.fn()}
+        onStartModelDownload={vi.fn()}
+        onCancelModelDownload={vi.fn()}
+        onStartTranslationJob={vi.fn()}
+      />
+    );
+
+    const s1Badge = () => screen.getByTestId("screen1-active-model-verification-badge");
+    expect(s1Badge()).toHaveAttribute("data-verification-stage", "file_verified");
+    expect(s1Badge()).toHaveTextContent("ファイル検証済み");
+
+    s1.rerender(
+      <Screen1HomePreflight
+        currentDocument={null}
+        jobConfig={cfg}
+        glossaries={[]}
+        modelsOverview={{ ...baseOverview, active_model_id: reg08LaunchOnly.registration_id, active_model: reg08LaunchOnly }}
+        isUploading={false}
+        uploadError={null}
+        isStartingJob={false}
+        jobStartError={null}
+        onUploadFile={vi.fn()}
+        onUpdateJobConfig={vi.fn()}
+        onOpenProtectionScreen={vi.fn()}
+        onOpenModelsScreen={vi.fn()}
+        onRefreshModels={vi.fn().mockResolvedValue(undefined)}
+        onBrowseLocalModelFile={vi.fn().mockResolvedValue(null)}
+        onRegisterLocalModel={vi.fn()}
+        onSelectModel={vi.fn().mockResolvedValue(undefined)}
+        onDeleteModel={vi.fn()}
+        onStartModelDownload={vi.fn()}
+        onCancelModelDownload={vi.fn()}
+        onStartTranslationJob={vi.fn()}
+      />
+    );
+    expect(s1Badge()).toHaveAttribute("data-verification-stage", "launch_verified");
+    expect(s1Badge()).toHaveTextContent("起動確認済み");
+
+    s1.rerender(
+      <Screen1HomePreflight
+        currentDocument={null}
+        jobConfig={cfg}
+        glossaries={[]}
+        modelsOverview={{
+          ...baseOverview,
+          active_model_id: reg2TranslationVerified.registration_id,
+          active_model: reg2TranslationVerified,
+        }}
+        isUploading={false}
+        uploadError={null}
+        isStartingJob={false}
+        jobStartError={null}
+        onUploadFile={vi.fn()}
+        onUpdateJobConfig={vi.fn()}
+        onOpenProtectionScreen={vi.fn()}
+        onOpenModelsScreen={vi.fn()}
+        onRefreshModels={vi.fn().mockResolvedValue(undefined)}
+        onBrowseLocalModelFile={vi.fn().mockResolvedValue(null)}
+        onRegisterLocalModel={vi.fn()}
+        onSelectModel={vi.fn().mockResolvedValue(undefined)}
+        onDeleteModel={vi.fn()}
+        onStartModelDownload={vi.fn()}
+        onCancelModelDownload={vi.fn()}
+        onStartTranslationJob={vi.fn()}
+      />
+    );
+    expect(s1Badge()).toHaveAttribute("data-verification-stage", "translation_verified");
+    expect(s1Badge()).toHaveTextContent("実翻訳確認済み");
+
+    s1.rerender(
+      <Screen1HomePreflight
+        currentDocument={null}
+        jobConfig={cfg}
+        glossaries={[]}
+        modelsOverview={{ ...baseOverview, active_model_id: regCorrupt.registration_id, active_model: regCorrupt }}
+        isUploading={false}
+        uploadError={null}
+        isStartingJob={false}
+        jobStartError={null}
+        onUploadFile={vi.fn()}
+        onUpdateJobConfig={vi.fn()}
+        onOpenProtectionScreen={vi.fn()}
+        onOpenModelsScreen={vi.fn()}
+        onRefreshModels={vi.fn().mockResolvedValue(undefined)}
+        onBrowseLocalModelFile={vi.fn().mockResolvedValue(null)}
+        onRegisterLocalModel={vi.fn()}
+        onSelectModel={vi.fn().mockResolvedValue(undefined)}
+        onDeleteModel={vi.fn()}
+        onStartModelDownload={vi.fn()}
+        onCancelModelDownload={vi.fn()}
+        onStartTranslationJob={vi.fn()}
+      />
+    );
+    expect(s1Badge()).toHaveAttribute("data-verification-stage", "unverified");
+    expect(s1Badge()).toHaveTextContent("未検証（整合性エラー）");
+  });
 });

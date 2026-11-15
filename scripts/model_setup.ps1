@@ -337,7 +337,7 @@ $script:RefreshRegisteredUi = {
         $rm = $script:RegisteredItems[$i]
         $isActiveMark = if ($rm.registration_id -eq $activeRegId) { "[使用中] " } else { "" }
         $existsOk = Test-Path -LiteralPath ([string]$rm.file_path) -PathType Leaf
-        $stMark = if (-not $existsOk) { "ファイル欠損" } elseif ($rm.verification.hash_status -eq "matched_known") { "検証済" } else { "要確認" }
+        $stMark = Get-PaperBridgeVerificationStageLabel -Verification $rm.verification -FileExistsOverride $existsOk
         $cmbRegistered.Items.Add("$isActiveMark$($rm.display_name) [$stMark / $($rm.source_type)]") | Out-Null
         if ($rm.registration_id -eq $activeRegId) { $selIdx = $i }
     }

@@ -585,6 +585,11 @@ try {
         $activeModeLabel = "CPU専用 (b12167-cpu-x64, -ngl 0)"
     }
     Write-LaunchLog "推論サーバー準備完了: $activeModeLabel"
+    try {
+        $null = Set-PaperBridgeModelLaunchVerified -UserDataDir $UserDataDir -RegistrationId ([string]$launchModel.Entry.registration_id)
+    } catch {
+        Write-LaunchLog "launch_verified 状態の保存に失敗しました（非致命的）: $($_.Exception.Message)" "WARN"
+    }
 
     # 5. Launch Backend (uvicorn) with isolated runtime environment
     $env:PAPERBRIDGE_RUNTIME_DIR = $UserDataDir

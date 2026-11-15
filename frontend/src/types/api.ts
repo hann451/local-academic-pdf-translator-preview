@@ -465,6 +465,12 @@ export interface CatalogModel {
   license: ModelLicenseInfo;
 }
 
+export type VerificationStage =
+  | "unverified"
+  | "file_verified"
+  | "launch_verified"
+  | "translation_verified";
+
 export interface ModelVerificationState {
   file_exists: boolean;
   format_valid: boolean;
@@ -472,6 +478,7 @@ export interface ModelVerificationState {
   backend_compatible: boolean;
   launch_verified: boolean;
   translation_verified: boolean;
+  verification_stage?: VerificationStage;
   matched_revision?: string | null;
   matched_label?: string | null;
   validation_error?: string | null;

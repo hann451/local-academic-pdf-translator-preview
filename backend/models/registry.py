@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 from backend.models.catalog import CatalogArtifact, CatalogModel, ModelCatalog, load_model_catalog
 from backend.models.gguf_inspector import (
@@ -46,6 +46,14 @@ def _paths_refer_to_same_file(a: Path, b: Path) -> bool:
     return False
 
 
+VerificationStage = Literal[
+    "unverified",
+    "file_verified",
+    "launch_verified",
+    "translation_verified",
+]
+
+
 class ModelVerificationState(BaseModel):
     """Layered verification state distinguishing structure, hash, compatibility, and runtime."""
 
@@ -59,6 +67,23 @@ class ModelVerificationState(BaseModel):
     matched_label: str | None = None
     validation_error: str | None = None
     validated_at: str = Field(default_factory=_utc_now_iso)
+
+    @computed_field
+    @property
+    def verification_stage(self) -> VerificationStage:
+        file_ok = (
+            self.file_exists
+            and self.format_valid
+            and self.hash_status == "matched_known"
+            and self.backend_compatible
+        )
+        if not file_ok:
+            return "unverified"
+        if self.translation_verified:
+            return "translation_verified"
+        if self.launch_verified:
+            return "launch_verified"
+        return "file_verified"
 
 
 class RegisteredModel(BaseModel):
@@ -253,14 +278,15 @@ class ModelRegistryManager:
                 "正しいファイルを選択するか、自動判定または該当モデルを選んで登録してください。"
             )
 
-        launch_verified = actual_cat.catalog_verification_status == "verified_runtime"
+        # File validation confirms existence, GGUF structure, SHA-256, and backend compatibility.
+        # Runtime launch and real translation are verified separately on live server / real job completion.
         ver = ModelVerificationState(
             file_exists=True,
             format_valid=True,
             hash_status="matched_known",
             backend_compatible=("llama.cpp" in actual_cat.supported_backends),
-            launch_verified=launch_verified,
-            translation_verified=launch_verified,
+            launch_verified=False,
+            translation_verified=False,
             matched_revision=matched_art.revision,
             matched_label=matched_art.label,
             validation_error=None,
@@ -300,6 +326,8 @@ class ModelRegistryManager:
             or mtime_changed
             or not entry.measured_sha256
         ):
+            old_sha = entry.measured_sha256
+            old_cat_id = entry.catalog_model_id
             insp = self._inspect_cached(p, compute_hash=True)
             entry.file_size_bytes = insp.file_size_bytes
             entry.file_mtime_ns = insp.file_mtime_ns
@@ -313,11 +341,17 @@ class ModelRegistryManager:
                     catalog,
                     expected_catalog_model_id=entry.catalog_model_id if cat else None,
                 )
-                # Preserve any prior runtime verification flags once verified on same valid file
-                ver.launch_verified = ver.launch_verified or entry.verification.launch_verified
-                ver.translation_verified = (
-                    ver.translation_verified or entry.verification.translation_verified
+                # Preserve prior runtime flags only when the exact same verified artifact remains in place.
+                same_artifact = (
+                    bool(old_sha)
+                    and old_sha.lower() == insp.sha256.lower()
+                    and old_cat_id == actual_cat.model_id
                 )
+                if same_artifact:
+                    ver.launch_verified = ver.launch_verified or entry.verification.launch_verified
+                    ver.translation_verified = (
+                        ver.translation_verified or entry.verification.translation_verified
+                    )
                 entry.catalog_model_id = actual_cat.model_id
                 entry.verification = ver
             except ModelValidationError as exc:
@@ -542,10 +576,17 @@ class ModelRegistryManager:
                 ]
                 reg_id = existing.registration_id
                 created_at = existing.created_at
-                ver.launch_verified = ver.launch_verified or existing.verification.launch_verified
-                ver.translation_verified = (
-                    ver.translation_verified or existing.verification.translation_verified
+                same_path_and_artifact = (
+                    _normalize_path_key(existing.file_path) == final_key
+                    and bool(existing.measured_sha256)
+                    and existing.measured_sha256.lower() == insp.sha256.lower()
+                    and existing.catalog_model_id == actual_cat.model_id
                 )
+                if same_path_and_artifact:
+                    ver.launch_verified = ver.launch_verified or existing.verification.launch_verified
+                    ver.translation_verified = (
+                        ver.translation_verified or existing.verification.translation_verified
+                    )
             else:
                 safe_slug = actual_cat.model_id.replace(".", "_")
                 reg_id = f"reg-{safe_slug}-{uuid.uuid4().hex[:8]}"
@@ -644,12 +685,15 @@ class ModelRegistryManager:
         launch_verified: bool = True,
         translation_verified: bool = False,
     ) -> None:
+        effective_launch = launch_verified or translation_verified
         with self._lock:
             _cat, reg = self.get_registry_snapshot(auto_migrate=False, revalidate=False)
             for entry in reg.models:
                 if entry.registration_id == registration_id:
+                    if not entry.is_usable:
+                        return
                     changed = False
-                    if launch_verified and not entry.verification.launch_verified:
+                    if effective_launch and not entry.verification.launch_verified:
                         entry.verification.launch_verified = True
                         changed = True
                     if translation_verified and not entry.verification.translation_verified:
@@ -782,6 +826,11 @@ class ModelRegistryManager:
         # Connected! Verify running server identity against active registered model
         if running_path_full:
             if _normalize_path_key(running_path_full) == _normalize_path_key(active.file_path):
+                self.mark_runtime_verified(
+                    active.registration_id,
+                    launch_verified=True,
+                    translation_verified=False,
+                )
                 return ModelServerMatchResult(
                     match_status="matched",
                     is_matched=True,
