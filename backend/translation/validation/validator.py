@@ -54,7 +54,48 @@ _NFKC_PLACEHOLDER_VARIANT_RE = re.compile(
 )
 _PLAMO_SPECIAL_RE = re.compile(r"<\|plamo:[^|>]+\|>")
 _CITATION_BRACKET_RE = re.compile(r"\[\d+(?:\s*[-,–]\s*\d+)*\]")
-_NUMBER_TOKEN_RE = re.compile(r"(?<![a-zA-Z_{])[-+]?\d+(?:,\d{3})*(?:\.\d+)?(?:[eE][-+]?\d+)?(?![a-zA-Z_}])")
+# Common ASCII unit suffixes attached immediately after numbers in technical prose
+# (e.g., "1.6m", "0.17m", "2.4GHz", "10ms", "0.25m2"). Single lowercase hex digits
+# (a-f) and ordinal/identifier letters are intentionally omitted so tokens like
+# "1a", "12b", "0x1f", "203d", "1st", "3D" are not mistaken for quantities.
+_MEASUREMENT_UNIT_TOKENS: tuple[str, ...] = tuple(
+    sorted(
+        (
+            "m", "mm", "cm", "km", "um", "nm", "pm", "fm",
+            "m2", "m3", "cm2", "cm3", "mm2", "mm3", "km2", "km3", "um2", "nm2",
+            "ft", "ft2", "ft3", "in", "in2", "in3", "yd", "mi",
+            "g", "mg", "kg", "ug", "ng", "pg", "t", "kt", "Mt", "Gt", "oz", "lb", "lbs",
+            "s", "ms", "us", "ns", "ps", "fs", "min", "h", "hr", "hrs", "sec", "secs",
+            "day", "days", "wk", "wks", "yr", "yrs",
+            "Hz", "kHz", "MHz", "GHz", "THz",
+            "V", "mV", "uV", "kV", "MV", "GV",
+            "A", "mA", "uA", "nA", "kA", "MA",
+            "W", "mW", "uW", "nW", "kW", "MW", "GW", "TW",
+            "Wh", "kWh", "MWh", "mAh", "VA", "kVA", "MVA", "var", "Var",
+            "F", "mF", "uF", "nF", "pF", "H", "mH", "uH", "nH",
+            "T", "mT", "uT", "nT", "Wb", "K", "J", "kJ", "MJ", "GJ", "eV", "keV", "MeV", "GeV", "TeV",
+            "Pa", "hPa", "kPa", "MPa", "GPa", "bar", "mbar", "kbar", "atm", "Torr", "torr", "mmHg", "psi",
+            "N", "kN", "MN", "mol", "mmol", "umol", "nmol", "IU",
+            "L", "mL", "uL", "nL", "dL", "kL", "ml", "ul", "nl", "dl", "kl",
+            "ohm", "ohms", "mOhm", "kOhm", "MOhm", "Bq", "Gy", "Sv", "lm", "lx", "cd",
+            "dB", "dBm", "dBi", "dBc", "dBV", "dBu", "dBA",
+            "cal", "kcal", "ppm", "ppb", "ppt", "pct", "wt", "vol",
+            "deg", "rad", "sr", "fps", "rpm", "mph", "kph", "kmph",
+            "bps", "kbps", "Mbps", "Gbps", "Tbps",
+            "KB", "MB", "GB", "TB", "PB", "KiB", "MiB", "GiB", "TiB", "PiB", "bit", "bits", "byte", "bytes",
+            "dpi", "ppi", "px", "pt", "pc", "em", "rem",
+        ),
+        key=lambda u: (-len(u), u),
+    )
+)
+_MEASUREMENT_UNIT_SUFFIX_RE = "|".join(re.escape(u) for u in _MEASUREMENT_UNIT_TOKENS)
+# Atomic number core prevents regex backtracking from truncating partial numbers
+# (e.g., "1.6m" -> "1" or "0.17m" -> "0.1") when followed by non-delimiter text.
+_NUMBER_TOKEN_RE = re.compile(
+    r"(?<![a-zA-Z0-9_{.])"
+    r"(?>[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[eE][-+]?\d+)?)"
+    rf"(?=(?:(?:{_MEASUREMENT_UNIT_SUFFIX_RE})(?![a-zA-Z0-9_}}]))|(?!\.\d)(?![a-zA-Z0-9_}}]))"
+)
 _EXPLANATION_PREFIX_RE = re.compile(
     r"^(?:翻訳(?:結果|文)?\s*[:：]|以下(?:が|は).*?(?:翻訳|訳文)です[。:：]?|Here is the translation\s*:|Translation\s*:)",
     re.IGNORECASE,
@@ -309,6 +350,8 @@ def validate_translation_output(
     src_nums = normalize_numeric_strings(masked_source_text)
     out_nums = normalize_numeric_strings(out)
     if src_nums:
+        # Set-membership check intentionally preserves the existing multiplicity behavior
+        # (detecting dropped duplicate occurrences of the same value is tracked separately).
         missing_nums = [n for n in src_nums if n not in out_nums]
         if missing_nums:
             findings.append(
