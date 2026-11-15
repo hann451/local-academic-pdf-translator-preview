@@ -994,6 +994,37 @@ def test_preexisting_protection_region_and_partial_retypeset_stale_behavior(
     assert prev["valid"] is True
     assert any(p["role"] == "bottom" and p["will_protect"] is False for p in prev["parts"])
 
+    # Verify UI warning explains precedence when slightly overlapping formula region touches bottom edge
+    assert any("数式分離指定を優先" in w for w in prev["warnings"])
+
+    # Also verify: if user intentionally marks the FULL prose block as DO_NOT_TRANSLATE (>=0.85),
+    # split preview must NOT silently disable protection and must explain via UI warning.
+    full_prose_reg = client.post(
+        f"/api/documents/{doc_id}/protection-regions",
+        json={
+            "page_index": 0,
+            "bbox": [coupled["bbox"][0] - 2.0, coupled["bbox"][1] - 2.0, coupled["bbox"][2] + 2.0, coupled["bbox"][3] + 2.0],
+            "mode": ProtectionMode.DO_NOT_TRANSLATE.value,
+            "note": "本文全体も非翻訳",
+        },
+        headers=headers,
+    )
+    assert full_prose_reg.status_code == 200
+    prev_full = client.post(
+        f"/api/documents/{doc_id}/block-splits/preview",
+        json={"page_index": 0, "requested_bbox": drag_bbox, "include_equation_number": True},
+        headers=headers,
+    ).json()
+    assert prev_full["valid"] is True
+    assert any(p["role"] == "bottom" and p["will_protect"] is True for p in prev_full["parts"])
+    assert any("上下の本文部分とも大きく重なっているため" in w for w in prev_full["warnings"])
+    client.delete(f"/api/documents/{doc_id}/protection-regions/{full_prose_reg.json()['id']}", headers=headers)
+
+    prev = client.post(
+        f"/api/documents/{doc_id}/block-splits/preview",
+        json={"page_index": 0, "requested_bbox": drag_bbox, "include_equation_number": True},
+        headers=headers,
+    ).json()
     conf = client.post(
         f"/api/documents/{doc_id}/block-splits",
         json={
@@ -1034,7 +1065,7 @@ def test_preexisting_protection_region_and_partial_retypeset_stale_behavior(
     unprot = next(b for b in reparsed if "Falling width" in b["source_text"])
     assert unprot["status"] == BlockStatus.PENDING.value
 
-    for _ in range(2):
+    for rt_idx in range(2):
         rt = client.post(
             f"/api/jobs/{job1['id']}/retypeset",
             json={"allow_validation_warnings": True},
@@ -1042,5 +1073,23 @@ def test_preexisting_protection_region_and_partial_retypeset_stale_behavior(
         ).json()
         assert rt["llm_calls_made"] == 0
         assert rt["job"]["outputs_stale"] is True
-        assert rt["job"]["outputs_stale_reason"]
+        assert "1 件" in (rt["job"]["outputs_stale_reason"] or "")
+        assert "0 件" not in (rt["job"]["outputs_stale_reason"] or "")
         assert rt["job"]["state"] == JobState.COMPLETED_WITH_WARNINGS.value
+        assert any(i["code"] == "UNTRANSLATED_AFTER_PROTECTION_CHANGE" for i in rt["issues"])
+        cur_blocks = client.get(f"/api/documents/{doc_id}/blocks", headers=headers).json()
+        cur_target = next(b for b in cur_blocks if b["id"] == unprot["id"])
+        assert cur_target["needs_retranslation"] is True, f"lost needs_retranslation on retypeset #{rt_idx+1}"
+
+    # Running a new job resolves the new job cleanly, while old job1 remains outputs_stale=True
+    job2 = client.post(
+        f"/api/documents/{doc_id}/jobs",
+        json=TranslationJobConfig(use_mock_translator=True).model_dump(),
+        headers=headers,
+    ).json()
+    assert job2["outputs_stale"] is False
+    blocks_after_j2 = client.get(f"/api/documents/{doc_id}/blocks", headers=headers).json()
+    target_after_j2 = next(b for b in blocks_after_j2 if b["id"] == unprot["id"])
+    assert target_after_j2["needs_retranslation"] is False
+    old_job1_now = client.get(f"/api/jobs/{job1['id']}", headers=headers).json()
+    assert old_job1_now["outputs_stale"] is True

@@ -1586,6 +1586,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
             if preview.valid and manual_regions and preview.snapped_bbox:
                 page_manual = [r for r in manual_regions if r.page_index == page_index]
                 has_prose_region_overlap = False
+                suppressed_conflict_labels: list[str] = []
                 for part in preview.parts:
                     if part.role not in ("top", "bottom"):
                         continue
@@ -1596,6 +1597,13 @@ class NativePreservingAdapter(PdfEngineAdapter):
                             reg=reg,
                             sibling_formula_bbox=preview.snapped_bbox,
                         ):
+                            if (
+                                bbox_intersection_ratio(part.bbox, reg.bbox) >= 0.15
+                                or bbox_iou(part.bbox, reg.bbox) >= 0.10
+                            ):
+                                label = (reg.note or reg.mode.value).strip()
+                                if label not in suppressed_conflict_labels:
+                                    suppressed_conflict_labels.append(label)
                             continue
                         if (
                             bbox_intersection_ratio(part.bbox, reg.bbox) >= 0.35
@@ -1607,9 +1615,14 @@ class NativePreservingAdapter(PdfEngineAdapter):
                             elif reg.mode == ProtectionMode.TRANSLATE_AS_BODY:
                                 part.will_protect = False
                                 break
+                if suppressed_conflict_labels:
+                    labels_txt = "、".join(suppressed_conflict_labels)
+                    preview.warnings.append(
+                        f"既存の手動保護領域（{labels_txt}）は本文側にも一部重なっていますが、数式分離指定を優先し分割後の本文は翻訳対象としています（本文も非翻訳にする場合は確定後に「非翻訳にする」を選択してください）。"
+                    )
                 if has_prose_region_overlap:
                     preview.warnings.append(
-                        "既存の手動保護領域が上下の本文部分とも大きく重なっているため、該当本文にも保護設定が引き継がれます。"
+                        "既存の手動保護領域が上下の本文部分とも大きく重なっているため、該当本文にも保護設定が引き継がれます（翻訳対象にする場合は確定後に「翻訳対象にする」または該当保護領域の削除を行ってください）。"
                     )
             return preview
         finally:
@@ -2508,8 +2521,6 @@ class NativePreservingAdapter(PdfEngineAdapter):
         formula_cov = bbox_intersection_ratio(sibling_formula_bbox, reg.bbox)
         if formula_cov < 0.50:
             return False
-        if reg.mode == ProtectionMode.PROTECT_AS_FORMULA:
-            return True
         return bbox_intersection_ratio(part_bbox, reg.bbox) < 0.85
 
     def _apply_protection_and_masking(
