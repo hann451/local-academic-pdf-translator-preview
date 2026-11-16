@@ -45,6 +45,10 @@ from backend.pdf.adapters.native_preserving_adapter import (
     NativePreservingAdapter,
 )
 from backend.pdf.coordinates import bbox_iou, parse_page_range_spec
+from backend.pdf.hyphenation import (
+    PREPROCESSING_VERSION_DEHYPHENATED,
+    PREPROCESSING_VERSION_RAW,
+)
 from backend.pdf.validation.preflight import (
     compute_sha256,
     inspect_pdf_preflight,
@@ -91,6 +95,21 @@ _TRANSIENT_BLOCK_WARNING_CODES: frozenset[str] = TYPESETTING_ISSUE_CODES | froze
 def _clear_transient_block_warnings(warnings: list[str]) -> list[str]:
     """Remove transient translation/typesetting warnings before re-evaluation."""
     return [w for w in warnings if w not in _TRANSIENT_BLOCK_WARNING_CODES]
+
+
+def _resolve_block_llm_input(
+    block: Block, cfg: TranslationJobConfig
+) -> tuple[str, str]:
+    """Return `(llm_input_text, preprocessing_version)` honoring `normalize_line_break_hyphens`."""
+    if cfg.normalize_line_break_hyphens:
+        return (
+            block.llm_input_text or block.masked_source_text or block.source_text,
+            PREPROCESSING_VERSION_DEHYPHENATED,
+        )
+    return (
+        block.masked_source_text or block.source_text,
+        PREPROCESSING_VERSION_RAW,
+    )
 from backend.translation.validation.validator import (
     TRANSLATION_VALIDATION_ISSUE_CODES,
     validate_translation_output,
@@ -1340,7 +1359,10 @@ class JobManager:
             job.total_blocks = len(blocks)
             attach_continuation_candidates(blocks)
             self.db.save_blocks(doc.id, blocks)
-            continuation_contexts = build_continuation_contexts(blocks)
+            continuation_contexts = build_continuation_contexts(
+                blocks,
+                normalize_line_break_hyphens=job.config.normalize_line_break_hyphens,
+            )
             self.db.save_job(job)
 
             if job.config.pause_for_review and not resume:
@@ -1525,9 +1547,10 @@ class JobManager:
                         blk.translation_provenance = "reused_block"
                         blk.warnings = _clear_transient_block_warnings(blk.warnings)
                         reused_existing_blocks += 1
+                        hist_src, _ = _resolve_block_llm_input(blk, job.config)
                         history_window.append(
                             HistoryPair(
-                                source_text=blk.masked_source_text or blk.source_text,
+                                source_text=hist_src,
                                 target_text=blk.translation_text,
                             )
                         )
@@ -1567,9 +1590,10 @@ class JobManager:
                     self.db.save_job(job)
 
                     if blk.status == BlockStatus.TRANSLATED and blk.translation_text:
+                        hist_src, _ = _resolve_block_llm_input(blk, job.config)
                         history_window.append(
                             HistoryPair(
-                                source_text=blk.masked_source_text or blk.source_text,
+                                source_text=hist_src,
                                 target_text=blk.translation_text,
                             )
                         )
@@ -1755,6 +1779,17 @@ class JobManager:
                 "compute_backend": compute_backend,
                 "is_mock": job.is_mock_run,
                 "only_roundtrip_preservation": job.config.only_roundtrip_preservation,
+                "normalize_line_break_hyphens": job.config.normalize_line_break_hyphens,
+                "preprocessing_version": (
+                    PREPROCESSING_VERSION_DEHYPHENATED
+                    if job.config.normalize_line_break_hyphens
+                    else PREPROCESSING_VERSION_RAW
+                ),
+                "line_break_hyphen_normalized_blocks": sum(
+                    1
+                    for b in blocks
+                    if job.config.normalize_line_break_hyphens and b.llm_input_text is not None
+                ),
                 "protection_policy_version": "v2.0-academic-auto-protect",
                 "total_blocks": len(blocks),
                 "newly_inferenced_blocks": newly_inferenced_blocks,
@@ -2399,7 +2434,7 @@ class JobManager:
             return translator.translate_segment(**kw)
 
         block.warnings = _clear_transient_block_warnings(block.warnings)
-        masked_src = block.masked_source_text or block.source_text
+        masked_src, preprocessing_version = _resolve_block_llm_input(block, job.config)
         cache_key = compute_translation_cache_key(
             masked_source_text=masked_src,
             model_id=job.config.model_id or "",
@@ -2416,6 +2451,7 @@ class JobManager:
             protected_items=block.protected_items,
             adapter_version=translator.adapter_version,
             is_mock=translator.is_mock,
+            preprocessing_version=preprocessing_version,
         )
 
         cached = self.db.get_cached_translation(

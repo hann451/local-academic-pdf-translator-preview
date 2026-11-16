@@ -315,7 +315,11 @@ def attach_continuation_candidates(blocks: list[Block]) -> None:
         )
 
 
-def build_continuation_contexts(blocks: list[Block]) -> dict[str, str]:
+def build_continuation_contexts(
+    blocks: list[Block],
+    *,
+    normalize_line_break_hyphens: bool = True,
+) -> dict[str, str]:
     """Build bounded, masked neighboring context without joining physical blocks."""
     by_id = {block.id: block for block in blocks}
     context_parts: dict[str, list[str]] = defaultdict(list)
@@ -327,7 +331,14 @@ def build_continuation_contexts(blocks: list[Block]) -> dict[str, str]:
             counterpart = by_id.get(candidate.counterpart_block_id)
             if counterpart is None:
                 continue
-            text = counterpart.masked_source_text or counterpart.source_text
+            if normalize_line_break_hyphens:
+                text = (
+                    counterpart.llm_input_text
+                    or counterpart.masked_source_text
+                    or counterpart.source_text
+                )
+            else:
+                text = counterpart.masked_source_text or counterpart.source_text
             text = _PLACEHOLDER_RE.sub("[protected item]", text).strip()
             if len(text) > 320:
                 text = (

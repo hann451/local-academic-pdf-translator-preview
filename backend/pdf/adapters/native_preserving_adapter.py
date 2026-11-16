@@ -62,6 +62,13 @@ from backend.pdf.validation.visual_diff import (
     PageVisualComparisonReport,
     compare_protected_regions_visually,
 )
+from backend.pdf.hyphenation import (
+    DocumentTokenInventory,
+    LineBreakHyphenEdit,
+    build_document_token_inventory,
+    detect_line_break_hyphen_edits,
+    project_line_break_edits_to_masked,
+)
 from backend.translation.continuation import attach_continuation_candidates
 
 # Kinsoku Shori character sets (Section 12)
@@ -1766,6 +1773,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
         page_manual: list[ProtectionRegion],
         cfg: TranslationJobConfig,
         spatial_fraction_equation: bool = False,
+        token_inventory: DocumentTokenInventory | None = None,
         split_spec_id: str | None = None,
         split_role: BlockSplitRole | None = None,
         parent_block_id: str | None = None,
@@ -1833,10 +1841,22 @@ class NativePreservingAdapter(PdfEngineAdapter):
             is_uncertain = False
 
         inline_spans = extract_inline_math_spans(lines, drawings)
+        blk_bbox = [round(float(x), 2) for x in bbox]
+        line_break_edits = (
+            detect_line_break_hyphen_edits(
+                lines,
+                text_lines,
+                blk_bbox,
+                full_text,
+                inventory=token_inventory,
+            )
+            if cfg.normalize_line_break_hyphens
+            else []
+        )
         blk = Block(
             id=block_id,
             page_index=page_index,
-            bbox=[round(float(x), 2) for x in bbox],
+            bbox=blk_bbox,
             kind=kind,
             source_text=full_text,
             source_text_hash=compute_source_text_hash(full_text),
@@ -1858,8 +1878,23 @@ class NativePreservingAdapter(PdfEngineAdapter):
             page_manual,
             cfg,
             sibling_formula_bbox=sibling_formula_bbox,
+            line_break_edits=line_break_edits,
         )
         return blk, in_references_section
+
+    def _collect_document_token_inventory(
+        self, mupdf_doc: pymupdf.Document
+    ) -> DocumentTokenInventory:
+        """Scan single-line tokens across the whole document for hyphenation safety."""
+        doc_line_texts: list[str] = []
+        for d_idx in range(len(mupdf_doc)):
+            raw_blocks_d = mupdf_doc[d_idx].get_text("dict").get("blocks", [])
+            for b_d in raw_blocks_d:
+                if b_d.get("type") == 0:
+                    doc_line_texts.extend(
+                        self._extract_lines_and_style(b_d.get("lines", []))[0]
+                    )
+        return build_document_token_inventory(doc_line_texts)
 
     def parse_and_extract_blocks(
         self,
@@ -1884,6 +1919,11 @@ class NativePreservingAdapter(PdfEngineAdapter):
 
         try:
             body_font_size = self._estimate_document_body_font_size(mupdf_doc, page_indices)
+            token_inventory = (
+                self._collect_document_token_inventory(mupdf_doc)
+                if cfg.normalize_line_break_hyphens
+                else None
+            )
             in_references_section = False
 
             for p_idx in page_indices:
@@ -2018,6 +2058,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
                                 in_references_section=in_references_section,
                                 page_manual=page_manual,
                                 cfg=cfg,
+                                token_inventory=token_inventory,
                                 split_spec_id=spec.id,
                                 split_role=c_role,
                                 parent_block_id=cand.base_block_id,
@@ -2048,6 +2089,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
                         page_manual=page_manual,
                         cfg=cfg,
                         spatial_fraction_equation=bool(b_item.get("_spatial_fraction_equation")),
+                        token_inventory=token_inventory,
                     )
                     if blk is not None:
                         page_candidates.append(blk)
@@ -3091,7 +3133,9 @@ class NativePreservingAdapter(PdfEngineAdapter):
         page_manual_regions: list[ProtectionRegion],
         cfg: TranslationJobConfig,
         sibling_formula_bbox: list[float] | None = None,
+        line_break_edits: list[LineBreakHyphenEdit] | None = None,
     ) -> None:
+        block.llm_input_text = None
         # -1. Split formula child blocks stay strictly protected regardless of force_translate or TRANSLATE_AS_BODY
         if block.split_role == "formula":
             block.kind = BlockKind.ISOLATED_FORMULA
@@ -3237,12 +3281,21 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 return
 
         # 3. Stage 7: Inline formula, symbol, URL/DOI, and equation-ref masking (`{v1}`, `{v2}`, ...)
-        masked, items = mask_inline_protected_elements(
+        masked, items, orig_to_masked = mask_inline_protected_elements_with_mapping(
             block.source_text,
             inline_math_spans=block.inline_math_spans,
         )
         block.masked_source_text = masked
         block.protected_items = items
+        if cfg.normalize_line_break_hyphens and line_break_edits:
+            block.llm_input_text = project_line_break_edits_to_masked(
+                block.source_text,
+                masked,
+                orig_to_masked,
+                line_break_edits,
+            )
+        else:
+            block.llm_input_text = None
         block.status = BlockStatus.PENDING
         if not manual_override_translate:
             block.protection_source = "none"
@@ -4090,15 +4143,13 @@ def _map_orig_chars_to_working(
     return orig_to_work
 
 
-def mask_inline_protected_elements(
+def mask_inline_protected_elements_with_mapping(
     text: str,
     inline_math_spans: list[InlineMathSpan] | None = None,
-) -> tuple[str, list[ProtectedItem]]:
+) -> tuple[str, list[ProtectedItem], dict[int, int] | None]:
     """Detect inline formulas, Greek/math symbols, sub/superscripts, and URLs/DOIs,
-    replacing them with `{v1}`, `{v2}`, ... while leaving `[1]` citation brackets visible
-    (or protected) for validation. Also safely protects any pre-existing literal `{vN}`
-    or Private Use Area (PUA) characters in the source text so they cannot collide with
-    generated placeholders or internal sentinels.
+    replacing them with `{v1}`, `{v2}`, ... while returning an optional character map
+    from unmasked indices in `text` to indices in the masked string.
     """
     pending_items: list[tuple[ProtectedItemKind, str]] = []
     existing_cps = {ord(ch) for ch in text if ord(ch) >= 0xE000}
@@ -4232,25 +4283,61 @@ def mask_inline_protected_elements(
                     )
                     working = working[:w_start] + sentinel + working[w_end:]
 
+    orig_to_work = _map_orig_chars_to_working(
+        working, text, pending_items, base_cp
+    )
     items: list[ProtectedItem] = []
     counter = 0
+    work_to_masked: dict[int, int] = {}
+    out_parts: list[str] = []
+    out_pos = 0
 
-    def _finalize_sentinel(match: re.Match) -> str:
-        nonlocal counter
-        idx = ord(match.group(0)) - base_cp
-        kind, orig_text = pending_items[idx]
-        counter += 1
-        ph = f"{{v{counter}}}"
-        items.append(
-            ProtectedItem(
-                placeholder=ph,
-                kind=kind,
-                original_text=orig_text,
+    for work_pos, ch in enumerate(working):
+        code = ord(ch) - base_cp
+        if 0 <= code < 256 and code < len(pending_items):
+            kind, orig_text = pending_items[code]
+            counter += 1
+            ph = f"{{v{counter}}}"
+            items.append(
+                ProtectedItem(
+                    placeholder=ph,
+                    kind=kind,
+                    original_text=orig_text,
+                )
             )
-        )
-        return ph
+            out_parts.append(ph)
+            out_pos += len(ph)
+        else:
+            work_to_masked[work_pos] = out_pos
+            out_parts.append(ch)
+            out_pos += 1
 
-    final_masked = sentinel_re.sub(_finalize_sentinel, working)
+    final_masked = "".join(out_parts)
+    _ = sentinel_re
+    orig_to_masked: dict[int, int] | None = None
+    if orig_to_work is not None:
+        orig_to_masked = {
+            o_idx: work_to_masked[w_idx]
+            for o_idx, w_idx in orig_to_work.items()
+            if w_idx in work_to_masked
+        }
+    return final_masked, items, orig_to_masked
+
+
+def mask_inline_protected_elements(
+    text: str,
+    inline_math_spans: list[InlineMathSpan] | None = None,
+) -> tuple[str, list[ProtectedItem]]:
+    """Detect inline formulas, Greek/math symbols, sub/superscripts, and URLs/DOIs,
+    replacing them with `{v1}`, `{v2}`, ... while leaving `[1]` citation brackets visible
+    (or protected) for validation. Also safely protects any pre-existing literal `{vN}`
+    or Private Use Area (PUA) characters in the source text so they cannot collide with
+    generated placeholders or internal sentinels.
+    """
+    final_masked, items, _ = mask_inline_protected_elements_with_mapping(
+        text,
+        inline_math_spans=inline_math_spans,
+    )
     return final_masked, items
 
 

@@ -269,6 +269,14 @@ class Block(BaseModel):
     column_index: int = Field(default=0, ge=0)
     source_text: str
     masked_source_text: str | None = None
+    llm_input_text: str | None = Field(
+        default=None,
+        description=(
+            "Preprocessed text sent to the LLM (e.g. geometry-validated line-break "
+            "dehyphenation of masked_source_text). Leaves source_text, bbox, and "
+            "masked_source_text untouched."
+        ),
+    )
     protected_items: list[ProtectedItem] = Field(default_factory=list)
     inline_math_spans: list[InlineMathSpan] = Field(default_factory=list)
     continuation_candidates: list[ContinuationCandidate] = Field(default_factory=list)
@@ -631,6 +639,7 @@ class TranslationJobConfig(BaseModel):
     pause_for_review: bool = False
     use_mock_translator: bool = False
     allow_pending_splits: bool = False
+    normalize_line_break_hyphens: bool = True
 
 
 class Job(BaseModel):
