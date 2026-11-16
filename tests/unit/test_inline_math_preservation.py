@@ -2470,3 +2470,858 @@ def test_fix_b_narrow_bbox_subcaptions_fallback_without_overhang(tmp_path: Path)
                 )
         out_pdf.close()
 
+
+def test_prose_stopword_and_decimal_subscript_no_false_ambiguity(tmp_path: Path) -> None:
+    """Ensure:
+    - Upright lowercase prose stopwords ('at' in normal English prose) do not collide
+      with subscript math 'a_t' -> no bogus AMBIGUOUS_INLINE_MATH_FALLBACK.
+    - Decimal subscripts spanned across 't', '1', '.', '5', 's' do not emit '.5' pseudo-math spans.
+    - MANUALLY_EDITED blocks never inspect stale `translation_text` or get downgraded to FALLBACK_ORIGINAL
+      by heuristic script ambiguity when manual text renders cleanly.
+    """
+    from backend.pdf.adapters.native_preserving_adapter import extract_inline_math_spans
+
+    lines_prose_at = [
+        {
+            "spans": [
+                {"text": "The window starts ", "size": 10.0, "font": "CMR10", "origin": [72.0, 120.0], "bbox": [72.0, 110.0, 145.0, 122.0]},
+                {"text": "at", "size": 10.0, "font": "CMR10", "origin": [146.0, 120.0], "bbox": [146.0, 110.0, 155.0, 122.0]},
+                {"text": " the initial frame and outputs ", "size": 10.0, "font": "CMR10", "origin": [156.0, 120.0], "bbox": [156.0, 110.0, 280.0, 122.0]},
+                {"text": "a", "size": 10.0, "font": "CMMI10", "origin": [281.0, 120.0], "bbox": [281.0, 110.0, 286.0, 122.0]},
+                {"text": "t", "size": 7.0, "font": "CMMI7", "origin": [286.5, 121.8], "bbox": [286.5, 115.0, 290.0, 123.5]},
+                {"text": ".", "size": 10.0, "font": "CMR10", "origin": [290.2, 120.0], "bbox": [290.2, 110.0, 293.0, 122.0]},
+            ]
+        }
+    ]
+    spans_at = extract_inline_math_spans(lines_prose_at, [])
+    assert any(s.context_text == "at" and s.role == "sub" and s.ambiguous is False for s in spans_at)
+
+    lines_t15s = [
+        {
+            "spans": [
+                {"text": "between t", "size": 10.0, "font": "CMMI10", "origin": [72.0, 150.0], "bbox": [72.0, 140.0, 112.0, 152.0]},
+                {"text": "1", "size": 7.0, "font": "CMR7", "origin": [112.2, 151.6], "bbox": [112.2, 145.0, 116.0, 153.2]},
+                {"text": ".", "size": 7.0, "font": "CMMI7", "origin": [116.1, 151.6], "bbox": [116.1, 145.0, 118.5, 153.2]},
+                {"text": "5", "size": 7.0, "font": "CMR7", "origin": [118.6, 151.6], "bbox": [118.6, 145.0, 122.5, 153.2]},
+                {"text": "s", "size": 7.0, "font": "CMMI7", "origin": [122.6, 151.6], "bbox": [122.6, 145.0, 126.5, 153.2]},
+                {"text": " and 1.5 s.", "size": 10.0, "font": "CMR10", "origin": [127.0, 150.0], "bbox": [127.0, 140.0, 175.0, 152.0]},
+            ]
+        }
+    ]
+    spans_t15 = extract_inline_math_spans(lines_t15s, [])
+    assert not any(s.context_text == ".5" for s in spans_t15)
+
+    # End-to-end typeset test: block 1 has false-stopword scenario translated cleanly without "at";
+    # block 2 is MANUALLY_EDITED despite stale .5 inside old translation_text + ambiguous inline_math_spans.
+    pdf_path = tmp_path / "issue_a_typeset.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    b1_box = [72.0, 100.0, 500.0, 140.0]
+    b2_box = [72.0, 160.0, 500.0, 200.0]
+    page.insert_textbox(pymupdf.Rect(b1_box), "The window starts at initial frame and yields at.", fontsize=10)
+    page.insert_textbox(pymupdf.Rect(b2_box), "Measured at t1.5s across 1.5 s interval.", fontsize=10)
+    doc.save(str(pdf_path))
+    doc.close()
+
+    cfg = AppConfig(runtime_dir=tmp_path / "rt")
+    doc_model = Document(
+        id="doc-issue-a",
+        original_filename="issue_a_typeset.pdf",
+        safe_storage_path=str(pdf_path),
+        sha256_hash=compute_sha256(pdf_path),
+        file_size_bytes=pdf_path.stat().st_size,
+        page_count=1,
+    )
+    b1 = Block(
+        id="doc-issue-a:page-1:block-1",
+        page_index=0,
+        bbox=b1_box,
+        kind=BlockKind.PARAGRAPH,
+        reading_order=0,
+        source_text="The window starts at initial frame and yields at.",
+        translation_text="ウィンドウは初期フレームから開始し、時刻 t の値を出力する。",
+        status=BlockStatus.TRANSLATED,
+        warnings=["AMBIGUOUS_INLINE_MATH_FALLBACK"],  # stale warning should be cleared!
+        inline_math_spans=spans_at,
+        font_size_pt=10.0,
+    )
+    b2 = Block(
+        id="doc-issue-a:page-1:block-2",
+        page_index=0,
+        bbox=b2_box,
+        kind=BlockKind.PARAGRAPH,
+        reading_order=1,
+        source_text="Measured at t1.5s across 1.5 s interval.",
+        translation_text="古い訳文では .5 が含まれていた。",  # stale AI output must be ignored!
+        manual_translation_text="間隔1.5秒において時刻t1.5sで計測された。",
+        status=BlockStatus.MANUALLY_EDITED,
+        warnings=["AMBIGUOUS_INLINE_MATH_FALLBACK"],
+        inline_math_spans=[
+            InlineMathSpan(context_text=".5", target_text="5", role="sub", ambiguous=True),
+        ],
+        font_size_pt=10.0,
+    )
+
+    mono_out = tmp_path / "mono.pdf"
+    dual_out = tmp_path / "dual.pdf"
+    adapter = NativePreservingAdapter(config=cfg)
+    updated, issues = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=[b1, b2],
+        page_indices=[0],
+        job_config=TranslationJobConfig(),
+        mono_output_path=mono_out,
+        dual_output_path=dual_out,
+        job_id="job-issue-a",
+    )
+    by_id = {b.id: b for b in updated}
+    assert by_id[b1.id].status == BlockStatus.TRANSLATED
+    assert "AMBIGUOUS_INLINE_MATH_FALLBACK" not in by_id[b1.id].warnings
+    assert by_id[b2.id].status == BlockStatus.MANUALLY_EDITED
+    assert "AMBIGUOUS_INLINE_MATH_FALLBACK" not in by_id[b2.id].warnings
+    assert not any(i.code == "AMBIGUOUS_INLINE_MATH_FALLBACK" for i in issues)
+
+    with pymupdf.open(str(mono_out)) as out_pdf:
+        full_txt = out_pdf[0].get_text()
+        assert "開始し" in full_txt
+        assert "計測された" in full_txt
+
+
+def test_figure_adjacent_small_unit_labels_auto_protected(tmp_path: Path) -> None:
+    """Dimension labels (e.g. '1.6m', '2m' at ~6.9pt) sitting 1.2-2.7pt outside a vector
+    diagram box must be classified under RULE_FIGURE_INTERNAL_TEXT while normal ~10pt body
+    text remains translatable.
+    """
+    pdf_path = tmp_path / "fig_adjacent_labels.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    # Place 1 Introduction heading above so body blocks sit in body zone (not page-1 frontmatter)
+    page.insert_text((72.0, 72.0), "1 Introduction", fontsize=12)
+    # Vector diagram box: [366, 283, 496, 368]
+    page.draw_rect(pymupdf.Rect(366.0, 283.0, 496.0, 368.0), color=(0, 0, 0), width=1.0)
+    page.draw_line((366.0, 283.0), (496.0, 368.0), color=(0, 0, 0), width=1.0)
+    # Dimension labels placed 1.5-2.7pt outside right/bottom edges at 6.9pt font
+    page.insert_text((497.5, 329.0), "1.6m", fontsize=6.9)
+    page.insert_text((425.0, 377.8), "2m", fontsize=6.9)
+    # Caption below (should remain caption / translatable, not figure internal)
+    page.insert_text((366.0, 395.0), "Fig. 1 Diagram layout", fontsize=9.96)
+    # Normal body paragraph nearby
+    page.insert_textbox(
+        pymupdf.Rect(72.0, 283.0, 340.0, 420.0),
+        "This paragraph describes the experimental setup using Wi-Fi sensing across multiple environments.",
+        fontsize=9.96,
+    )
+    doc.save(str(pdf_path))
+    doc.close()
+
+    cfg = AppConfig(runtime_dir=tmp_path / "rt_fig")
+    adapter = NativePreservingAdapter(config=cfg)
+    doc_model = Document(
+        id="doc-fig-lbl",
+        original_filename="fig_adjacent_labels.pdf",
+        safe_storage_path=str(pdf_path),
+        sha256_hash=compute_sha256(pdf_path),
+        file_size_bytes=pdf_path.stat().st_size,
+        page_count=1,
+    )
+    blocks = adapter.parse_and_extract_blocks(
+        document=doc_model,
+        page_indices=[0],
+        manual_regions=[],
+        job_config=TranslationJobConfig(use_mock_translator=True),
+    )
+    by_text = {b.source_text.strip(): b for b in blocks}
+    assert by_text["1.6m"].protection_rule_id == "RULE_FIGURE_INTERNAL_TEXT"
+    assert by_text["1.6m"].status == BlockStatus.PROTECTED_SKIP
+    assert by_text["2m"].protection_rule_id == "RULE_FIGURE_INTERNAL_TEXT"
+    assert by_text["2m"].status == BlockStatus.PROTECTED_SKIP
+    body_blk = next(b for b in blocks if "experimental setup" in b.source_text)
+    assert body_blk.status == BlockStatus.PENDING
+
+
+def test_compound_subscript_grouping_masking_and_rendering(tmp_path: Path) -> None:
+    """Issue B: Multi-span compound subscripts (including nested sub-subscripts such as
+    `a_{t_0-10,t_0-1}`, `a_{t_0,t_0+9}`, and `t_{1.5s}`) must:
+    1) Group into complete `InlineMathSpan` entries without emitting partial `at`/`t0` fragments.
+    2) Never be torn mid-identifier into `{v1}`/`{v2}` (`at0{v1},t0{v2}` or `width = mean(at0−10`).
+    3) Protect compound subscript tokens cleanly as single `{vN}` units during block masking.
+    4) Render the entire compound subscript tail at lowered subscript size and baseline in PDFs.
+    """
+    raw_lines = [
+        {
+            "spans": [
+                {"text": "First ", "size": 9.96, "origin": [50.0, 100.0], "bbox": [50.0, 92.0, 74.0, 102.0]},
+                {"text": "a", "size": 9.96, "origin": [74.0, 100.0], "bbox": [74.0, 92.0, 80.0, 102.0]},
+                {"text": "t", "size": 6.97, "origin": [80.0, 101.5], "bbox": [80.0, 96.0, 83.0, 103.0]},
+                {"text": "0", "size": 4.98, "origin": [83.0, 102.5], "bbox": [83.0, 98.5, 86.2, 103.5]},
+                {"text": "−", "size": 6.97, "origin": [86.7, 101.5], "bbox": [86.7, 96.0, 92.7, 103.0]},
+                {"text": "10", "size": 6.97, "origin": [92.7, 101.5], "bbox": [92.7, 96.0, 100.5, 103.0]},
+                {"text": ",t", "size": 6.97, "origin": [100.5, 101.5], "bbox": [100.5, 96.0, 106.0, 103.0]},
+                {"text": "0", "size": 4.98, "origin": [106.0, 102.5], "bbox": [106.0, 98.5, 109.2, 103.5]},
+                {"text": "−", "size": 6.97, "origin": [109.7, 101.5], "bbox": [109.7, 96.0, 115.7, 103.0]},
+                {"text": "1", "size": 6.97, "origin": [115.7, 101.5], "bbox": [115.7, 96.0, 119.7, 103.0]},
+                {"text": " and ", "size": 9.96, "origin": [120.2, 100.0], "bbox": [120.2, 92.0, 140.0, 102.0]},
+                {"text": "a", "size": 9.96, "origin": [140.0, 100.0], "bbox": [140.0, 92.0, 146.0, 102.0]},
+                {"text": "t", "size": 6.97, "origin": [146.0, 101.5], "bbox": [146.0, 96.0, 149.0, 103.0]},
+                {"text": "0", "size": 4.98, "origin": [149.0, 102.5], "bbox": [149.0, 98.5, 152.2, 103.5]},
+                {"text": ",t", "size": 6.97, "origin": [152.7, 101.5], "bbox": [152.7, 96.0, 158.0, 103.0]},
+                {"text": "0", "size": 4.98, "origin": [158.0, 102.5], "bbox": [158.0, 98.5, 161.2, 103.5]},
+                {"text": "+9", "size": 6.97, "origin": [161.7, 101.5], "bbox": [161.7, 96.0, 171.7, 103.0]},
+                {"text": " at t", "size": 9.96, "origin": [172.2, 100.0], "bbox": [172.2, 92.0, 189.0, 102.0]},
+                {"text": "0", "size": 6.97, "origin": [189.0, 101.5], "bbox": [189.0, 96.0, 193.0, 103.0]},
+                {"text": " and t", "size": 9.96, "origin": [193.5, 100.0], "bbox": [193.5, 92.0, 215.0, 102.0]},
+                {"text": "1", "size": 6.97, "origin": [215.0, 101.5], "bbox": [215.0, 96.0, 219.0, 103.0]},
+                {"text": ".", "size": 6.97, "origin": [219.0, 101.5], "bbox": [219.0, 96.0, 221.3, 103.0]},
+                {"text": "5", "size": 6.97, "origin": [221.3, 101.5], "bbox": [221.3, 96.0, 225.3, 103.0]},
+                {"text": "s", "size": 6.97, "origin": [225.3, 101.5], "bbox": [225.3, 96.0, 229.0, 103.0]},
+                {"text": ".", "size": 9.96, "origin": [229.5, 100.0], "bbox": [229.5, 92.0, 232.0, 102.0]},
+            ]
+        }
+    ]
+    extracted = extract_inline_math_spans(raw_lines)
+    tuples = {(m.role, m.context_text, m.target_text, m.ambiguous) for m in extracted}
+    assert ("sub", "at0−10,t0−1", "t0−10,t0−1", False) in tuples
+    assert ("sub", "at0,t0+9", "t0,t0+9", False) in tuples
+    assert ("sub", "t1.5s", "1.5s", False) in tuples
+    assert ("sub", "t0", "0", False) in tuples
+    assert not any(m.context_text == "at" for m in extracted)
+
+    at_9 = next(m for m in extracted if m.context_text == "at0,t0+9")
+    assert [(sr.start, sr.end, sr.level) for sr in at_9.sub_runs] == [
+        (0, 1, 1),
+        (1, 2, 2),
+        (2, 4, 1),
+        (4, 5, 2),
+        (5, 7, 1),
+    ]
+    assert all(sr.scale < 0.78 * 0.85 and sr.dy_em > 0.18 + 0.05 for sr in at_9.sub_runs if sr.level == 2)
+    at_10 = next(m for m in extracted if m.context_text == "at0−10,t0−1")
+    assert any(sr.level == 2 for sr in at_10.sub_runs)
+
+    # Standalone masking (without inline_math_spans) must not rip `-10` / `-1` out of `at0−10,t0−1`
+    raw_para = "between 10 samples at0−10,t0−1 and 10 samples at0,t0+9 at t0 and t1.5s."
+    raw_masked, raw_items = mask_inline_protected_elements(raw_para)
+    assert "at0{" not in raw_masked
+    assert "t0{" not in raw_masked
+    assert unmask_inline_protected_elements(raw_masked, raw_items) == raw_para
+
+    # Equation masking with mean(...) must keep balanced equation without tearing `at0−10`
+    eq_src = "Falling width = mean(at0−10,t0−1) − mean(at0,t0+9)(6) A point is identified."
+    eq_masked, eq_items = mask_inline_protected_elements(eq_src)
+    assert [it.original_text for it in eq_items] == ["width = mean(at0−10,t0−1) − mean(at0,t0+9)"]
+    assert unmask_inline_protected_elements(eq_masked, eq_items) == eq_src
+
+    # With PDF inline_math_spans, compound subscripts AND standalone `t0` mask cleanly as `{vN}` placeholders
+    masked, items = mask_inline_protected_elements(raw_para, inline_math_spans=extracted)
+    origs = [it.original_text for it in items]
+    assert origs == ["at0−10,t0−1", "at0,t0+9", "t0", "t1.5s"]
+    assert "at0{" not in masked
+    assert unmask_inline_protected_elements(masked, items) == raw_para
+
+    # End-to-end typesetting to mono & dual PDFs renders full L0 > L1 > L2 hierarchy
+    pdf_path = tmp_path / "compound_sub_src.pdf"
+    pdf_doc = pymupdf.open()
+    pg = pdf_doc.new_page(width=595, height=842)
+    pg.insert_textbox(pymupdf.Rect(50.0, 90.0, 290.0, 175.0), raw_para, fontsize=9.96)
+    pdf_doc.save(str(pdf_path))
+    pdf_doc.close()
+
+    doc_model = Document(
+        id="doc-comp-sub",
+        original_filename="compound_sub_src.pdf",
+        safe_storage_path=str(pdf_path),
+        sha256_hash=compute_sha256(pdf_path),
+        file_size_bytes=pdf_path.stat().st_size,
+        page_count=1,
+    )
+    blk = Block(
+        id="doc-comp-sub:page-1:block-1",
+        page_index=0,
+        bbox=[50.0, 90.0, 290.0, 175.0],
+        kind=BlockKind.PARAGRAPH,
+        source_text=raw_para,
+        masked_source_text=masked,
+        protected_items=items,
+        inline_math_spans=extracted,
+        translation_text="時刻 {v3} と {v4} において、前半 {v1} と後半 {v2} の平均値を比較する。",
+        status=BlockStatus.TRANSLATED,
+        font_size_pt=9.96,
+    )
+    adapter = NativePreservingAdapter(config=AppConfig(runtime_dir=tmp_path / "rt_comp"))
+    mono_out = tmp_path / "compound_sub_mono.pdf"
+    dual_out = tmp_path / "compound_sub_dual.pdf"
+    updated, issues = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=[blk],
+        page_indices=[0],
+        job_config=TranslationJobConfig(output_mono_pdf=True, output_dual_pdf=True),
+        mono_output_path=mono_out,
+        dual_output_path=dual_out,
+        job_id="job-comp-sub",
+    )
+    assert not issues
+    assert updated[0].status == BlockStatus.TRANSLATED
+    fitted = updated[0].fitted_font_size_pt or 9.0
+
+    for out_file, is_dual in [(mono_out, False), (dual_out, True)]:
+        d_out = pymupdf.open(str(out_file))
+        clip = (
+            pymupdf.Rect(50.0 + 595.0, 90.0, 290.0 + 595.0, 175.0)
+            if is_dual and d_out[0].rect.width > 700
+            else pymupdf.Rect(50.0, 90.0, 290.0, 175.0)
+        )
+        pd = d_out[0].get_text("dict", clip=clip)
+        d_out.close()
+        rendered_spans = [
+            s
+            for b_item in pd["blocks"]
+            if b_item.get("type") == 0
+            for ln in b_item["lines"]
+            for s in ln["spans"]
+        ]
+        full_text = "".join(s["text"] for s in rendered_spans).replace("\xa0", " ")
+        assert "{v" not in full_text
+        assert "at0−10,t0−1" in full_text
+        assert "at0,t0+9" in full_text
+        assert "t1.5s" in full_text
+
+        sub_l1_spans = [
+            s
+            for s in rendered_spans
+            if s["text"] in (",t", "+9", "1.5s", "10,t") and s["size"] < fitted * 0.85
+        ]
+        assert len(sub_l1_spans) >= 3
+        sub_l2_zeros = [
+            s
+            for s in rendered_spans
+            if s["text"] == "0" and s["size"] < fitted * 0.68
+        ]
+        assert len(sub_l2_zeros) == 4  # 2 inside at0-10,t0-1 and 2 inside at0,t0+9
+        for l2 in sub_l2_zeros:
+            same_line_l1 = [
+                ls
+                for ls in rendered_spans
+                if 0.70 * fitted <= ls["size"] < 0.85 * fitted
+                and abs(ls["origin"][1] - l2["origin"][1]) < 4.0
+            ]
+            assert same_line_l1
+            l1 = same_line_l1[0]
+            assert l2["size"] < l1["size"] * 0.85
+            assert l2["origin"][1] > l1["origin"][1] + 0.5
+            same_line_normals = [
+                ns
+                for ns in rendered_spans
+                if ns["size"] >= fitted * 0.90 and abs(ns["origin"][1] - l1["origin"][1]) < 6.0
+            ]
+            assert same_line_normals
+            assert l1["origin"][1] > same_line_normals[0]["origin"][1] + 1.0
+
+
+def test_stopword_colliding_subscript_variables_masked_by_occurrence_and_rendered(
+    tmp_path: Path,
+) -> None:
+    """Geometry-confirmed script variables whose spelling collides with English stopwords
+    (e.g. subscript `a_t` vs prose `'starts at the'`, or `i_n` vs `'in this'`) must be:
+      1) Annotated with exact `mask_occurrence_indices` rather than `ambiguous=True`,
+      2) Masked to `{vN}` ONLY at the script occurrences (never corrupting prose prepositions),
+      3) Rejected by `validate_translation_output` if dropped by the translator,
+      4) Rendered as proper subscripts in final mono & dual PDFs.
+    """
+    raw_lines = [
+        {
+            "spans": [
+                {"text": "the window ", "size": 9.96, "font": "CMR10", "origin": [50.0, 110.0], "bbox": [50.0, 100.0, 100.0, 112.0]},
+                {"text": "starts at the", "size": 9.96, "font": "CMR10", "origin": [101.0, 110.0], "bbox": [101.0, 100.0, 155.0, 112.0]},
+                {"text": " initial frame with ", "size": 9.96, "font": "CMR10", "origin": [156.0, 110.0], "bbox": [156.0, 100.0, 240.0, 112.0]},
+            ]
+        },
+        {
+            "spans": [
+                {"text": "ˆ", "size": 9.96, "font": "CMR10", "origin": [51.5, 119.5], "bbox": [51.5, 112.0, 56.5, 121.0]},
+                {"text": "H", "size": 9.96, "font": "CMMI10", "origin": [50.0, 122.0], "bbox": [50.0, 112.0, 58.0, 124.0]},
+                {"text": "m,n,k,t", "size": 6.97, "font": "CMMI7", "origin": [58.2, 123.5], "bbox": [58.2, 117.0, 82.0, 125.0]},
+                {"text": " per window, we define the value ", "size": 9.96, "font": "CMR10", "origin": [83.0, 122.0], "bbox": [83.0, 112.0, 232.0, 124.0]},
+                {"text": "a", "size": 9.96, "font": "CMMI10", "origin": [233.0, 122.0], "bbox": [233.0, 112.0, 238.5, 124.0]},
+                {"text": "t", "size": 6.97, "font": "CMMI7", "origin": [238.6, 123.5], "bbox": [238.6, 117.0, 242.0, 125.0]},
+                {"text": " of", "size": 9.96, "font": "CMR10", "origin": [243.0, 122.0], "bbox": [243.0, 112.0, 256.0, 124.0]},
+            ]
+        },
+    ]
+
+    extracted = extract_inline_math_spans(raw_lines, [])
+    at_span = next(s for s in extracted if s.context_text == "at")
+    assert at_span.role == "sub"
+    assert at_span.target_text == "t"
+    assert at_span.ambiguous is False
+    assert at_span.mask_occurrence_indices == [1]
+
+    source_text = (
+        "the window starts at the initial frame with "
+        "ˆHm,n,k,t per window, we define the value at of"
+    )
+    masked, items = mask_inline_protected_elements(source_text, inline_math_spans=extracted)
+    assert "starts at the" in masked
+    assert masked.endswith("define the value {v2} of")
+    assert [(it.placeholder, it.original_text) for it in items] == [
+        ("{v1}", "ˆHm,n,k,t"),
+        ("{v2}", "at"),
+    ]
+    assert unmask_inline_protected_elements(masked, items) == source_text
+
+    # Translator dropping `{v2}` (omitting `a_t`) must be rejected by validator
+    bad_val = validate_translation_output(
+        source_text,
+        masked,
+        "{v1}の分散を用いて、の値を定義する。",
+        items,
+    )
+    assert bad_val.is_valid is False
+    assert "PLACEHOLDER_MISSING" in bad_val.error_codes
+
+    ok_tr = "ウィンドウは初期フレームから始まり、{v1}の分散を用いて、{v2}の値を定義する。"
+    ok_val = validate_translation_output(source_text, masked, ok_tr, items)
+    assert ok_val.is_valid is True
+
+    # Generalized stopword check (`in` -> `i_n` alongside prose `"in this"` and `"at"` prose + 2x `a_t`)
+    multi_lines = [
+        {
+            "spans": [
+                {"text": "In prose, we stay ", "size": 10.0, "font": "CMR10", "origin": [50.0, 100.0], "bbox": [50.0, 90.0, 130.0, 102.0]},
+                {"text": "in", "size": 10.0, "font": "CMR10", "origin": [132.0, 100.0], "bbox": [132.0, 90.0, 141.0, 102.0]},
+                {"text": " the loop at first, then ", "size": 10.0, "font": "CMR10", "origin": [143.0, 100.0], "bbox": [143.0, 90.0, 240.0, 102.0]},
+                {"text": "i", "size": 10.0, "font": "CMMI10", "origin": [242.0, 100.0], "bbox": [242.0, 90.0, 246.0, 102.0]},
+                {"text": "n", "size": 7.0, "font": "CMMI7", "origin": [246.1, 101.8], "bbox": [246.1, 95.0, 250.0, 103.5]},
+                {"text": " updates ", "size": 10.0, "font": "CMR10", "origin": [252.0, 100.0], "bbox": [252.0, 90.0, 290.0, 102.0]},
+                {"text": "a", "size": 10.0, "font": "CMMI10", "origin": [291.0, 100.0], "bbox": [291.0, 90.0, 296.0, 102.0]},
+                {"text": "t", "size": 7.0, "font": "CMMI7", "origin": [296.1, 101.8], "bbox": [296.1, 95.0, 299.5, 103.5]},
+                {"text": " and ", "size": 10.0, "font": "CMR10", "origin": [301.0, 100.0], "bbox": [301.0, 90.0, 322.0, 102.0]},
+                {"text": "a", "size": 10.0, "font": "CMMI10", "origin": [323.0, 100.0], "bbox": [323.0, 90.0, 328.0, 102.0]},
+                {"text": "t", "size": 7.0, "font": "CMMI7", "origin": [328.1, 101.8], "bbox": [328.1, 95.0, 331.5, 103.5]},
+                {"text": ".", "size": 10.0, "font": "CMR10", "origin": [332.0, 100.0], "bbox": [332.0, 90.0, 335.0, 102.0]},
+            ]
+        }
+    ]
+    multi_spans = extract_inline_math_spans(multi_lines, [])
+    multi_src = "In prose, we stay in the loop at first, then in updates at and at."
+    multi_masked, multi_items = mask_inline_protected_elements(multi_src, inline_math_spans=multi_spans)
+    assert multi_masked == "In prose, we stay in the loop at first, then {v1} updates {v2} and {v3}."
+    assert [(it.placeholder, it.original_text) for it in multi_items] == [
+        ("{v1}", "in"),
+        ("{v2}", "at"),
+        ("{v3}", "at"),
+    ]
+    assert unmask_inline_protected_elements(multi_masked, multi_items) == multi_src
+
+    # End-to-end PDF typesetting confirms subscript `t` rendering in Japanese prose
+    pdf_path = tmp_path / "at_sub_src.pdf"
+    pdf_doc = pymupdf.open()
+    pg = pdf_doc.new_page(width=595, height=842)
+    pg.insert_textbox(pymupdf.Rect(50.0, 95.0, 290.0, 165.0), source_text, fontsize=9.96)
+    pdf_doc.save(str(pdf_path))
+    pdf_doc.close()
+
+    doc_model = Document(
+        id="doc-at-sub",
+        original_filename="at_sub_src.pdf",
+        safe_storage_path=str(pdf_path),
+        sha256_hash=compute_sha256(pdf_path),
+        file_size_bytes=pdf_path.stat().st_size,
+        page_count=1,
+    )
+    blk = Block(
+        id="doc-at-sub:page-1:block-1",
+        page_index=0,
+        bbox=[50.0, 95.0, 290.0, 165.0],
+        kind=BlockKind.PARAGRAPH,
+        source_text=source_text,
+        masked_source_text=masked,
+        protected_items=items,
+        inline_math_spans=extracted,
+        translation_text=ok_tr,
+        status=BlockStatus.TRANSLATED,
+        font_size_pt=9.96,
+    )
+    adapter = NativePreservingAdapter(config=AppConfig(runtime_dir=tmp_path / "rt_at"))
+    mono_out = tmp_path / "at_sub_mono.pdf"
+    dual_out = tmp_path / "at_sub_dual.pdf"
+    updated, issues = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=[blk],
+        page_indices=[0],
+        job_config=TranslationJobConfig(output_mono_pdf=True, output_dual_pdf=True),
+        mono_output_path=mono_out,
+        dual_output_path=dual_out,
+        job_id="job-at-sub",
+    )
+    assert not issues
+    assert updated[0].status == BlockStatus.TRANSLATED
+    fitted = updated[0].fitted_font_size_pt or 9.0
+
+    for out_file, is_dual in [(mono_out, False), (dual_out, True)]:
+        d_out = pymupdf.open(str(out_file))
+        clip = (
+            pymupdf.Rect(50.0 + 595.0, 95.0, 290.0 + 595.0, 165.0)
+            if is_dual and d_out[0].rect.width > 700
+            else pymupdf.Rect(50.0, 95.0, 290.0, 165.0)
+        )
+        pd = d_out[0].get_text("dict", clip=clip)
+        d_out.close()
+        rendered_spans = [
+            s
+            for b_item in pd["blocks"]
+            if b_item.get("type") == 0
+            for ln in b_item["lines"]
+            for s in ln["spans"]
+        ]
+        full_text = "".join(s["text"] for s in rendered_spans).replace("\xa0", " ")
+        assert "{v" not in full_text
+        assert "atの値を定義する" in full_text
+
+        sub_t_spans = [s for s in rendered_spans if s["text"] == "t" and s["size"] < fitted * 0.85]
+        assert sub_t_spans
+        for ss in sub_t_spans:
+            same_line_normals = [
+                ns
+                for ns in rendered_spans
+                if ns["size"] >= fitted * 0.90 and abs(ns["origin"][1] - ss["origin"][1]) < 6.0
+            ]
+            assert same_line_normals
+            assert ss["origin"][1] > same_line_normals[0]["origin"][1] + 1.0
+
+
+def test_nested_superscript_and_mixed_l1_l2_structures(tmp_path: Path) -> None:
+    """General L1/L2 script hierarchies across superscripts and subscripts must preserve
+    per-tier font scales and vertical offsets in both mono and dual output PDFs:
+      - e^{j h_{m,n,k,t}} (even when L2 drops toward baseline)
+      - x^{a^2} (L2 super inside L1 super)
+      - x^{a_0} (L2 sub inside L1 super)
+      - a_{i^2} (L2 super inside L1 sub)
+      - P^{*}_{a_0} (stacked L1 super + L1/L2 sub on same base)
+    """
+    raw_lines = [
+        {
+            "spans": [
+                {"text": "Compute ", "size": 10.0, "font": "CMR10", "origin": [40.0, 100.0], "bbox": [40.0, 91.0, 82.0, 102.0]},
+                {"text": "e", "size": 10.0, "font": "CMMI10", "origin": [83.0, 100.0], "bbox": [83.0, 92.0, 88.0, 102.0]},
+                {"text": "jh", "size": 7.0, "font": "CMMI7", "origin": [88.2, 96.5], "bbox": [88.2, 90.0, 96.0, 98.0]},
+                {"text": "m,n,k,t", "size": 5.0, "font": "CMMI5", "origin": [96.2, 99.1], "bbox": [96.2, 94.5, 113.0, 100.5]},
+                {"text": " with ", "size": 10.0, "font": "CMR10", "origin": [114.0, 100.0], "bbox": [114.0, 91.0, 136.0, 102.0]},
+                {"text": "x", "size": 10.0, "font": "CMMI10", "origin": [137.0, 100.0], "bbox": [137.0, 92.0, 143.0, 102.0]},
+                {"text": "a", "size": 7.0, "font": "CMMI7", "origin": [143.2, 96.5], "bbox": [143.2, 90.0, 147.0, 98.0]},
+                {"text": "2", "size": 5.0, "font": "CMR5", "origin": [147.2, 94.5], "bbox": [147.2, 90.0, 150.2, 95.5]},
+                {"text": ", ", "size": 10.0, "font": "CMR10", "origin": [151.0, 100.0], "bbox": [151.0, 92.0, 155.0, 102.0]},
+                {"text": "y", "size": 10.0, "font": "CMMI10", "origin": [156.0, 100.0], "bbox": [156.0, 92.0, 162.0, 102.0]},
+                {"text": "b", "size": 7.0, "font": "CMMI7", "origin": [162.2, 96.5], "bbox": [162.2, 90.0, 166.0, 98.0]},
+                {"text": "0", "size": 5.0, "font": "CMR5", "origin": [166.2, 98.2], "bbox": [166.2, 93.5, 169.2, 99.0]},
+            ]
+        },
+        {
+            "spans": [
+                {"text": "and ", "size": 10.0, "font": "CMR10", "origin": [40.0, 120.0], "bbox": [40.0, 111.0, 58.0, 122.0]},
+                {"text": "w", "size": 10.0, "font": "CMMI10", "origin": [59.0, 120.0], "bbox": [59.0, 112.0, 66.0, 122.0]},
+                {"text": "i", "size": 7.0, "font": "CMMI7", "origin": [66.2, 121.6], "bbox": [66.2, 115.0, 69.0, 123.0]},
+                {"text": "2", "size": 5.0, "font": "CMR5", "origin": [69.2, 119.9], "bbox": [69.2, 115.0, 72.2, 120.8]},
+                {"text": " plus ", "size": 10.0, "font": "CMR10", "origin": [73.0, 120.0], "bbox": [73.0, 111.0, 98.0, 122.0]},
+                {"text": "P", "size": 10.0, "font": "CMMI10", "origin": [99.0, 120.0], "bbox": [99.0, 112.0, 106.0, 122.0]},
+                {"text": "∗", "size": 7.0, "font": "CMSY7", "origin": [106.2, 116.5], "bbox": [106.2, 110.0, 110.2, 118.0]},
+                {"text": "c", "size": 7.0, "font": "CMMI7", "origin": [106.2, 122.0], "bbox": [106.2, 116.0, 110.0, 123.5]},
+                {"text": "3", "size": 5.0, "font": "CMR5", "origin": [110.2, 123.0], "bbox": [110.2, 118.5, 113.2, 124.0]},
+                {"text": ".", "size": 10.0, "font": "CMR10", "origin": [114.0, 120.0], "bbox": [114.0, 112.0, 117.0, 122.0]},
+            ]
+        },
+    ]
+    extracted = extract_inline_math_spans(raw_lines)
+    by_ctx = {m.context_text: m for m in extracted}
+    assert "ejhm,n,k,t" in by_ctx
+    assert [(sr.start, sr.end, sr.level, sr.role) for sr in by_ctx["ejhm,n,k,t"].sub_runs] == [
+        (0, 2, 1, "super"),
+        (2, 9, 2, "sub"),
+    ]
+    assert [(sr.start, sr.end, sr.level, sr.role) for sr in by_ctx["xa2"].sub_runs] == [
+        (0, 1, 1, "super"),
+        (1, 2, 2, "super"),
+    ]
+    assert [(sr.start, sr.end, sr.level, sr.role) for sr in by_ctx["yb0"].sub_runs] == [
+        (0, 1, 1, "super"),
+        (1, 2, 2, "sub"),
+    ]
+    assert [(sr.start, sr.end, sr.level, sr.role) for sr in by_ctx["wi2"].sub_runs] == [
+        (0, 1, 1, "sub"),
+        (1, 2, 2, "super"),
+    ]
+    assert [(sr.start, sr.end, sr.level, sr.role) for sr in by_ctx["P∗c3"].sub_runs] == [
+        (0, 1, 1, "sub"),
+        (1, 2, 2, "sub"),
+    ]
+
+    pdf_path = tmp_path / "nested_mixed_src.pdf"
+    pdf_doc = pymupdf.open()
+    pg = pdf_doc.new_page(width=595, height=842)
+    pg.insert_textbox(pymupdf.Rect(40.0, 88.0, 290.0, 175.0), "dummy source", fontsize=10.0)
+    pdf_doc.save(str(pdf_path))
+    pdf_doc.close()
+
+    doc_model = Document(
+        id="doc-nested-mixed",
+        original_filename="nested_mixed_src.pdf",
+        safe_storage_path=str(pdf_path),
+        sha256_hash=compute_sha256(pdf_path),
+        file_size_bytes=pdf_path.stat().st_size,
+        page_count=1,
+    )
+    blk = Block(
+        id="doc-nested-mixed:page-1:block-1",
+        page_index=0,
+        bbox=[40.0, 88.0, 290.0, 175.0],
+        kind=BlockKind.PARAGRAPH,
+        source_text="Compute ejhm,n,k,t with xa2, yb0 and wi2 plus P∗c3.",
+        translation_text="式 ejhm,n,k,t と xa2 と yb0 と wi2 と P∗c3 を評価する。",
+        inline_math_spans=extracted,
+        status=BlockStatus.TRANSLATED,
+        font_size_pt=10.0,
+    )
+    adapter = NativePreservingAdapter(config=AppConfig(runtime_dir=tmp_path / "rt_nested"))
+    mono_out = tmp_path / "nested_mixed_mono.pdf"
+    dual_out = tmp_path / "nested_mixed_dual.pdf"
+    updated, issues = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=[blk],
+        page_indices=[0],
+        job_config=TranslationJobConfig(output_mono_pdf=True, output_dual_pdf=True),
+        mono_output_path=mono_out,
+        dual_output_path=dual_out,
+        job_id="job-nested-mixed",
+    )
+    assert not issues
+    assert updated[0].status == BlockStatus.TRANSLATED
+    fitted = updated[0].fitted_font_size_pt or 9.0
+
+    for out_file, is_dual in [(mono_out, False), (dual_out, True)]:
+        d_out = pymupdf.open(str(out_file))
+        clip = (
+            pymupdf.Rect(40.0 + 595.0, 88.0, 290.0 + 595.0, 175.0)
+            if is_dual and d_out[0].rect.width > 700
+            else pymupdf.Rect(40.0, 88.0, 290.0, 175.0)
+        )
+        pd = d_out[0].get_text("dict", clip=clip)
+        d_out.close()
+        spans_out = [
+            s
+            for b_item in pd["blocks"]
+            if b_item.get("type") == 0
+            for ln in b_item["lines"]
+            for s in ln["spans"]
+        ]
+        s_jh = next(s for s in spans_out if "jh" in s["text"])
+        s_mnkt = next(s for s in spans_out if "m,n,k,t" in s["text"])
+        assert s_mnkt["size"] < s_jh["size"] * 0.85
+        assert s_mnkt["origin"][1] > s_jh["origin"][1] + 0.5
+
+        s_a = next(s for s in spans_out if s["text"] == "a")
+        s_a2 = next(s for s in spans_out if s["text"] == "2" and abs(s["origin"][1] - s_a["origin"][1]) < 4.0)
+        assert s_a2["size"] < s_a["size"] * 0.85
+        assert s_a2["origin"][1] < s_a["origin"][1] - 0.5
+
+        s_b = next(s for s in spans_out if s["text"] == "b")
+        s_b0 = next(s for s in spans_out if s["text"] == "0" and abs(s["origin"][1] - s_b["origin"][1]) < 4.0)
+        assert s_b0["size"] < s_b["size"] * 0.85
+        assert s_b0["origin"][1] > s_b["origin"][1] + 0.4
+
+        s_i = next(s for s in spans_out if s["text"] == "i")
+        s_i2 = next(s for s in spans_out if s["text"] == "2" and abs(s["origin"][1] - s_i["origin"][1]) < 4.0)
+        assert s_i2["size"] < s_i["size"] * 0.85
+        assert s_i2["origin"][1] < s_i["origin"][1] - 0.4
+
+        s_c = next(s for s in spans_out if s["text"] == "c")
+        s_c3 = next(s for s in spans_out if s["text"] == "3" and abs(s["origin"][1] - s_c["origin"][1]) < 4.0)
+        assert s_c3["size"] < s_c["size"] * 0.85
+        assert s_c3["origin"][1] > s_c["origin"][1] + 0.4
+        assert s_c["size"] < fitted * 0.85
+
+
+def test_page3_script_masking_norm_hat_and_negative_controls() -> None:
+    """Confirm masking on Page-3 patterns (`∥ht∥`, standalone `ht`, `ˆH(m, n, k, t)`, `tN`, `t0`, `t1`, `t2`)
+    while ensuring `tw` is never faked as subscript and ordinals/footnotes/prose stopwords are untouched.
+    """
+    raw_lines = [
+        {
+            "spans": [
+                {"text": "Let ", "size": 9.96, "font": "CMR10", "origin": [40.0, 100.0], "bbox": [40.0, 92.0, 56.0, 102.0]},
+                {"text": "tw", "size": 9.96, "font": "CMMI10", "origin": [57.0, 100.0], "bbox": [57.0, 92.0, 68.0, 102.0]},
+                {"text": " be window, ", "size": 9.96, "font": "CMR10", "origin": [69.0, 100.0], "bbox": [69.0, 92.0, 118.0, 102.0]},
+                {"text": "ˆ", "size": 9.96, "font": "CMR10", "origin": [120.5, 97.5], "bbox": [120.5, 90.0, 125.0, 98.5]},
+                {"text": "H", "size": 9.96, "font": "CMMI10", "origin": [119.0, 100.0], "bbox": [119.0, 92.0, 127.0, 102.0]},
+                {"text": "(m, n, k, t) has ∥", "size": 9.96, "font": "CMR10", "origin": [128.0, 100.0], "bbox": [128.0, 92.0, 185.0, 102.0]},
+                {"text": "h", "size": 9.96, "font": "CMMI10", "origin": [185.5, 100.0], "bbox": [185.5, 92.0, 191.0, 102.0]},
+                {"text": "t", "size": 6.97, "font": "CMMI7", "origin": [191.2, 101.5], "bbox": [191.2, 95.5, 194.2, 102.5]},
+                {"text": "∥ and components ", "size": 9.96, "font": "CMR10", "origin": [194.5, 100.0], "bbox": [194.5, 92.0, 260.0, 102.0]},
+                {"text": "h", "size": 9.96, "font": "CMMI10", "origin": [261.0, 100.0], "bbox": [261.0, 92.0, 266.5, 102.0]},
+                {"text": "t", "size": 6.97, "font": "CMMI7", "origin": [266.7, 101.5], "bbox": [266.7, 95.5, 269.7, 102.5]},
+            ]
+        },
+        {
+            "spans": [
+                {"text": "starts at 1", "size": 9.96, "font": "CMR10", "origin": [40.0, 120.0], "bbox": [40.0, 112.0, 85.0, 122.0]},
+                {"text": "st", "size": 6.97, "font": "CMR7", "origin": [85.2, 116.5], "bbox": [85.2, 110.0, 92.0, 118.0]},
+                {"text": " using method", "size": 9.96, "font": "CMR10", "origin": [92.5, 120.0], "bbox": [92.5, 112.0, 150.0, 122.0]},
+                {"text": "1", "size": 6.97, "font": "CMR7", "origin": [150.2, 116.5], "bbox": [150.2, 110.0, 154.0, 118.0]},
+                {"text": " in 2020", "size": 9.96, "font": "CMR10", "origin": [154.5, 120.0], "bbox": [154.5, 112.0, 190.0, 122.0]},
+                {"text": "2", "size": 6.97, "font": "CMR7", "origin": [190.2, 116.5], "bbox": [190.2, 110.0, 194.0, 118.0]},
+                {"text": " from t", "size": 9.96, "font": "CMMI10", "origin": [194.5, 120.0], "bbox": [194.5, 112.0, 224.0, 122.0]},
+                {"text": "1", "size": 6.97, "font": "CMR7", "origin": [224.2, 121.5], "bbox": [224.2, 115.5, 228.0, 122.5]},
+                {"text": " to t", "size": 9.96, "font": "CMMI10", "origin": [228.5, 120.0], "bbox": [228.5, 112.0, 245.0, 122.0]},
+                {"text": "2", "size": 6.97, "font": "CMR7", "origin": [245.2, 121.5], "bbox": [245.2, 115.5, 249.0, 122.5]},
+                {"text": " at t", "size": 9.96, "font": "CMMI10", "origin": [249.5, 120.0], "bbox": [249.5, 112.0, 265.0, 122.0]},
+                {"text": "N", "size": 6.97, "font": "CMMI7", "origin": [265.2, 121.5], "bbox": [265.2, 115.5, 270.0, 122.5]},
+            ]
+        },
+    ]
+    extracted = extract_inline_math_spans(raw_lines)
+    assert not any(m.context_text == "tw" for m in extracted)
+
+    source_text = (
+        "Let tw be window, ˆH(m, n, k, t) has ∥ht∥ and components ht "
+        "starts at 1st using method1 in 20202 from t1 to t2 at tN"
+    )
+    masked, items = mask_inline_protected_elements(source_text, inline_math_spans=extracted)
+    origs = [it.original_text for it in items]
+    assert origs == ["ˆH(m, n, k, t)", "∥ht∥", "ht", "t1", "t2", "tN"]
+    assert "∥" not in masked
+    assert "tw" in masked
+    assert "starts at 1st using method1 in 20202" in masked
+    assert unmask_inline_protected_elements(masked, items) == source_text
+
+
+def test_conflicting_nested_vs_flat_and_depth3_never_silently_flattened(tmp_path: Path) -> None:
+    """Conflicting nested vs flat structure (`x_{a_0}` vs `x_{a0}`), depth >= 3 nesting,
+    and line-wrap-split nested tokens must trigger explicit fallback + warning before redaction.
+    """
+    # 1. Conflict between nested `x_{a_0}` and flat `x_{a0}` in the same block
+    conflict_lines = [
+        {
+            "spans": [
+                {"text": "Compare x", "size": 10.0, "font": "CMMI10", "origin": [40.0, 100.0], "bbox": [40.0, 92.0, 86.0, 102.0]},
+                {"text": "a", "size": 7.0, "font": "CMMI7", "origin": [86.2, 101.5], "bbox": [86.2, 95.5, 90.0, 102.5]},
+                {"text": "0", "size": 5.0, "font": "CMR5", "origin": [90.2, 102.5], "bbox": [90.2, 98.0, 93.2, 103.5]},
+                {"text": " with x", "size": 10.0, "font": "CMR10", "origin": [94.0, 100.0], "bbox": [94.0, 92.0, 122.0, 102.0]},
+                {"text": "a0", "size": 7.0, "font": "CMR7", "origin": [122.2, 101.5], "bbox": [122.2, 95.5, 130.0, 102.5]},
+            ]
+        }
+    ]
+    conflict_spans = extract_inline_math_spans(conflict_lines)
+    xa0 = next(m for m in conflict_spans if m.context_text == "xa0")
+    assert xa0.ambiguous is True
+
+    # 2. Depth >= 3 nesting sets `unrepresentable_reason`
+    deep_lines = [
+        {
+            "spans": [
+                {"text": "Evaluate x", "size": 10.0, "font": "CMMI10", "origin": [40.0, 100.0], "bbox": [40.0, 92.0, 88.0, 102.0]},
+                {"text": "a", "size": 7.0, "font": "CMMI7", "origin": [88.2, 96.5], "bbox": [88.2, 90.0, 92.0, 98.0]},
+                {"text": "2", "size": 5.0, "font": "CMR5", "origin": [92.2, 94.5], "bbox": [92.2, 89.5, 95.2, 95.5]},
+                {"text": "k", "size": 3.5, "font": "CMMI5", "origin": [95.4, 93.2], "bbox": [95.4, 88.5, 98.0, 94.2]},
+            ]
+        }
+    ]
+    deep_spans = extract_inline_math_spans(deep_lines)
+    xa2k = next(m for m in deep_spans if m.context_text == "xa2k")
+    assert xa2k.unrepresentable_reason == "UNREPRESENTABLE_DEEP_NESTED_MATH"
+
+    # Build source PDF with 3 blocks covering conflict, depth>=3, and wrap-split fallback
+    pdf_path = tmp_path / "fallback_guards_src.pdf"
+    d_src = pymupdf.open()
+    pg = d_src.new_page(width=595, height=842)
+    pg.insert_textbox(pymupdf.Rect(40.0, 60.0, 290.0, 120.0), "ORIGINAL_CONFLICT", fontsize=10.0)
+    pg.insert_textbox(pymupdf.Rect(40.0, 140.0, 290.0, 200.0), "ORIGINAL_DEEP3", fontsize=10.0)
+    pg.insert_textbox(pymupdf.Rect(40.0, 220.0, 290.0, 280.0), "ORIGINAL_WRAPSPLIT", fontsize=10.0)
+    d_src.save(str(pdf_path))
+    d_src.close()
+
+    doc_model = Document(
+        id="doc-guards",
+        original_filename="fallback_guards_src.pdf",
+        safe_storage_path=str(pdf_path),
+        sha256_hash=compute_sha256(pdf_path),
+        file_size_bytes=pdf_path.stat().st_size,
+        page_count=1,
+    )
+    split_nested_span = InlineMathSpan(
+        context_text="at0,t0+9",
+        target_text="t0,t0+9",
+        role="sub",
+        scale=0.78,
+        dy_em=0.18,
+    )
+    from backend.domain.models import InlineMathSubRun
+
+    split_nested_span = split_nested_span.model_copy(
+        update={
+            "sub_runs": [
+                InlineMathSubRun(start=0, end=1, role="sub", level=1, scale=0.78, dy_em=0.18),
+                InlineMathSubRun(start=1, end=2, role="sub", level=2, scale=0.557, dy_em=0.28),
+                InlineMathSubRun(start=2, end=4, role="sub", level=1, scale=0.78, dy_em=0.18),
+                InlineMathSubRun(start=4, end=5, role="sub", level=2, scale=0.557, dy_em=0.28),
+                InlineMathSubRun(start=5, end=7, role="sub", level=1, scale=0.78, dy_em=0.18),
+            ]
+        }
+    )
+    blocks = [
+        Block(
+            id="b-conflict",
+            page_index=0,
+            bbox=[40.0, 60.0, 290.0, 120.0],
+            kind=BlockKind.PARAGRAPH,
+            source_text="Compare xa0 with xa0",
+            translation_text="xa0 と xa0 を比較する。",
+            inline_math_spans=conflict_spans,
+            status=BlockStatus.TRANSLATED,
+            font_size_pt=10.0,
+        ),
+        Block(
+            id="b-deep3",
+            page_index=0,
+            bbox=[40.0, 140.0, 290.0, 200.0],
+            kind=BlockKind.PARAGRAPH,
+            source_text="Evaluate xa2k",
+            translation_text="xa2k を評価する。",
+            inline_math_spans=deep_spans,
+            status=BlockStatus.TRANSLATED,
+            font_size_pt=10.0,
+        ),
+        Block(
+            id="b-wrapsplit",
+            page_index=0,
+            bbox=[40.0, 220.0, 290.0, 280.0],
+            kind=BlockKind.PARAGRAPH,
+            source_text="Use at0,t0+9",
+            translation_text="値 at0,t0\n+9 を用いる。",
+            inline_math_spans=[split_nested_span],
+            status=BlockStatus.TRANSLATED,
+            font_size_pt=10.0,
+        ),
+    ]
+    adapter = NativePreservingAdapter(config=AppConfig(runtime_dir=tmp_path / "rt_guards"))
+    mono_out = tmp_path / "guards_mono.pdf"
+    dual_out = tmp_path / "guards_dual.pdf"
+    updated, issues = adapter.typeset_and_export(
+        document=doc_model,
+        blocks=blocks,
+        page_indices=[0],
+        job_config=TranslationJobConfig(output_mono_pdf=True, output_dual_pdf=True),
+        mono_output_path=mono_out,
+        dual_output_path=dual_out,
+        job_id="job-guards",
+    )
+    assert all(b.status == BlockStatus.FALLBACK_ORIGINAL for b in updated)
+    issue_by_block = {iss.block_id: iss.code for iss in issues}
+    assert issue_by_block["b-conflict"] == "AMBIGUOUS_INLINE_MATH_FALLBACK"
+    assert issue_by_block["b-deep3"] == "UNREPRESENTABLE_DEEP_NESTED_MATH_FALLBACK"
+    assert issue_by_block["b-wrapsplit"] == "INLINE_MATH_HIERARCHY_FALLBACK"
+
+    d_mono = pymupdf.open(str(mono_out))
+    mono_txt = d_mono[0].get_text()
+    d_mono.close()
+    assert "ORIGINAL_CONFLICT" in mono_txt
+    assert "ORIGINAL_DEEP3" in mono_txt
+    assert "ORIGINAL_WRAPSPLIT" in mono_txt
+

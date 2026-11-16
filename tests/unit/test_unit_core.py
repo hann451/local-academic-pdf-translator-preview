@@ -382,3 +382,33 @@ def test_japanese_fitting_respects_min_font_size() -> None:
     )
     assert fits_over is False
     assert sz_over == 8.0
+
+
+def test_cache_key_and_db_lookup_isolate_mock_vs_real(tmp_path: Path) -> None:
+    from backend.storage.database import DatabaseRepository
+
+    key_mock = compute_translation_cache_key(
+        masked_source_text="The proposed method achieves high accuracy.",
+        model_name="plamo-3-translate-2b",
+        quantization="Q4_K_M",
+        is_mock=True,
+    )
+    key_real = compute_translation_cache_key(
+        masked_source_text="The proposed method achieves high accuracy.",
+        model_name="plamo-3-translate-2b",
+        quantization="Q4_K_M",
+        is_mock=False,
+    )
+    assert key_mock != key_real
+
+    db = DatabaseRepository(tmp_path / "cache_isolation.sqlite3")
+    db.put_cached_translation(
+        cache_key=key_real,
+        model_output_text="[MOCK ja] poisoned legacy mock entry",
+        model_name="plamo-3-translate-2b",
+        quantization="Q4_K_M",
+        is_mock=True,
+    )
+    assert db.get_cached_translation(key_real, expected_is_mock=False) is None
+    hit_mock = db.get_cached_translation(key_real, expected_is_mock=True)
+    assert hit_mock is not None and hit_mock["is_mock"] is True

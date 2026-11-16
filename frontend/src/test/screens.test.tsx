@@ -6,6 +6,8 @@ import { Screen3ProgressReview } from "../components/Screen3ProgressReview";
 import { Screen4GlossaryDiagnostics } from "../components/Screen4GlossaryDiagnostics";
 import type {
   Block,
+  BlockSplitPreviewResult,
+  BlockSplitSpec,
   Document,
   ExportArtifact,
   Glossary,
@@ -316,6 +318,342 @@ describe("Screen 2: PDF Viewer & SVG Protection Editor (Section 6)", () => {
     fireEvent.click(screen.getByTestId("delete-region-reg-001"));
     expect(onDeleteRegion).toHaveBeenCalledWith("reg-001");
   });
+
+  it("supports drag-to-split preview/confirm under zoom and rotation, rejection guidance, split list delete, and immutable split formula badge", async () => {
+    const splitChildBlocks: Block[] = [
+      {
+        ...SAMPLE_BLOCKS[0],
+        id: "doc-abc123456789:page-1:block-0:f",
+        split_spec_id: "split-001",
+        split_role: "formula",
+        kind: "isolated_formula",
+        status: "protected_skip",
+        protection_source: "manual",
+        protection_reason: "選択範囲分割：数式原文保護",
+        source_text: "Falling width = mean(a_{t0-10,t0-1}) (6)",
+        bbox: [70, 200, 340, 220],
+      },
+      {
+        ...SAMPLE_BLOCKS[0],
+        id: "doc-abc123456789:page-1:block-0:b",
+        reading_order: 1,
+        split_spec_id: "split-001",
+        split_role: "bottom",
+        status: "pending",
+        translation_text: null,
+        needs_retranslation: true,
+        source_text: "A point is identified as the falling point.",
+        bbox: [70, 222, 420, 250],
+      },
+    ];
+    const savedSplits: BlockSplitSpec[] = [
+      {
+        id: "split-001",
+        document_id: SAMPLE_DOC.id,
+        page_index: 0,
+        requested_bbox: [68, 198, 345, 222],
+        snapped_bbox: [70, 200, 340, 220],
+        operation_mode: "split_and_protect_formula",
+        parent_block_id: "doc-abc123456789:page-1:block-0",
+        parent_bbox: [70, 180, 420, 250],
+        parent_source_hash: "a".repeat(64),
+        parent_source_preview: "Falling width ...",
+        include_equation_number: true,
+        applied_status: "applied",
+        status_reason: null,
+        note: "Eq.(6)",
+        created_at: "2026-11-15T00:00:00Z",
+      },
+      {
+        id: "split-pending",
+        document_id: SAMPLE_DOC.id,
+        page_index: 0,
+        requested_bbox: [70, 400, 250, 420],
+        snapped_bbox: [70, 400, 250, 420],
+        operation_mode: "split_and_protect_formula",
+        parent_block_id: "doc-abc123456789:page-1:block-9",
+        parent_bbox: [70, 390, 280, 440],
+        parent_source_hash: "b".repeat(64),
+        parent_source_preview: "Missing parent formula ...",
+        include_equation_number: true,
+        applied_status: "pending_ambiguous",
+        status_reason: "親ブロック候補が複数一致したため適用保留",
+        note: null,
+        created_at: "2026-11-15T00:01:00Z",
+      },
+    ];
+
+    const rejectedPreview: BlockSplitPreviewResult = {
+      valid: false,
+      document_id: SAMPLE_DOC.id,
+      page_index: 0,
+      protection_revision: 1,
+      parse_revision: 0,
+      requested_bbox: [10, 10, 60, 40],
+      snapped_bbox: null,
+      equation_number_candidate_bbox: null,
+      equation_number_text: null,
+      equation_number_auto_included: false,
+      parent_block_id: null,
+      parent_bbox: null,
+      parent_source_hash: null,
+      parent_signature: null,
+      parts: [],
+      rejection_code: "EMPTY_SELECTION",
+      rejection_reason: "選択範囲にテキストが含まれていません。",
+      retry_guidance: "数式文字全体が入るようにドラッグし直してください。",
+      warnings: [],
+      will_invalidate_manual_edits: false,
+      affected_manual_block_ids: [],
+      has_active_job: false,
+    };
+
+    const validPreview: BlockSplitPreviewResult = {
+      valid: true,
+      document_id: SAMPLE_DOC.id,
+      page_index: 0,
+      protection_revision: 1,
+      parse_revision: 2,
+      requested_bbox: [100, 200, 300, 240],
+      snapped_bbox: [102, 202, 298, 238],
+      equation_number_candidate_bbox: [275, 204, 298, 222],
+      equation_number_text: "(6)",
+      equation_number_auto_included: true,
+      parent_block_id: "doc-abc123456789:page-1:block-0",
+      parent_bbox: [100, 170, 400, 280],
+      parent_source_hash: "c".repeat(64),
+      parent_signature: "sig-xyz-123",
+      parts: [
+        {
+          role: "top",
+          kind: "paragraph",
+          will_protect: false,
+          bbox: [100, 170, 400, 198],
+          source_text: "Top intro sentence.",
+          label_ja: "上の本文（翻訳対象）",
+        },
+        {
+          role: "formula",
+          kind: "isolated_formula",
+          will_protect: true,
+          bbox: [102, 202, 298, 238],
+          source_text: "Falling width = mean(...) (6)",
+          label_ja: "選択数式（原文保護）",
+        },
+        {
+          role: "bottom",
+          kind: "paragraph",
+          will_protect: false,
+          bbox: [100, 242, 400, 280],
+          source_text: "A point is identified as the falling point.",
+          label_ja: "下の本文（翻訳対象）",
+        },
+      ],
+      rejection_code: null,
+      rejection_reason: null,
+      retry_guidance: null,
+      warnings: ["式番号 (6) を自動検出しました。"],
+      will_invalidate_manual_edits: true,
+      affected_manual_block_ids: ["doc-abc123456789:page-1:block-0"],
+      has_active_job: false,
+    };
+
+    const onAddRegion = vi.fn().mockResolvedValue(undefined);
+    const onPreviewSplit = vi
+      .fn()
+      .mockResolvedValueOnce(rejectedPreview)
+      .mockResolvedValue(validPreview);
+    const onCreateSplit = vi.fn().mockResolvedValue(undefined);
+    const onDeleteSplit = vi.fn().mockResolvedValue(undefined);
+    const onSetOverride = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <Screen2ProtectionEditor
+        document={{ ...SAMPLE_DOC, parse_revision: 2 }}
+        pdfBytes={null}
+        blocks={splitChildBlocks}
+        protectionRegions={[]}
+        blockSplits={savedSplits}
+        isParsing={false}
+        saveStatus="saved"
+        saveMessage={null}
+        onReparseBlocks={vi.fn()}
+        onAddProtectionRegion={onAddRegion}
+        onDeleteProtectionRegion={vi.fn()}
+        onPreviewBlockSplit={onPreviewSplit}
+        onCreateBlockSplit={onCreateSplit}
+        onDeleteBlockSplit={onDeleteSplit}
+        onProceedToStartJob={vi.fn()}
+        onSetBlockOverride={onSetOverride}
+      />
+    );
+
+    // 1. Split formula child hides generic translate toggle & shows immutable guidance
+    expect(
+      screen.queryByTestId("override-translate-doc-abc123456789:page-1:block-0:f")
+    ).toBeNull();
+    expect(
+      screen.getByTestId("split-formula-immutable-note-doc-abc123456789:page-1:block-0:f")
+    ).toHaveTextContent("「分割指定」を削除");
+    expect(
+      screen.getByTestId("block-needs-retranslation-doc-abc123456789:page-1:block-0:b")
+    ).toHaveTextContent("要再翻訳");
+
+    // Pending split status, job-start block & opt-in confirmation are visible; delete button works
+    expect(screen.getByTestId("split-status-split-pending")).toHaveTextContent("適用保留（曖昧）");
+    expect(screen.getByTestId("split-status-reason-split-pending")).toHaveTextContent(
+      "親ブロック候補が複数一致"
+    );
+    expect(screen.getByTestId("pending-splits-job-warning")).toBeInTheDocument();
+    expect(screen.getByTestId("screen2-start-job-btn")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("allow-pending-splits-checkbox"));
+    expect(screen.getByTestId("screen2-start-job-btn")).not.toBeDisabled();
+    fireEvent.click(screen.getByTestId("delete-split-split-pending"));
+    expect(onDeleteSplit).toHaveBeenCalledWith("split-pending");
+
+    // 2. Switch to drag-to-split tool mode, zoom=1.5 & userRotation=90 -> triggers preview (not AddRegion)
+    fireEvent.click(screen.getByTestId("drag-tool-split-btn"));
+    fireEvent.change(screen.getByTestId("zoom-select"), { target: { value: "1.5" } });
+    fireEvent.change(screen.getByTestId("rotation-select"), { target: { value: "90" } });
+
+    const svg = screen.getByTestId("pdf-svg-overlay");
+    // At scale=1.5 & userRotation=90 on 595x842 page -> cssWidth=842*1.5=1263, cssHeight=595*1.5=892.5
+    vi.spyOn(svg, "getBoundingClientRect").mockReturnValue({
+      x: 0,
+      y: 0,
+      left: 0,
+      top: 0,
+      right: 1263,
+      bottom: 892.5,
+      width: 1263,
+      height: 892.5,
+      toJSON: () => ({}),
+    });
+
+    // Drag 1 -> rejected preview shown cleanly
+    fireEvent.mouseDown(svg, { clientX: 150, clientY: 150 });
+    fireEvent.mouseUp(svg, { clientX: 210, clientY: 210 });
+    await waitFor(() => {
+      expect(onPreviewSplit).toHaveBeenCalledTimes(1);
+    });
+    expect(onAddRegion).not.toHaveBeenCalled();
+    // Verify 90-degree rotated viewport -> backend pdf coord transform was non-trivial & in bounds
+    const call1Args = onPreviewSplit.mock.calls[0][0];
+    expect(call1Args.requested_bbox[0]).toBeGreaterThanOrEqual(0);
+    expect(call1Args.requested_bbox[2]).toBeLessThanOrEqual(595);
+    expect(call1Args.requested_bbox[3]).toBeLessThanOrEqual(842);
+    expect(screen.getByTestId("split-rejection-box")).toHaveTextContent("EMPTY_SELECTION");
+    expect(screen.getByTestId("split-rejection-box")).toHaveTextContent("対処方法");
+    expect(screen.getByTestId("svg-split-preview-rejected")).toBeInTheDocument();
+
+    // Drag 2 -> valid 3-way preview + SVG overlays + manual-edit warning + eqnum toggle + confirm
+    fireEvent.mouseDown(svg, { clientX: 300, clientY: 200 });
+    fireEvent.mouseUp(svg, { clientX: 500, clientY: 320 });
+    await waitFor(() => {
+      expect(screen.getByTestId("split-preview-valid-box")).toBeInTheDocument();
+    });
+    expect(screen.getByTestId("split-manual-warning")).toHaveTextContent("無効化");
+    expect(screen.getByTestId("svg-split-part-top")).toBeInTheDocument();
+    expect(screen.getByTestId("svg-split-part-formula")).toBeInTheDocument();
+    expect(screen.getByTestId("svg-split-part-bottom")).toBeInTheDocument();
+    expect(screen.getByTestId("svg-split-preview-snapped")).toBeInTheDocument();
+    expect(screen.getByTestId("svg-split-preview-eqnum")).toBeInTheDocument();
+
+    // Toggle eqnum checkbox off -> re-fetches preview with include_equation_number=false
+    fireEvent.click(screen.getByTestId("split-include-eqnum-checkbox"));
+    await waitFor(() => {
+      expect(onPreviewSplit).toHaveBeenCalledTimes(3);
+    });
+    expect(onPreviewSplit.mock.calls[2][0].include_equation_number).toBe(false);
+
+    // Confirm split -> sends expected revisions + parent signature
+    fireEvent.change(screen.getByTestId("split-note-input"), { target: { value: "Eq.(6) 分離" } });
+    fireEvent.click(screen.getByTestId("confirm-split-btn"));
+    await waitFor(() => {
+      expect(onCreateSplit).toHaveBeenCalledWith({
+        page_index: 0,
+        requested_bbox: [100, 200, 300, 240],
+        include_equation_number: false,
+        note: "Eq.(6) 分離",
+        expected_protection_revision: 1,
+        expected_parse_revision: 2,
+        expected_parent_signature: "sig-xyz-123",
+      });
+    });
+  });
+
+  it("distinguishes fallback_original warnings and translate_as_body manual overrides from locked manual protection in Screen 2", () => {
+    const edgeBlocks: Block[] = [
+      {
+        ...SAMPLE_BLOCKS[0],
+        id: "doc-abc123456789:page-1:block-fallback",
+        status: "fallback_original",
+        protection_source: "none",
+        warnings: ["AMBIGUOUS_INLINE_MATH_FALLBACK"],
+        source_text: "Window starts at initial frame with a_t.",
+      },
+      {
+        ...SAMPLE_BLOCKS[0],
+        id: "doc-abc123456789:page-1:block-translate-body",
+        reading_order: 1,
+        status: "pending",
+        protection_source: "manual",
+        protection_reason: "手動領域：翻訳対象",
+        source_text: "Falling width = mean(a) (6) A point is identified.",
+      },
+      {
+        ...SAMPLE_BLOCKS[0],
+        id: "doc-abc123456789:page-1:block-manual-locked",
+        reading_order: 2,
+        status: "protected_skip",
+        protection_source: "manual",
+        protection_reason: "手動領域：非翻訳対象",
+        source_text: "Protected manual formula block.",
+      },
+    ];
+
+    render(
+      <Screen2ProtectionEditor
+        document={SAMPLE_DOC}
+        pdfBytes={null}
+        blocks={edgeBlocks}
+        protectionRegions={[]}
+        isParsing={false}
+        saveStatus="saved"
+        saveMessage={null}
+        onReparseBlocks={vi.fn()}
+        onAddProtectionRegion={vi.fn()}
+        onDeleteProtectionRegion={vi.fn()}
+        onProceedToStartJob={vi.fn()}
+      />
+    );
+
+    // Fallback block must surface fallback warning and never show plain "翻訳対象"
+    const fbBadge = screen.getByTestId(
+      "block-status-badge-doc-abc123456789:page-1:block-fallback"
+    );
+    expect(fbBadge).toHaveTextContent("原文保持フォールバック");
+    expect(fbBadge).toHaveTextContent("AMBIGUOUS_INLINE_MATH_FALLBACK");
+
+    // translate_as_body block (protection_source="manual", status="pending") must NOT display 🔒手動保護 / 🔒Manual
+    const transBodyBadge = screen.getByTestId(
+      "block-status-badge-doc-abc123456789:page-1:block-translate-body"
+    );
+    expect(transBodyBadge).not.toHaveTextContent("🔒手動保護");
+    expect(transBodyBadge).toHaveTextContent("翻訳対象");
+
+    // Genuine manual protected block still displays 🔒手動保護
+    const lockedBadge = screen.getByTestId(
+      "block-status-badge-doc-abc123456789:page-1:block-manual-locked"
+    );
+    expect(lockedBadge).toHaveTextContent("🔒手動保護");
+
+    // SVG badges agree accurately
+    const svg = screen.getByTestId("pdf-svg-overlay");
+    expect(svg).toHaveTextContent("⚠Fallback");
+    expect(svg).toHaveTextContent("翻訳(手動)");
+    expect(svg).toHaveTextContent("🔒Manual");
+  });
 });
 
 describe("Screen 3: 13-Stage Progress, Cancel Distinction, Manual Edit & Retypeset (Section 7)", () => {
@@ -588,6 +926,69 @@ describe("Screen 3: 13-Stage Progress, Cancel Distinction, Manual Edit & Retypes
     expect(screen.getByTestId("job-error-recovery-guide")).not.toHaveTextContent(
       "中断箇所からジョブを再開 (Resume)"
     );
+  });
+
+  it("displays outputs_stale banner, needs_retranslation badge, and disables retranslate on split formula blocks", () => {
+    const splitBlocks: Block[] = [
+      {
+        ...SAMPLE_BLOCKS[0],
+        id: "doc-abc123456789:page-1:block-0:f",
+        split_spec_id: "split-001",
+        split_role: "formula",
+        kind: "isolated_formula",
+        status: "protected_skip",
+        translation_text: null,
+      },
+      {
+        ...SAMPLE_BLOCKS[0],
+        id: "doc-abc123456789:page-1:block-0:b",
+        split_spec_id: "split-001",
+        split_role: "bottom",
+        reading_order: 1,
+        needs_retranslation: true,
+        status: "pending",
+        translation_text: null,
+      },
+    ];
+    render(
+      <Screen3ProgressReview
+        document={SAMPLE_DOC}
+        originalPdfBytes={null}
+        translatedPdfBytes={null}
+        job={{
+          ...sampleJob,
+          state: "completed",
+          cancel_requested: false,
+          outputs_stale: true,
+          outputs_stale_reason: "ブロック分割が確定されたため最新構成と未同期です。",
+        }}
+        blocks={splitBlocks}
+        issues={[]}
+        artifacts={sampleArtifacts}
+        isCanceling={false}
+        isResuming={false}
+        isRetypesetting={false}
+        isRetranslatingBlock={false}
+        retypesetMessage={null}
+        retypesetError={null}
+        onCancelJob={vi.fn()}
+        onResumeJob={vi.fn()}
+        onSaveManualEdit={vi.fn()}
+        onRetranslateBlock={vi.fn()}
+        onRetypesetJob={vi.fn()}
+        onDownloadArtifact={vi.fn()}
+      />
+    );
+
+    expect(screen.getByTestId("outputs-stale-banner")).toHaveTextContent(
+      "ブロック分割が確定されたため最新構成と未同期"
+    );
+    expect(screen.getByTestId("job-stale-badge")).toHaveTextContent("成果物未同期");
+    expect(screen.getByTestId("unprotected-pending-notice")).toHaveTextContent("1件");
+    expect(
+      screen.getByTestId("review-needs-retranslation-doc-abc123456789:page-1:block-0:b")
+    ).toHaveTextContent("要再翻訳");
+    expect(screen.getByTestId("retranslate-block-btn")).toBeDisabled();
   });
 });
 

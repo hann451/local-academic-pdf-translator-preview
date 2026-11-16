@@ -37,6 +37,7 @@ def compute_translation_cache_key(
     history: list[HistoryPair] | None = None,
     protected_items: list[ProtectedItem] | None = None,
     adapter_version: str = "1.0.0",
+    is_mock: bool = False,
 ) -> str:
     """Compute a deterministic SHA-256 hex key that invalidates whenever any relevant factor changes."""
     active_glossary = filter_active_glossary(masked_source_text, glossary_entries)
@@ -68,6 +69,7 @@ def compute_translation_cache_key(
         "history": history_canonical,
         "protected_items": protected_canonical,
         "adapter_version": adapter_version,
+        "is_mock": bool(is_mock),
     }
     serialized = json.dumps(key_payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()

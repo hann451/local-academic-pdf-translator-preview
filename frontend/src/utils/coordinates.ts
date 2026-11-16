@@ -45,8 +45,34 @@ export function pdfBottomLeftToTopLeftBbox(
   ];
 }
 
+export const MAX_CANVAS_EDGE_PX = 3840;
+export const MAX_CANVAS_AREA_PX = 8_000_000;
+export const FALLBACK_CANVAS_EDGE_PX = 2048;
+export const FALLBACK_CANVAS_AREA_PX = 2_500_000;
+
 /**
- * Compute CSS viewport width/height (in CSS px) and physical canvas dimensions (with devicePixelRatio).
+ * Compute a safe canvas backing-store scale multiplier for a CSS viewport box so neither edge
+ * exceeds `maxEdgePx` nor total pixels exceed `maxAreaPx` (avoiding blank GPU/RDP canvases).
+ */
+export function computeSafeCanvasRenderScale(
+  cssWidthPx: number,
+  cssHeightPx: number,
+  targetDpr: number = 1,
+  maxEdgePx: number = MAX_CANVAS_EDGE_PX,
+  maxAreaPx: number = MAX_CANVAS_AREA_PX
+): number {
+  const requestedDpr = Math.max(1, targetDpr || 1);
+  const safeW = Math.max(1, cssWidthPx);
+  const safeH = Math.max(1, cssHeightPx);
+  const edgeLimitDpr = Math.min(maxEdgePx / safeW, maxEdgePx / safeH);
+  const areaLimitDpr = Math.sqrt(maxAreaPx / (safeW * safeH));
+  const clamped = Math.min(requestedDpr, edgeLimitDpr, areaLimitDpr);
+  return Number.isFinite(clamped) && clamped > 0 ? clamped : 0.25;
+}
+
+/**
+ * Compute CSS viewport width/height (in CSS px) and bounded physical canvas dimensions.
+ * CSS/SVG layout dimensions are never capped so coordinate mapping stays 1:1 across zoom levels.
  */
 export function getRotatedViewportDimensions(
   pageWidthPt: number,
@@ -69,12 +95,20 @@ export function getRotatedViewportDimensions(
   const isSwapped = totalRotationDeg === 90 || totalRotationDeg === 270;
   const cssWidthPx = (isSwapped ? pageHeightPt : pageWidthPt) * scale;
   const cssHeightPx = (isSwapped ? pageWidthPt : pageHeightPt) * scale;
-  const dpr = Math.max(1, devicePixelRatio || 1);
+  const requestedDpr = Math.max(1, devicePixelRatio || 1);
+  const safeDpr = computeSafeCanvasRenderScale(cssWidthPx, cssHeightPx, requestedDpr);
+  const isClamped = safeDpr < requestedDpr - 1e-6;
+  const canvasWidthPx = isClamped
+    ? Math.min(MAX_CANVAS_EDGE_PX, Math.max(1, Math.floor(cssWidthPx * safeDpr)))
+    : Math.max(1, Math.round(cssWidthPx * requestedDpr));
+  const canvasHeightPx = isClamped
+    ? Math.min(MAX_CANVAS_EDGE_PX, Math.max(1, Math.floor(cssHeightPx * safeDpr)))
+    : Math.max(1, Math.round(cssHeightPx * requestedDpr));
   return {
     cssWidthPx,
     cssHeightPx,
-    canvasWidthPx: Math.round(cssWidthPx * dpr),
-    canvasHeightPx: Math.round(cssHeightPx * dpr),
+    canvasWidthPx,
+    canvasHeightPx,
     totalRotationDeg,
   };
 }

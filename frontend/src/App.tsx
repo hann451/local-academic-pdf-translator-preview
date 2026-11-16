@@ -4,14 +4,18 @@
 
 import React, { useCallback, useEffect, useState } from "react";
 import {
+  ApiHttpError,
   cancelTranslationJob,
+  createBlockSplit,
   createGlossary,
   createProtectionRegion,
+  deleteBlockSplit,
   deleteGlossary,
   deleteProtectionRegion,
   downloadArtifactFile,
   ensureSessionToken,
   fetchArtifactPdfBytes,
+  fetchBlockSplits,
   fetchDocument,
   fetchDocumentBlocks,
   fetchDocumentPdfBytes,
@@ -21,6 +25,7 @@ import {
   fetchJobIssues,
   fetchProtectionRegions,
   fetchSystemDiagnostics,
+  previewBlockSplit,
   updateBlockProtection,
   reapplyAutoProtection,
   parseDocumentBlocks,
@@ -41,6 +46,8 @@ import { Screen4GlossaryDiagnostics } from "./components/Screen4GlossaryDiagnost
 import type {
   ArtifactType,
   Block,
+  BlockSplitPreviewResult,
+  BlockSplitSpec,
   Document,
   ExportArtifact,
   Glossary,
@@ -93,6 +100,7 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
   const [jobConfig, setJobConfig] = useState<TranslationJobConfig>(DEFAULT_JOB_CONFIG);
   const [blocks, setBlocks] = useState<Block[]>([]);
   const [protectionRegions, setProtectionRegions] = useState<ProtectionRegion[]>([]);
+  const [blockSplits, setBlockSplits] = useState<BlockSplitSpec[]>([]);
   const [currentJob, setCurrentJob] = useState<Job | null>(null);
   const [issues, setIssues] = useState<ValidationIssue[]>([]);
   const [artifacts, setArtifacts] = useState<ExportArtifact[]>([]);
@@ -141,18 +149,20 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
 
   const refreshJobDetails = useCallback(
     async (jobId: string, docId: string) => {
-      const [job, blks, iss, arts, doc] = await Promise.all([
+      const [job, blks, iss, arts, doc, splits] = await Promise.all([
         fetchJob(jobId),
         fetchDocumentBlocks(docId),
         fetchJobIssues(jobId),
         fetchJobArtifacts(jobId),
         fetchDocument(docId),
+        fetchBlockSplits(docId),
       ]);
       setCurrentJob(job);
       setBlocks(blks);
       setIssues(iss);
       setArtifacts(arts);
       setCurrentDocument(doc);
+      setBlockSplits(splits);
 
       const hasMono = arts.some(
         (a) => a.artifact_type === "mono_ja_pdf" && a.is_finalized
@@ -225,15 +235,20 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
         !doc.is_scanned_pdf &&
         doc.extractable_Sync_status === "ok"
       ) {
-        const [parsed, regs] = await Promise.all([
+        const [parsed, regs, splits, refreshedDoc] = await Promise.all([
           parseDocumentBlocks(doc.id, jobConfig),
           fetchProtectionRegions(doc.id),
+          fetchBlockSplits(doc.id),
+          fetchDocument(doc.id),
         ]);
         setBlocks(parsed);
         setProtectionRegions(regs);
+        setBlockSplits(splits);
+        setCurrentDocument(refreshedDoc);
       } else {
         setBlocks([]);
         setProtectionRegions([]);
+        setBlockSplits([]);
       }
     } catch (err) {
       setUploadError(err instanceof Error ? err.message : String(err));
@@ -242,16 +257,21 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
     }
   };
 
-  const handleStartTranslationJob = async () => {
+  const handleStartTranslationJob = async (options?: {
+    allowPendingSplits?: boolean;
+  }) => {
     if (!currentDocument) return;
     setIsStartingJob(true);
     setJobStartError(null);
     setRetypesetMessage(null);
     setRetypesetError(null);
     try {
+      const effectiveConfig: TranslationJobConfig = options?.allowPendingSplits
+        ? { ...jobConfig, allow_pending_splits: true }
+        : jobConfig;
       const job = await startTranslationJob(
         currentDocument.id,
-        jobConfig,
+        effectiveConfig,
         runJobsInBackground
       );
       setCurrentJob(job);
@@ -264,25 +284,34 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
     }
   };
 
+  const formatProtectionError = (err: unknown): string => {
+    if (err instanceof ApiHttpError && err.status === 409) {
+      return `他処理との競合または状態更新により実行できませんでした（409 Conflict: ${err.detail}）。最新状態を再取得してからお試しください。`;
+    }
+    return err instanceof Error ? err.message : String(err);
+  };
+
   // --- Screen 2 Handlers ---
   const handleReparseBlocks = async () => {
     if (!currentDocument) return;
     setIsParsingBlocks(true);
     setProtectionSaveStatus("saving");
     try {
-      const [parsed, updatedDoc] = await Promise.all([
+      const [parsed, updatedDoc, splits] = await Promise.all([
         parseDocumentBlocks(currentDocument.id, jobConfig),
         fetchDocument(currentDocument.id),
+        fetchBlockSplits(currentDocument.id),
       ]);
       setBlocks(parsed);
       setCurrentDocument(updatedDoc);
+      setBlockSplits(splits);
       setProtectionSaveStatus("saved");
       setProtectionSaveMessage(
-        `保護領域を反映して全 ${parsed.length} ブロックを再解析しました。`
+        `保護領域と分割指定を反映して全 ${parsed.length} ブロックを再解析しました。`
       );
     } catch (err) {
       setProtectionSaveStatus("error");
-      setProtectionSaveMessage(err instanceof Error ? err.message : String(err));
+      setProtectionSaveMessage(formatProtectionError(err));
     } finally {
       setIsParsingBlocks(false);
     }
@@ -306,7 +335,7 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
       setProtectionSaveMessage("ブロックの翻訳／非翻訳指定を更新しました。");
     } catch (err) {
       setProtectionSaveStatus("error");
-      setProtectionSaveMessage(err instanceof Error ? err.message : String(err));
+      setProtectionSaveMessage(formatProtectionError(err));
     }
   };
 
@@ -327,7 +356,7 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
       );
     } catch (err) {
       setProtectionSaveStatus("error");
-      setProtectionSaveMessage(err instanceof Error ? err.message : String(err));
+      setProtectionSaveMessage(formatProtectionError(err));
     }
   };
 
@@ -341,18 +370,20 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
     setProtectionSaveStatus("saving");
     try {
       await createProtectionRegion(currentDocument.id, payload);
-      const [regs, parsed, updatedDoc] = await Promise.all([
+      const [regs, parsed, updatedDoc, splits] = await Promise.all([
         fetchProtectionRegions(currentDocument.id),
         parseDocumentBlocks(currentDocument.id, jobConfig),
         fetchDocument(currentDocument.id),
+        fetchBlockSplits(currentDocument.id),
       ]);
       setProtectionRegions(regs);
       setBlocks(parsed);
       setCurrentDocument(updatedDoc);
+      setBlockSplits(splits);
       setProtectionSaveStatus("saved");
     } catch (err) {
       setProtectionSaveStatus("error");
-      setProtectionSaveMessage(err instanceof Error ? err.message : String(err));
+      setProtectionSaveMessage(formatProtectionError(err));
     }
   };
 
@@ -361,19 +392,78 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
     setProtectionSaveStatus("saving");
     try {
       await deleteProtectionRegion(currentDocument.id, regionId);
-      const [regs, parsed, updatedDoc] = await Promise.all([
+      const [regs, parsed, updatedDoc, splits] = await Promise.all([
         fetchProtectionRegions(currentDocument.id),
         parseDocumentBlocks(currentDocument.id, jobConfig),
         fetchDocument(currentDocument.id),
+        fetchBlockSplits(currentDocument.id),
       ]);
       setProtectionRegions(regs);
       setBlocks(parsed);
       setCurrentDocument(updatedDoc);
+      setBlockSplits(splits);
       setProtectionSaveStatus("saved");
       setProtectionSaveMessage("手動保護領域を削除し、ブロック保護判定を更新しました。");
     } catch (err) {
       setProtectionSaveStatus("error");
-      setProtectionSaveMessage(err instanceof Error ? err.message : String(err));
+      setProtectionSaveMessage(formatProtectionError(err));
+    }
+  };
+
+  const handlePreviewBlockSplit = async (payload: {
+    page_index: number;
+    requested_bbox: BBox4;
+    include_equation_number: boolean;
+  }): Promise<BlockSplitPreviewResult> => {
+    if (!currentDocument) {
+      throw new Error("Document not loaded");
+    }
+    return previewBlockSplit(currentDocument.id, payload);
+  };
+
+  const handleCreateBlockSplit = async (payload: {
+    page_index: number;
+    requested_bbox: BBox4;
+    include_equation_number: boolean;
+    note?: string | null;
+    expected_protection_revision?: number | null;
+    expected_parse_revision?: number | null;
+    expected_parent_signature?: string | null;
+  }) => {
+    if (!currentDocument) return;
+    setProtectionSaveStatus("saving");
+    try {
+      const res = await createBlockSplit(currentDocument.id, payload);
+      setBlocks(res.blocks);
+      setBlockSplits(res.splits);
+      setCurrentDocument(res.document);
+      setProtectionSaveStatus("saved");
+      setProtectionSaveMessage(
+        "選択範囲を数式（原文保護）と本文へ分割・保存しました。変更があった本文ブロックには再翻訳が必要です。"
+      );
+      return res;
+    } catch (err) {
+      setProtectionSaveStatus("error");
+      setProtectionSaveMessage(formatProtectionError(err));
+      throw err;
+    }
+  };
+
+  const handleDeleteBlockSplit = async (splitId: string) => {
+    if (!currentDocument) return;
+    setProtectionSaveStatus("saving");
+    try {
+      const res = await deleteBlockSplit(currentDocument.id, splitId);
+      setBlocks(res.blocks);
+      setBlockSplits(res.splits);
+      setCurrentDocument(res.document);
+      setProtectionSaveStatus("saved");
+      setProtectionSaveMessage(
+        "分割指定を削除し、元の親ブロック構成へ復元しました（他の手動保護領域は維持されています）。"
+      );
+    } catch (err) {
+      setProtectionSaveStatus("error");
+      setProtectionSaveMessage(formatProtectionError(err));
     }
   };
 
@@ -646,13 +736,18 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
             pdfBytes={originalPdfBytes}
             blocks={blocks}
             protectionRegions={protectionRegions}
+            blockSplits={blockSplits}
             isParsing={isParsingBlocks}
             saveStatus={protectionSaveStatus}
             saveMessage={protectionSaveMessage}
             onReparseBlocks={handleReparseBlocks}
             onAddProtectionRegion={handleAddProtectionRegion}
             onDeleteProtectionRegion={handleDeleteProtectionRegion}
+            onPreviewBlockSplit={handlePreviewBlockSplit}
+            onCreateBlockSplit={handleCreateBlockSplit}
+            onDeleteBlockSplit={handleDeleteBlockSplit}
             onProceedToStartJob={handleStartTranslationJob}
+            jobStartError={jobStartError}
             onSetBlockOverride={handleSetBlockOverride}
             onReapplyAutoProtection={handleReapplyAutoProtection}
           />

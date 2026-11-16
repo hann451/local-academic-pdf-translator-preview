@@ -102,7 +102,82 @@ export interface Block {
   protection_rule_id: string;
   protection_confidence: string;
   user_protection_override: "force_translate" | "force_protect" | null;
+  split_spec_id?: string | null;
+  split_role?: BlockSplitRole | null;
+  parent_block_id?: string | null;
+  parent_bbox?: [number, number, number, number] | null;
+  parent_source_hash?: string | null;
+  source_text_hash?: string | null;
+  needs_retranslation?: boolean;
   translation_provenance: string;
+  translation_is_mock?: boolean;
+}
+
+export type BlockSplitRole = "top" | "formula" | "bottom";
+export type BlockSplitAppliedStatus =
+  | "applied"
+  | "pending_ambiguous"
+  | "pending_missing"
+  | "pending_changed";
+
+export interface BlockSplitSpec {
+  id: string;
+  document_id: string;
+  page_index: number;
+  requested_bbox: [number, number, number, number];
+  snapped_bbox: [number, number, number, number];
+  operation_mode: "split_and_protect_formula";
+  parent_block_id: string | null;
+  parent_bbox: [number, number, number, number];
+  parent_source_hash: string;
+  parent_source_preview: string;
+  include_equation_number: boolean;
+  applied_status: BlockSplitAppliedStatus;
+  status_reason: string | null;
+  note: string | null;
+  created_at: string;
+}
+
+export interface BlockSplitPreviewPart {
+  role: BlockSplitRole;
+  kind: BlockKind;
+  will_protect: boolean;
+  bbox: [number, number, number, number];
+  source_text: string;
+  label_ja: string;
+}
+
+export interface BlockSplitPreviewResult {
+  valid: boolean;
+  document_id: string;
+  page_index: number;
+  protection_revision: number;
+  parse_revision: number;
+  requested_bbox: [number, number, number, number];
+  snapped_bbox: [number, number, number, number] | null;
+  equation_number_candidate_bbox: [number, number, number, number] | null;
+  equation_number_text: string | null;
+  equation_number_auto_included: boolean;
+  parent_block_id: string | null;
+  parent_bbox: [number, number, number, number] | null;
+  parent_source_hash: string | null;
+  parent_signature: string | null;
+  parts: BlockSplitPreviewPart[];
+  rejection_code: string | null;
+  rejection_reason: string | null;
+  retry_guidance: string | null;
+  warnings: string[];
+  will_invalidate_manual_edits: boolean;
+  affected_manual_block_ids: string[];
+  has_active_job: boolean;
+}
+
+export interface BlockSplitMutationResponse {
+  split: BlockSplitSpec | null;
+  deleted: boolean;
+  document: Document;
+  blocks: Block[];
+  splits: BlockSplitSpec[];
 }
 
 export interface ProtectionRegion {
@@ -143,6 +218,7 @@ export interface Document {
   extractable_Sync_status: string;
   unsupported_reason: string | null;
   protection_revision: number;
+  parse_revision?: number;
   edit_revision: number;
   pages: Page[];
   created_at: string;
@@ -217,6 +293,7 @@ export interface TranslationJobConfig {
   only_roundtrip_preservation: boolean;
   pause_for_review: boolean;
   use_mock_translator: boolean;
+  allow_pending_splits?: boolean;
 }
 
 export interface AppliedBlockRevisionInfo {
@@ -267,6 +344,8 @@ export interface Job {
   retypeset_revision: number;
   based_on_edit_revision: number;
   based_on_protection_revision: number;
+  outputs_stale?: boolean;
+  outputs_stale_reason?: string | null;
   applied_block_revisions: Record<string, AppliedBlockRevisionInfo>;
   execution_provenance: ExecutionProvenance;
   created_at: string;

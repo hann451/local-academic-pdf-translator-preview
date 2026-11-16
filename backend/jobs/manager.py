@@ -10,10 +10,12 @@ Handles:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import shutil
 import threading
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 
 from typing import Any
@@ -22,13 +24,17 @@ from backend.config import AppConfig
 from backend.domain.models import (
     Block,
     BlockKind,
+    BlockSplitPreviewResult,
+    BlockSplitSpec,
     BlockStatus,
     Document,
     ExportArtifact,
     GlossaryEntry,
+    InlineMathSpan,
     IssueSeverity,
     Job,
     JobState,
+    ProtectionMode,
     ProtectionRegion,
     TranslationJobConfig,
     ValidationIssue,
@@ -60,6 +66,30 @@ from backend.translation.prompts.pfml3 import (
     HistoryPair,
     split_paragraph_preserving_placeholders,
 )
+
+_TRANSIENT_BLOCK_WARNING_CODES: frozenset[str] = TYPESETTING_ISSUE_CODES | frozenset(
+    {
+        "UNTRANSLATED_AFTER_PROTECTION_CHANGE",
+        "EMPTY_OUTPUT",
+        "TRUNCATED_BY_LENGTH",
+        "SPECIAL_TOKEN_RESIDUE",
+        "PLACEHOLDER_ALTERED",
+        "PLACEHOLDER_MISSING",
+        "PLACEHOLDER_DUPLICATED",
+        "PLACEHOLDER_HALLUCINATED",
+        "REFERENCE_MARKER_MISSING",
+        "ABNORMAL_REPETITION",
+        "EXPLANATION_CONTAMINATION",
+        "UNTRANSLATED_SOURCE_RETURNED",
+        "ABNORMALLY_SHORT_TRANSLATION",
+        "NUMERIC_VALUE_MISMATCH",
+    }
+)
+
+
+def _clear_transient_block_warnings(warnings: list[str]) -> list[str]:
+    """Remove transient translation/typesetting warnings before re-evaluation."""
+    return [w for w in warnings if w not in _TRANSIENT_BLOCK_WARNING_CODES]
 from backend.translation.validation.validator import (
     TRANSLATION_VALIDATION_ISSUE_CODES,
     validate_translation_output,
@@ -208,10 +238,45 @@ class JobManager:
         self._interrupt_flags: dict[str, threading.Event] = {}
         self._active_lock = threading.Lock()
         self._active_jobs: set[str] = set()
+        # Single-process per-document exclusion map: document_id -> (op_name, job_id | None)
+        self._active_doc_ops: dict[str, tuple[str, str | None]] = {}
 
     def is_job_active(self, job_id: str) -> bool:
         with self._active_lock:
             return job_id in self._active_jobs
+
+    def has_active_document_operation(self, document_id: str) -> bool:
+        with self._active_lock:
+            return document_id in self._active_doc_ops
+
+    @contextlib.contextmanager
+    def acquire_document_operation(
+        self,
+        document_id: str,
+        op_name: str,
+        job_id: str | None = None,
+    ) -> Iterator[None]:
+        """Single-process mutual exclusion lock across document parsing, splits, edits, and jobs."""
+        with self._active_lock:
+            existing = self._active_doc_ops.get(document_id)
+            if existing is not None:
+                ex_op, ex_job = existing
+                detail = f" (job={ex_job})" if ex_job else ""
+                raise RuntimeError(
+                    f"JobConflict: Document '{document_id}' is busy running '{ex_op}'{detail}. Cannot start '{op_name}'."
+                )
+            if job_id is not None and job_id in self._active_jobs:
+                raise RuntimeError(f"JobConflict: Job '{job_id}' is already running.")
+            self._active_doc_ops[document_id] = (op_name, job_id)
+            if job_id is not None:
+                self._active_jobs.add(job_id)
+        try:
+            yield
+        finally:
+            with self._active_lock:
+                self._active_doc_ops.pop(document_id, None)
+                if job_id is not None:
+                    self._active_jobs.discard(job_id)
 
     def register_document(
         self,
@@ -248,6 +313,29 @@ class JobManager:
         if not doc:
             raise KeyError(f"Document not found: {document_id}")
         cfg = job_config or TranslationJobConfig()
+        pending_splits = [
+            s
+            for s in self.db.list_block_splits(document_id)
+            if s.applied_status.startswith("pending_")
+        ]
+        if pending_splits:
+            target_pages = (
+                set(parse_page_range_spec(cfg.page_range_spec, doc.page_count))
+                if doc.page_count > 0
+                else None
+            )
+            relevant_pending = [
+                s
+                for s in pending_splits
+                if target_pages is None or s.page_index in target_pages
+            ]
+            if relevant_pending and not cfg.allow_pending_splits:
+                pages_label = ", ".join(
+                    str(p + 1) for p in sorted({s.page_index for s in relevant_pending})
+                )
+                raise ValueError(
+                    f"PendingSplitsConflict: 適用保留（pending）の分割設定が {len(relevant_pending)} 件残っています（対象ページ: {pages_label}）。再解析・分割設定の削除または再ドラッグで解消するか、保留設定を除いて続行を許可（allow_pending_splits=True）してください。"
+                )
         job = Job(
             id=f"job-{uuid.uuid4().hex[:12]}",
             document_id=document_id,
@@ -295,6 +383,41 @@ class JobManager:
             return True
         return False
 
+    @staticmethod
+    def _inline_spans_signature(
+        spans: list[InlineMathSpan],
+    ) -> tuple[
+        tuple[
+            str,
+            str,
+            str,
+            bool,
+            bool,
+            tuple[int, ...] | None,
+            str | None,
+            tuple[tuple[int, int, str, int], ...],
+        ],
+        ...,
+    ]:
+        return tuple(
+            (
+                s.context_text,
+                s.target_text,
+                s.role,
+                s.overbar,
+                s.ambiguous,
+                tuple(s.mask_occurrence_indices)
+                if s.mask_occurrence_indices is not None
+                else None,
+                s.unrepresentable_reason,
+                tuple(
+                    (sr.start, sr.end, sr.role, sr.level)
+                    for sr in s.sub_runs
+                ),
+            )
+            for s in spans
+        )
+
     def _merge_existing_block_state(
         self,
         parsed_blocks: list[Block],
@@ -303,9 +426,21 @@ class JobManager:
         cfg: TranslationJobConfig,
         reset_user_overrides: bool = False,
         target_block_ids: set[str] | None = None,
-    ) -> None:
+    ) -> set[str]:
+        """Reconcile freshly extracted `parsed_blocks` with previous DB `existing_blocks`.
+
+        Freshly recomputed `masked_source_text`, `protected_items`, and `inline_math_spans`
+        are NEVER overwritten with stale historical values. Existing translations and manual
+        edits are inherited strictly when source text, split role/spec, and inline masks
+        remain identical. Returns block IDs whose persisted manual edits must be cleared.
+        """
+        clear_manual_ids: set[str] = set()
         if not existing_blocks:
-            return
+            for pb in parsed_blocks:
+                if pb.split_spec_id is not None and pb.status != BlockStatus.PROTECTED_SKIP:
+                    pb.needs_retranslation = True
+            return clear_manual_ids
+
         old_by_id = {b.id: b for b in existing_blocks}
         old_by_page: dict[int, list[Block]] = {}
         for b in existing_blocks:
@@ -316,31 +451,59 @@ class JobManager:
 
         for pb in parsed_blocks:
             old_b = old_by_id.get(pb.id)
-            if old_b is None or bbox_iou(pb.bbox, old_b.bbox) < 0.45:
-                # Match by page_index + high bbox overlap if block numbering shifted
+            if old_b is not None:
+                # Guard against accidental ID collision across unrelated units
+                if (
+                    bbox_iou(pb.bbox, old_b.bbox) < 0.25
+                    or pb.split_spec_id != old_b.split_spec_id
+                    or pb.split_role != old_b.split_role
+                ):
+                    old_b = None
+            if old_b is None:
                 candidates = old_by_page.get(pb.page_index, [])
                 best_cand = None
                 best_iou = 0.0
                 for cand in candidates:
+                    if (
+                        cand.split_spec_id != pb.split_spec_id
+                        or cand.split_role != pb.split_role
+                        or cand.source_text_hash != pb.source_text_hash
+                    ):
+                        continue
                     iou = bbox_iou(pb.bbox, cand.bbox)
                     if iou > best_iou:
                         best_iou = iou
                         best_cand = cand
-                if best_cand is not None and best_iou >= 0.65:
+                if best_cand is not None and best_iou >= 0.80:
                     old_b = best_cand
-                elif old_b is not None and bbox_iou(pb.bbox, old_b.bbox) < 0.25:
-                    old_b = None
 
             if old_b is None:
+                if pb.split_spec_id is not None and pb.status != BlockStatus.PROTECTED_SKIP:
+                    pb.needs_retranslation = True
                 continue
 
-            pb.edit_revision = old_b.edit_revision
-            pb.manual_validation_errors = list(old_b.manual_validation_errors)
-            pb.manual_validation_warnings = list(old_b.manual_validation_warnings)
+            same_split_unit = (
+                pb.split_spec_id == old_b.split_spec_id
+                and pb.split_role == old_b.split_role
+                and pb.source_text == old_b.source_text
+                and pb.source_text_hash == old_b.source_text_hash
+            )
+            same_mask_unit = (
+                same_split_unit
+                and (pb.masked_source_text or "") == (old_b.masked_source_text or "")
+                and self._inline_spans_signature(pb.inline_math_spans)
+                == self._inline_spans_signature(old_b.inline_math_spans)
+            )
+            bbox_moved = any(
+                abs(float(a) - float(c)) > 0.5 for a, c in zip(pb.bbox, old_b.bbox)
+            )
 
-            if not reset_user_overrides and old_b.user_protection_override in (
-                "force_translate",
-                "force_protect",
+            if pb.split_role == "formula":
+                pb.user_protection_override = None
+            elif (
+                not reset_user_overrides
+                and same_split_unit
+                and old_b.user_protection_override in ("force_translate", "force_protect")
             ):
                 pb.user_protection_override = old_b.user_protection_override
                 if isinstance(self.pdf_adapter, NativePreservingAdapter):
@@ -348,38 +511,87 @@ class JobManager:
                         pb, manual_by_page.get(pb.page_index, []), cfg
                     )
 
-            if (
-                pb.status != BlockStatus.PROTECTED_SKIP
-                and (target_block_ids is None or pb.id not in target_block_ids)
-                and old_b.status in (BlockStatus.TRANSLATED, BlockStatus.MANUALLY_EDITED)
-            ):
-                pb.translation_text = old_b.translation_text
-                pb.manual_translation_text = old_b.manual_translation_text
-                if old_b.masked_source_text is not None:
-                    pb.masked_source_text = old_b.masked_source_text
-                    pb.protected_items = list(old_b.protected_items)
-                pb.status = old_b.status
-                pb.translation_provenance = (
-                    "manual_edit"
-                    if old_b.status == BlockStatus.MANUALLY_EDITED
-                    else (old_b.translation_provenance if old_b.translation_provenance != "none" else "reused_block")
-                )
-            else:
-                pb.translation_text = old_b.translation_text
-                pb.manual_translation_text = old_b.manual_translation_text
-                if (
-                    old_b.translation_text is not None or old_b.manual_translation_text is not None
-                ) and old_b.masked_source_text is not None:
-                    pb.masked_source_text = old_b.masked_source_text
-                    pb.protected_items = list(old_b.protected_items)
+            if not same_mask_unit:
+                clear_manual_ids.add(pb.id)
+                pb.translation_text = None
+                pb.translation_is_mock = False
+                pb.manual_translation_text = None
+                pb.manual_validation_errors = []
+                pb.manual_validation_warnings = []
+                pb.fitted_font_size_pt = None
+                if pb.status != BlockStatus.PROTECTED_SKIP:
+                    pb.needs_retranslation = True
+                    pb.translation_provenance = "none"
+                continue
 
-    def parse_document_blocks(
+            pb.edit_revision = old_b.edit_revision
+            pb.manual_validation_errors = list(old_b.manual_validation_errors)
+            pb.manual_validation_warnings = list(old_b.manual_validation_warnings)
+            pb.translation_text = old_b.translation_text
+            pb.translation_is_mock = old_b.translation_is_mock
+            pb.manual_translation_text = old_b.manual_translation_text
+
+            if not bbox_moved:
+                pb.fitted_font_size_pt = old_b.fitted_font_size_pt
+                pb.warnings = list(old_b.warnings)
+            else:
+                pb.fitted_font_size_pt = None
+                pb.warnings = [
+                    w
+                    for w in old_b.warnings
+                    if "TYPESET" not in w and "OVERLAP" not in w and "GLYPH" not in w
+                ]
+
+            if pb.status != BlockStatus.PROTECTED_SKIP:
+                if (
+                    target_block_ids is None or pb.id not in target_block_ids
+                ) and old_b.status in (
+                    BlockStatus.TRANSLATED,
+                    BlockStatus.MANUALLY_EDITED,
+                    BlockStatus.FALLBACK_ORIGINAL,
+                ):
+                    pb.status = old_b.status
+                    pb.needs_retranslation = old_b.needs_retranslation
+                    pb.translation_provenance = (
+                        "manual_edit"
+                        if old_b.status == BlockStatus.MANUALLY_EDITED
+                        else (
+                            "fallback_original"
+                            if old_b.status == BlockStatus.FALLBACK_ORIGINAL
+                            else (
+                                old_b.translation_provenance
+                                if old_b.translation_provenance != "none"
+                                else "reused_block"
+                            )
+                        )
+                    )
+                elif target_block_ids is not None and pb.id in target_block_ids:
+                    pb.status = BlockStatus.PENDING
+                    pb.needs_retranslation = True
+                    pb.translation_provenance = "none"
+                elif old_b.manual_translation_text is not None:
+                    pb.status = BlockStatus.MANUALLY_EDITED
+                    pb.needs_retranslation = old_b.needs_retranslation
+                    pb.translation_provenance = "manual_edit"
+                elif old_b.translation_text is not None:
+                    pb.status = BlockStatus.TRANSLATED
+                    pb.needs_retranslation = old_b.needs_retranslation
+                    pb.translation_provenance = (
+                        old_b.translation_provenance
+                        if old_b.translation_provenance != "none"
+                        else "reused_block"
+                    )
+
+        return clear_manual_ids
+
+    def _parse_document_blocks_unlocked(
         self,
         document_id: str,
         job_config: TranslationJobConfig | None = None,
         reset_user_overrides: bool = False,
+        bump_parse_revision: bool = False,
     ) -> list[Block]:
-        """Parse and extract blocks for Screen 2 pre-translation protection region editing."""
+        """Parse and extract blocks (caller must hold `acquire_document_operation`)."""
         doc = self.db.get_document(document_id)
         if not doc:
             raise KeyError(f"Document not found: {document_id}")
@@ -393,22 +605,52 @@ class JobManager:
         cfg = job_config or TranslationJobConfig()
         page_indices = parse_page_range_spec(cfg.page_range_spec, doc.page_count)
         manual_regions = self.db.list_protection_regions(doc.id)
+        split_specs = self.db.list_block_splits(doc.id)
         existing_blocks = self.db.list_blocks(doc.id)
+        updated_splits: list[BlockSplitSpec] = []
         parsed_blocks = self.pdf_adapter.parse_and_extract_blocks(
             document=doc,
             page_indices=page_indices,
             manual_regions=manual_regions,
             job_config=cfg,
+            split_specs=split_specs,
+            updated_split_specs_out=updated_splits,
         )
-        self._merge_existing_block_state(
+        clear_ids = self._merge_existing_block_state(
             parsed_blocks=parsed_blocks,
             existing_blocks=existing_blocks,
             manual_regions=manual_regions,
             cfg=cfg,
             reset_user_overrides=reset_user_overrides,
         )
-        self.db.save_blocks(doc.id, parsed_blocks, replace_all_for_pages=True)
+        if updated_splits:
+            self.db.update_block_split_statuses(doc.id, updated_splits)
+        self.db.save_blocks(
+            doc.id,
+            parsed_blocks,
+            replace_all_for_pages=True,
+            replace_page_indices=set(page_indices),
+            allow_clear_manual_translation=True,
+            clear_manual_translation_ids=clear_ids,
+        )
+        if bump_parse_revision and existing_blocks:
+            self.db.increment_parse_revision(doc.id)
         return parsed_blocks
+
+    def parse_document_blocks(
+        self,
+        document_id: str,
+        job_config: TranslationJobConfig | None = None,
+        reset_user_overrides: bool = False,
+    ) -> list[Block]:
+        """Parse and extract blocks for Screen 2 pre-translation protection region editing."""
+        with self.acquire_document_operation(document_id, "parse_document"):
+            return self._parse_document_blocks_unlocked(
+                document_id=document_id,
+                job_config=job_config,
+                reset_user_overrides=reset_user_overrides,
+                bump_parse_revision=False,
+            )
 
     def update_block_protection(
         self,
@@ -422,38 +664,56 @@ class JobManager:
             raise ValueError(
                 f"Invalid user_protection_override: {user_protection_override}. Expected 'force_translate', 'force_protect', or None."
             )
-        doc = self.db.get_document(document_id)
-        if not doc:
-            raise KeyError(f"Document not found: {document_id}")
-        blocks = self.db.list_blocks(document_id)
-        target = next((b for b in blocks if b.id == block_id), None)
-        if not target:
-            raise KeyError(f"Block not found: {block_id}")
+        with self.acquire_document_operation(document_id, "update_block_protection"):
+            doc = self.db.get_document(document_id)
+            if not doc:
+                raise KeyError(f"Document not found: {document_id}")
+            blocks = self.db.list_blocks(document_id)
+            target = next((b for b in blocks if b.id == block_id), None)
+            if not target:
+                raise KeyError(f"Block not found: {block_id}")
 
-        cfg = job_config or TranslationJobConfig()
-        manual_regions = self.db.list_protection_regions(document_id, page_index=target.page_index)
-        saved_trans = target.translation_text
-        saved_manual = target.manual_translation_text
+            if target.split_role == "formula":
+                raise ValueError(
+                    "分割により原文保護された数式ブロック（split_role='formula'）は単体で翻訳対象へ変更できません。翻訳対象に戻す場合は該当の分割設定を削除してください。"
+                )
 
-        target.user_protection_override = user_protection_override
-        if isinstance(self.pdf_adapter, NativePreservingAdapter):
-            self.pdf_adapter._apply_protection_and_masking(target, manual_regions, cfg)
+            cfg = job_config or TranslationJobConfig()
+            manual_regions = self.db.list_protection_regions(
+                document_id, page_index=target.page_index
+            )
+            saved_trans = target.translation_text
+            saved_manual = target.manual_translation_text
 
-        target.translation_text = saved_trans
-        target.manual_translation_text = saved_manual
-        if target.status != BlockStatus.PROTECTED_SKIP:
-            if saved_manual is not None:
-                target.status = BlockStatus.MANUALLY_EDITED
-                target.translation_provenance = "manual_edit"
-            elif saved_trans is not None:
-                target.status = BlockStatus.TRANSLATED
-            else:
-                target.status = BlockStatus.PENDING
-                target.translation_provenance = "none"
+            target.user_protection_override = user_protection_override
+            if isinstance(self.pdf_adapter, NativePreservingAdapter):
+                sibling_formula_bbox = None
+                if target.split_spec_id and target.split_role in ("top", "bottom"):
+                    split_spec = self.db.get_block_split(document_id, target.split_spec_id)
+                    if split_spec is not None:
+                        sibling_formula_bbox = split_spec.snapped_bbox
+                self.pdf_adapter._apply_protection_and_masking(
+                    target,
+                    manual_regions,
+                    cfg,
+                    sibling_formula_bbox=sibling_formula_bbox,
+                )
 
-        self.db.save_blocks(document_id, [target])
-        self.db.increment_protection_revision(document_id)
-        return target
+            target.translation_text = saved_trans
+            target.manual_translation_text = saved_manual
+            if target.status != BlockStatus.PROTECTED_SKIP:
+                if saved_manual is not None:
+                    target.status = BlockStatus.MANUALLY_EDITED
+                    target.translation_provenance = "manual_edit"
+                elif saved_trans is not None:
+                    target.status = BlockStatus.TRANSLATED
+                else:
+                    target.status = BlockStatus.PENDING
+                    target.translation_provenance = "none"
+
+            self.db.save_blocks(document_id, [target])
+            self.db.increment_protection_revision(document_id)
+            return target
 
     def reapply_auto_protection(
         self,
@@ -465,43 +725,361 @@ class JobManager:
         """Re-apply initial academic non-translation auto-detection to an existing document
         without modifying already finalized job artifacts.
         """
+        with self.acquire_document_operation(document_id, "reapply_auto_protection"):
+            doc = self.db.get_document(document_id)
+            if not doc:
+                raise KeyError(f"Document not found: {document_id}")
+            cleared_regions = 0
+            if clear_manual_regions:
+                cleared_regions = self.db.clear_protection_regions_for_document(document_id)
+            updated_blocks = self._parse_document_blocks_unlocked(
+                document_id=document_id,
+                job_config=job_config,
+                reset_user_overrides=reset_user_overrides,
+                bump_parse_revision=True,
+            )
+            new_rev = self.db.increment_protection_revision(document_id)
+            doc_after = self.db.get_document(document_id) or doc
+            auto_protected = [
+                b
+                for b in updated_blocks
+                if b.status == BlockStatus.PROTECTED_SKIP and b.protection_source == "auto"
+            ]
+            manual_protected = [
+                b
+                for b in updated_blocks
+                if b.status == BlockStatus.PROTECTED_SKIP and b.protection_source == "manual"
+            ]
+            translatable = [b for b in updated_blocks if b.status != BlockStatus.PROTECTED_SKIP]
+            category_counts: dict[str, int] = {}
+            for b in auto_protected:
+                category_counts[b.semantic_category] = category_counts.get(b.semantic_category, 0) + 1
+            return {
+                "document": doc_after,
+                "blocks": updated_blocks,
+                "protection_revision": new_rev,
+                "cleared_manual_regions": cleared_regions,
+                "auto_protected_count": len(auto_protected),
+                "manual_protected_count": len(manual_protected),
+                "translatable_count": len(translatable),
+                "auto_protected_by_category": category_counts,
+            }
+
+    def add_protection_region(
+        self,
+        document_id: str,
+        *,
+        page_index: int,
+        bbox: list[float],
+        mode: ProtectionMode,
+        note: str | None = None,
+    ) -> ProtectionRegion:
+        with self.acquire_document_operation(document_id, "add_protection_region"):
+            doc = self.db.get_document(document_id)
+            if not doc:
+                raise KeyError(f"Document not found: {document_id}")
+            if page_index < 0 or page_index >= max(1, doc.page_count):
+                raise ValueError("page_index out of bounds")
+            region = ProtectionRegion(
+                id=f"reg-{uuid.uuid4().hex[:10]}",
+                document_id=document_id,
+                page_index=page_index,
+                bbox=bbox,
+                mode=mode,
+                source="manual",
+                note=note,
+            )
+            self.db.save_protection_region(region)
+            return region
+
+    def remove_protection_region(self, document_id: str, region_id: str) -> bool:
+        with self.acquire_document_operation(document_id, "remove_protection_region"):
+            doc = self.db.get_document(document_id)
+            if not doc:
+                raise KeyError(f"Document not found: {document_id}")
+            return self.db.delete_protection_region(document_id, region_id)
+
+    def manual_edit_block(
+        self,
+        document_id: str,
+        block_id: str,
+        manual_text: str | None,
+        expected_edit_revision: int | None = None,
+    ) -> Block:
+        with self.acquire_document_operation(document_id, "manual_edit_block"):
+            return self.db.update_block_manual_translation(
+                document_id,
+                block_id,
+                manual_text,
+                expected_edit_revision=expected_edit_revision,
+            )
+
+    def preview_block_split(
+        self,
+        document_id: str,
+        page_index: int,
+        requested_bbox: list[float],
+        include_equation_number: bool = True,
+    ) -> BlockSplitPreviewResult:
+        """Preview drag-selection block splitting directly from immutable source PDF."""
         doc = self.db.get_document(document_id)
         if not doc:
             raise KeyError(f"Document not found: {document_id}")
-        cleared_regions = 0
-        if clear_manual_regions:
-            cleared_regions = self.db.clear_protection_regions_for_document(document_id)
-        updated_blocks = self.parse_document_blocks(
-            document_id=document_id,
-            job_config=job_config,
-            reset_user_overrides=reset_user_overrides,
-        )
-        new_rev = self.db.increment_protection_revision(document_id)
-        doc_after = self.db.get_document(document_id) or doc
-        auto_protected = [
-            b
-            for b in updated_blocks
-            if b.status == BlockStatus.PROTECTED_SKIP and b.protection_source == "auto"
-        ]
-        manual_protected = [
-            b
-            for b in updated_blocks
-            if b.status == BlockStatus.PROTECTED_SKIP and b.protection_source == "manual"
-        ]
-        translatable = [b for b in updated_blocks if b.status != BlockStatus.PROTECTED_SKIP]
-        category_counts: dict[str, int] = {}
-        for b in auto_protected:
-            category_counts[b.semantic_category] = category_counts.get(b.semantic_category, 0) + 1
-        return {
-            "document": doc_after,
-            "blocks": updated_blocks,
-            "protection_revision": new_rev,
-            "cleared_manual_regions": cleared_regions,
-            "auto_protected_count": len(auto_protected),
-            "manual_protected_count": len(manual_protected),
-            "translatable_count": len(translatable),
-            "auto_protected_by_category": category_counts,
+        if page_index < 0 or page_index >= max(1, doc.page_count):
+            raise ValueError(f"page_index {page_index} out of bounds")
+        if len(requested_bbox) != 4:
+            raise ValueError("bbox must have 4 elements [x0, y0, x1, y1]")
+        existing_splits = self.db.list_block_splits(doc.id, page_index=page_index)
+        existing_blocks = self.db.list_blocks(doc.id, page_index=page_index)
+        manual_regions = self.db.list_protection_regions(doc.id, page_index=page_index)
+        manual_edit_ids = {
+            b.id
+            for b in existing_blocks
+            if b.manual_translation_text is not None or b.status == BlockStatus.MANUALLY_EDITED
         }
+        if not isinstance(self.pdf_adapter, NativePreservingAdapter):
+            raise RuntimeError("Active PDF adapter does not support drag-split preview")
+        preview = self.pdf_adapter.preview_block_split(
+            document=doc,
+            page_index=page_index,
+            drag_bbox=requested_bbox,
+            existing_splits=existing_splits,
+            include_equation_number=include_equation_number,
+            manual_edit_block_ids=manual_edit_ids,
+            manual_regions=manual_regions,
+        )
+        preview.protection_revision = doc.protection_revision
+        preview.parse_revision = doc.parse_revision
+        preview.has_active_job = self.has_active_document_operation(doc.id)
+        return preview
+
+    def create_block_split(
+        self,
+        document_id: str,
+        *,
+        page_index: int,
+        requested_bbox: list[float],
+        include_equation_number: bool = True,
+        note: str | None = None,
+        expected_protection_revision: int | None = None,
+        expected_parse_revision: int | None = None,
+        expected_parent_signature: str | None = None,
+        job_config: TranslationJobConfig | None = None,
+        fail_stage_for_test: str | None = None,
+    ) -> dict[str, Any]:
+        """Server-recomputed atomic confirmation of a drag-split specification."""
+        with self.acquire_document_operation(document_id, "create_block_split"):
+            doc = self.db.get_document(document_id)
+            if not doc:
+                raise KeyError(f"Document not found: {document_id}")
+            if (
+                expected_protection_revision is not None
+                and doc.protection_revision != expected_protection_revision
+            ):
+                raise ValueError(
+                    f"RevisionConflict: protection_revision expected={expected_protection_revision}, actual={doc.protection_revision}"
+                )
+            if (
+                expected_parse_revision is not None
+                and doc.parse_revision != expected_parse_revision
+            ):
+                raise ValueError(
+                    f"RevisionConflict: parse_revision expected={expected_parse_revision}, actual={doc.parse_revision}"
+                )
+
+            existing_splits = self.db.list_block_splits(doc.id, page_index=page_index)
+            existing_page_blocks = self.db.list_blocks(doc.id, page_index=page_index)
+            manual_regions = self.db.list_protection_regions(doc.id, page_index=page_index)
+            manual_edit_ids = {
+                b.id
+                for b in existing_page_blocks
+                if b.manual_translation_text is not None or b.status == BlockStatus.MANUALLY_EDITED
+            }
+            if not isinstance(self.pdf_adapter, NativePreservingAdapter):
+                raise RuntimeError("Active PDF adapter does not support drag-split creation")
+
+            preview = self.pdf_adapter.preview_block_split(
+                document=doc,
+                page_index=page_index,
+                drag_bbox=requested_bbox,
+                existing_splits=existing_splits,
+                include_equation_number=include_equation_number,
+                manual_edit_block_ids=manual_edit_ids,
+                manual_regions=manual_regions,
+            )
+            if not preview.valid:
+                raise ValueError(
+                    f"InvalidSplitSelection:{preview.rejection_code}:{preview.rejection_reason}"
+                )
+            if (
+                expected_parent_signature is not None
+                and preview.parent_signature != expected_parent_signature
+            ):
+                raise ValueError(
+                    "RevisionConflict: 親ブロックの構成または解析状態が変化したため、再度プレビューしてから確定してください。"
+                )
+
+            parent_blk_existing = next(
+                (b for b in existing_page_blocks if b.id == preview.parent_block_id), None
+            )
+            parent_preview_text = (
+                (parent_blk_existing.source_text[:120] if parent_blk_existing else "")
+                or (preview.parent_block_id or "")
+            )
+            spec = BlockSplitSpec(
+                id=f"split-{uuid.uuid4().hex[:10]}",
+                document_id=doc.id,
+                page_index=page_index,
+                requested_bbox=preview.requested_bbox,
+                snapped_bbox=preview.snapped_bbox or preview.requested_bbox,
+                parent_block_id=preview.parent_block_id,
+                parent_bbox=preview.parent_bbox or preview.requested_bbox,
+                parent_source_hash=preview.parent_source_hash or "",
+                parent_source_preview=parent_preview_text,
+                include_equation_number=include_equation_number,
+                applied_status="applied",
+                status_reason=None,
+                note=note,
+            )
+
+            cfg = job_config or TranslationJobConfig()
+            all_page_splits = existing_splits + [spec]
+            updated_splits: list[BlockSplitSpec] = []
+            new_page_blocks = self.pdf_adapter.parse_and_extract_blocks(
+                document=doc,
+                page_indices=[page_index],
+                manual_regions=manual_regions,
+                job_config=cfg,
+                split_specs=all_page_splits,
+                updated_split_specs_out=updated_splits,
+            )
+            spec_status = next((u for u in updated_splits if u.id == spec.id), spec)
+            if spec_status.applied_status != "applied":
+                raise ValueError(
+                    f"InvalidSplitSelection:SPLIT_NOT_APPLIED:{spec_status.status_reason or '分割適用に失敗しました。'}"
+                )
+
+            clear_ids = self._merge_existing_block_state(
+                parsed_blocks=new_page_blocks,
+                existing_blocks=existing_page_blocks,
+                manual_regions=manual_regions,
+                cfg=cfg,
+                reset_user_overrides=False,
+            )
+            # Re-attach continuations over full document view while only saving touched page
+            other_blocks = [
+                b for b in self.db.list_blocks(doc.id) if b.page_index != page_index
+            ]
+            attach_continuation_candidates(other_blocks + new_page_blocks)
+
+            invalidated_ids = set(clear_ids) | set(preview.affected_manual_block_ids)
+            if preview.parent_block_id:
+                invalidated_ids.add(preview.parent_block_id)
+
+            updated_doc = self.db.commit_split_transaction(
+                document_id=doc.id,
+                blocks_to_save=new_page_blocks,
+                replace_page_indices={page_index},
+                clear_manual_translation_ids=clear_ids,
+                allow_clear_manual_translation=True,
+                upsert_splits=updated_splits or [spec_status],
+                expected_protection_revision=doc.protection_revision,
+                expected_parse_revision=doc.parse_revision,
+                bump_protection_revision=True,
+                bump_parse_revision=True,
+                stale_reason="block_split_added",
+                invalidated_block_ids=invalidated_ids,
+                fail_stage_for_test=fail_stage_for_test,
+            )
+            return {
+                "split": spec_status,
+                "preview": preview,
+                "document": updated_doc,
+                "blocks": self.db.list_blocks(doc.id),
+                "splits": self.db.list_block_splits(doc.id),
+            }
+
+    def delete_block_split(
+        self,
+        document_id: str,
+        split_id: str,
+        *,
+        job_config: TranslationJobConfig | None = None,
+        fail_stage_for_test: str | None = None,
+    ) -> dict[str, Any]:
+        """Remove a single BlockSplitSpec, restore raw parent block cleanly, and preserve other regions/blocks."""
+        with self.acquire_document_operation(document_id, "delete_block_split"):
+            doc = self.db.get_document(document_id)
+            if not doc:
+                raise KeyError(f"Document not found: {document_id}")
+            spec = self.db.get_block_split(document_id, split_id)
+            if not spec:
+                raise KeyError(f"BlockSplitSpec not found: {split_id}")
+
+            page_index = spec.page_index
+            remaining_page_splits = [
+                s
+                for s in self.db.list_block_splits(doc.id, page_index=page_index)
+                if s.id != split_id
+            ]
+            existing_page_blocks = self.db.list_blocks(doc.id, page_index=page_index)
+            cfg = job_config or TranslationJobConfig()
+            manual_regions = self.db.list_protection_regions(doc.id, page_index=page_index)
+            updated_splits: list[BlockSplitSpec] = []
+            new_page_blocks = self.pdf_adapter.parse_and_extract_blocks(
+                document=doc,
+                page_indices=[page_index],
+                manual_regions=manual_regions,
+                job_config=cfg,
+                split_specs=remaining_page_splits,
+                updated_split_specs_out=updated_splits,
+            )
+            clear_ids = self._merge_existing_block_state(
+                parsed_blocks=new_page_blocks,
+                existing_blocks=existing_page_blocks,
+                manual_regions=manual_regions,
+                cfg=cfg,
+                reset_user_overrides=False,
+            )
+            # Mark newly restored parent block as needing translation if previously split
+            for nb in new_page_blocks:
+                if (
+                    spec.parent_block_id
+                    and nb.id == spec.parent_block_id
+                    and nb.status != BlockStatus.PROTECTED_SKIP
+                ):
+                    nb.needs_retranslation = True
+
+            other_blocks = [
+                b for b in self.db.list_blocks(doc.id) if b.page_index != page_index
+            ]
+            attach_continuation_candidates(other_blocks + new_page_blocks)
+
+            removed_child_ids = {
+                b.id for b in existing_page_blocks if b.split_spec_id == split_id
+            }
+            updated_doc = self.db.commit_split_transaction(
+                document_id=doc.id,
+                blocks_to_save=new_page_blocks,
+                replace_page_indices={page_index},
+                clear_manual_translation_ids=clear_ids,
+                allow_clear_manual_translation=True,
+                upsert_splits=updated_splits,
+                delete_split_id=split_id,
+                expected_protection_revision=doc.protection_revision,
+                expected_parse_revision=doc.parse_revision,
+                bump_protection_revision=True,
+                bump_parse_revision=True,
+                stale_reason="block_split_deleted",
+                invalidated_block_ids=set(clear_ids) | removed_child_ids,
+                fail_stage_for_test=fail_stage_for_test,
+            )
+            return {
+                "deleted": True,
+                "document": updated_doc,
+                "blocks": self.db.list_blocks(doc.id),
+                "splits": self.db.list_block_splits(doc.id),
+            }
 
     def _resolve_translator(self, cfg: TranslationJobConfig) -> TranslationAdapter:
         if self.default_translation_adapter is not None:
@@ -520,12 +1098,23 @@ class JobManager:
         resume: bool = False,
         target_block_ids: set[str] | None = None,
     ) -> Job:
-        """Execute or resume a job through all 13 stages."""
-        with self._active_lock:
-            if job_id in self._active_jobs:
-                raise RuntimeError(f"JobConflict: Job '{job_id}' is already running.")
-            self._active_jobs.add(job_id)
+        """Execute or resume a job through all 13 stages under per-document exclusion."""
+        job = self.db.get_job(job_id)
+        if not job:
+            raise KeyError(f"Job not found: {job_id}")
+        with self.acquire_document_operation(job.document_id, "translation_job", job_id=job_id):
+            return self._run_job_unlocked(
+                job_id=job_id,
+                resume=resume,
+                target_block_ids=target_block_ids,
+            )
 
+    def _run_job_unlocked(
+        self,
+        job_id: str,
+        resume: bool = False,
+        target_block_ids: set[str] | None = None,
+    ) -> Job:
         try:
             job = self.db.get_job(job_id)
             if not job:
@@ -580,20 +1169,24 @@ class JobManager:
             # Stage 4 - 7: Parsing, Reading Order, Protection Regions, Translation Units
             existing_blocks = self.db.list_blocks(doc.id)
             manual_regions = self.db.list_protection_regions(doc.id)
+            split_specs = self.db.list_block_splits(doc.id)
 
             if not existing_blocks or not resume:
                 if job.can_transition_to(JobState.PARSING):
                     job.transition_to(JobState.PARSING, "Stage 4-7: 構造・数式解析および保護領域決定")
                     self.db.save_job(job)
 
+                updated_splits: list[BlockSplitSpec] = []
                 parsed_blocks = self.pdf_adapter.parse_and_extract_blocks(
                     document=doc,
                     page_indices=page_indices,
                     manual_regions=manual_regions,
                     job_config=job.config,
+                    split_specs=split_specs,
+                    updated_split_specs_out=updated_splits,
                 )
-                # Preserve existing translations/manual edits and user overrides
-                self._merge_existing_block_state(
+                # Preserve existing translations/manual edits and user overrides safely
+                clear_ids = self._merge_existing_block_state(
                     parsed_blocks=parsed_blocks,
                     existing_blocks=existing_blocks,
                     manual_regions=manual_regions,
@@ -601,7 +1194,16 @@ class JobManager:
                     reset_user_overrides=False,
                     target_block_ids=target_block_ids,
                 )
-                self.db.save_blocks(doc.id, parsed_blocks, replace_all_for_pages=True)
+                if updated_splits:
+                    self.db.update_block_split_statuses(doc.id, updated_splits)
+                self.db.save_blocks(
+                    doc.id,
+                    parsed_blocks,
+                    replace_all_for_pages=True,
+                    replace_page_indices=set(page_indices),
+                    allow_clear_manual_translation=True,
+                    clear_manual_translation_ids=clear_ids,
+                )
                 blocks = parsed_blocks
             else:
                 blocks = [b for b in existing_blocks if b.page_index in set(page_indices)]
@@ -618,6 +1220,27 @@ class JobManager:
                 return job
 
             issues: list[ValidationIssue] = self.db.list_validation_issues(job.id) if resume else []
+            if not resume:
+                latest_splits = self.db.list_block_splits(doc.id)
+                for sp in latest_splits:
+                    if sp.page_index in set(page_indices) and sp.applied_status.startswith("pending_"):
+                        issues.append(
+                            ValidationIssue(
+                                id=f"iss-{uuid.uuid4().hex[:10]}",
+                                job_id=job.id,
+                                document_id=doc.id,
+                                page_index=sp.page_index,
+                                bbox=sp.snapped_bbox,
+                                code="PENDING_BLOCK_SPLIT_UNAPPLIED",
+                                severity=IssueSeverity.WARNING,
+                                message=(
+                                    f"ページ {sp.page_index + 1} の分割設定 {sp.id} は"
+                                    f"保留状態（{sp.applied_status}）のため適用されず、"
+                                    "元の親ブロック構成で処理されました。"
+                                ),
+                                details={"split_id": sp.id, "applied_status": sp.applied_status, "reason": sp.status_reason},
+                            )
+                        )
             newly_inferenced_blocks = 0
             llm_api_calls_made = 0
             cache_hit_blocks = 0
@@ -704,23 +1327,40 @@ class JobManager:
                     # Skip blocks that are protected or already translated (unless targeted for partial re-translation)
                     if blk.status == BlockStatus.PROTECTED_SKIP:
                         blk.translation_provenance = "protected_skip"
+                        blk.needs_retranslation = False
+                        blk.warnings = _clear_transient_block_warnings(blk.warnings)
                         continue
                     if blk.status == BlockStatus.MANUALLY_EDITED and (
                         target_block_ids is None or blk.id not in target_block_ids
                     ):
                         blk.translation_provenance = "manual_edit"
+                        blk.warnings = _clear_transient_block_warnings(blk.warnings)
                         continue
-                    if blk.status == BlockStatus.FALLBACK_ORIGINAL and (
-                        target_block_ids is None or blk.id not in target_block_ids
+                    blk_is_mock_origin = bool(blk.translation_is_mock) or str(
+                        blk.translation_text or ""
+                    ).lstrip().startswith("[MOCK")
+                    if (
+                        blk.status == BlockStatus.FALLBACK_ORIGINAL
+                        and (
+                            (target_block_ids is not None and blk.id not in target_block_ids)
+                            or (
+                                resume
+                                and not blk.needs_retranslation
+                                and not (not translator.is_mock and blk_is_mock_origin)
+                            )
+                        )
                     ):
                         blk.translation_provenance = "fallback_original"
                         continue
                     if (
                         blk.status == BlockStatus.TRANSLATED
                         and blk.translation_text
+                        and not blk.needs_retranslation
+                        and not (not translator.is_mock and blk_is_mock_origin)
                         and (target_block_ids is None or blk.id not in target_block_ids)
                     ):
                         blk.translation_provenance = "reused_block"
+                        blk.warnings = _clear_transient_block_warnings(blk.warnings)
                         reused_existing_blocks += 1
                         history_window.append(
                             HistoryPair(
@@ -1017,6 +1657,8 @@ class JobManager:
 
             job.processed_pages = len(page_indices)
             job.warning_count = len(issues)
+            job.outputs_stale = False
+            job.outputs_stale_reason = None
             has_fallbacks = any(b.status == BlockStatus.FALLBACK_ORIGINAL for b in blocks)
 
             if issues or has_fallbacks:
@@ -1042,9 +1684,6 @@ class JobManager:
                 job.transition_to(JobState.FAILED, f"エラー発生: {type(exc).__name__}")
             self.db.save_job(job)
             raise
-        finally:
-            with self._active_lock:
-                self._active_jobs.discard(job_id)
 
     def retypeset_job(
         self,
@@ -1053,15 +1692,25 @@ class JobManager:
         allow_validation_warnings: bool = True,
         fail_stage_for_test: bool = False,
     ) -> dict[str, Any]:
-        """Re-run Stages 10-13 (Typesetting, Preservation Verification, Artifact Export, JSON Report)
-        using existing translations and manual edits WITHOUT calling the LLM (`llm_calls_made = 0`).
-        Preserves previous finalized artifacts untouched if any validation or typesetting error occurs.
-        """
-        with self._active_lock:
-            if job_id in self._active_jobs:
-                raise RuntimeError(f"JobConflict: Job '{job_id}' is already running or retypesetting.")
-            self._active_jobs.add(job_id)
+        """Re-run Stages 10-13 without LLM calls under per-document exclusion."""
+        job = self.db.get_job(job_id)
+        if not job:
+            raise KeyError(f"Job not found: {job_id}")
+        with self.acquire_document_operation(job.document_id, "retypeset_job", job_id=job_id):
+            return self._retypeset_job_unlocked(
+                job_id=job_id,
+                expected_edit_revision=expected_edit_revision,
+                allow_validation_warnings=allow_validation_warnings,
+                fail_stage_for_test=fail_stage_for_test,
+            )
 
+    def _retypeset_job_unlocked(
+        self,
+        job_id: str,
+        expected_edit_revision: int | None = None,
+        allow_validation_warnings: bool = True,
+        fail_stage_for_test: bool = False,
+    ) -> dict[str, Any]:
         staging_dir: Path | None = None
         try:
             job = self.db.get_job(job_id)
@@ -1103,6 +1752,9 @@ class JobManager:
             requires_reparse_or_retranslate = False
 
             protection_changed = doc.protection_revision != job.based_on_protection_revision
+            split_formula_bbox_by_spec = {
+                s.id: s.snapped_bbox for s in self.db.list_block_splits(doc.id)
+            }
 
             for blk in working_blocks:
                 blk.warnings = []
@@ -1117,17 +1769,19 @@ class JobManager:
                         blk,
                         manual_by_page.get(blk.page_index, []),
                         job.config,
+                        sibling_formula_bbox=(
+                            split_formula_bbox_by_spec.get(blk.split_spec_id)
+                            if blk.split_spec_id and blk.split_role in ("top", "bottom")
+                            else None
+                        ),
                     )
                     blk.translation_text = saved_trans
                     blk.manual_translation_text = saved_manual
-                    if (saved_trans is not None or saved_manual is not None) and saved_masked is not None:
-                        blk.masked_source_text = saved_masked
-                        blk.protected_items = saved_items
                     if blk.status == BlockStatus.PROTECTED_SKIP:
                         reevaluated_scopes_by_block.setdefault(blk.id, set()).update(
                             {"translation_validation", "typesetting", "protection_change"}
                         )
-                    elif prev_status == BlockStatus.FALLBACK_ORIGINAL:
+                    elif prev_status == BlockStatus.FALLBACK_ORIGINAL and not blk.needs_retranslation:
                         # Existing FALLBACK_ORIGINAL blocks not newly protected stay
                         # untouched so their original fallback reason is never overwritten.
                         blk.status = BlockStatus.FALLBACK_ORIGINAL
@@ -1135,10 +1789,11 @@ class JobManager:
                         reevaluated_scopes_by_block.setdefault(blk.id, set()).add("protection_change")
                         if saved_manual is not None:
                             blk.status = BlockStatus.MANUALLY_EDITED
-                        elif saved_trans is not None:
+                        elif saved_trans is not None and not blk.needs_retranslation:
                             blk.status = BlockStatus.TRANSLATED
                         else:
                             requires_reparse_or_retranslate = True
+                            blk.needs_retranslation = True
                             blk.status = BlockStatus.FALLBACK_ORIGINAL
                             blk.warnings.append("UNTRANSLATED_AFTER_PROTECTION_CHANGE")
                             issues.append(
@@ -1158,6 +1813,28 @@ class JobManager:
                 elif blk.status == BlockStatus.PROTECTED_SKIP:
                     reevaluated_scopes_by_block.setdefault(blk.id, set()).update(
                         {"translation_validation", "typesetting", "protection_change"}
+                    )
+                elif blk.status == BlockStatus.PENDING or (
+                    blk.needs_retranslation and saved_manual is None
+                ):
+                    requires_reparse_or_retranslate = True
+                    blk.needs_retranslation = True
+                    reevaluated_scopes_by_block.setdefault(blk.id, set()).add("protection_change")
+                    blk.status = BlockStatus.FALLBACK_ORIGINAL
+                    blk.warnings.append("UNTRANSLATED_AFTER_PROTECTION_CHANGE")
+                    issues.append(
+                        ValidationIssue(
+                            id=f"iss-{uuid.uuid4().hex[:10]}",
+                            job_id=job.id,
+                            document_id=doc.id,
+                            page_index=blk.page_index,
+                            block_id=blk.id,
+                            bbox=blk.bbox,
+                            code="UNTRANSLATED_AFTER_PROTECTION_CHANGE",
+                            severity=IssueSeverity.WARNING,
+                            message="再翻訳待ちまたは未翻訳のブロックが残った状態で再組版されたため、該当箇所は原文を保持しています。",
+                            fallback_applied=True,
+                        )
                     )
 
                 if blk.status in (BlockStatus.TRANSLATED, BlockStatus.MANUALLY_EDITED):
@@ -1468,13 +2145,37 @@ class JobManager:
             job.original_hash_verified = original_intact
             job.warning_count = len(issues)
 
+            untranslated_remaining = [
+                b
+                for b in working_blocks
+                if b.status == BlockStatus.PENDING
+                or (
+                    b.needs_retranslation
+                    and b.status != BlockStatus.PROTECTED_SKIP
+                    and b.manual_translation_text is None
+                )
+            ]
+            if untranslated_remaining or requires_reparse_or_retranslate:
+                job.outputs_stale = True
+                job.outputs_stale_reason = (
+                    f"未翻訳または再翻訳待ちのブロックが {len(untranslated_remaining)} 件残った状態で再組版されました"
+                    "（未翻訳箇所は原文のまま保持されています）。完全な翻訳成果物にするには「ブロック再翻訳」または新規翻訳を実行してから再組版してください。"
+                )
+            else:
+                job.outputs_stale = False
+                job.outputs_stale_reason = None
+
             has_fallbacks = any(
                 b.status == BlockStatus.FALLBACK_ORIGINAL for b in working_blocks
             )
-            if issues or has_fallbacks:
+            if issues or has_fallbacks or untranslated_remaining or requires_reparse_or_retranslate:
                 job.transition_to(
                     JobState.COMPLETED_WITH_WARNINGS,
-                    f"再組版完了（rev {next_rev}・要確認警告 {len(issues)} 件）",
+                    (
+                        f"暫定再組版完了（rev {next_rev}・未翻訳 {len(untranslated_remaining)} 件残存・要再翻訳）"
+                        if untranslated_remaining
+                        else f"再組版完了（rev {next_rev}・要確認警告 {len(issues)} 件）"
+                    ),
                 )
             else:
                 job.transition_to(
@@ -1493,8 +2194,6 @@ class JobManager:
         finally:
             if staging_dir and staging_dir.exists():
                 shutil.rmtree(staging_dir, ignore_errors=True)
-            with self._active_lock:
-                self._active_jobs.discard(job_id)
 
     def _translate_and_validate_single_block(
         self,
@@ -1518,6 +2217,7 @@ class JobManager:
             llm_calls += 1
             return translator.translate_segment(**kw)
 
+        block.warnings = _clear_transient_block_warnings(block.warnings)
         masked_src = block.masked_source_text or block.source_text
         cache_key = compute_translation_cache_key(
             masked_source_text=masked_src,
@@ -1532,9 +2232,13 @@ class JobManager:
             history=history_window,
             protected_items=block.protected_items,
             adapter_version=translator.adapter_version,
+            is_mock=translator.is_mock,
         )
 
-        cached = self.db.get_cached_translation(cache_key)
+        cached = self.db.get_cached_translation(
+            cache_key,
+            expected_is_mock=translator.is_mock,
+        )
         if cached is not None:
             val_res = validate_translation_output(
                 source_text=block.source_text,
@@ -1546,7 +2250,9 @@ class JobManager:
             if val_res.is_valid:
                 block.translation_text = cached["model_output_text"]
                 block.status = BlockStatus.TRANSLATED
+                block.needs_retranslation = False
                 block.translation_provenance = "cache_hit"
+                block.translation_is_mock = bool(cached.get("is_mock", translator.is_mock))
                 return "cache_hit", 0
 
         max_attempts = 3  # Initial attempt + up to 2 retries (Section 11)
@@ -1640,6 +2346,7 @@ class JobManager:
             if val_res.is_valid:
                 block.translation_text = candidate_text
                 block.status = BlockStatus.TRANSLATED
+                block.needs_retranslation = False
                 self.db.put_cached_translation(
                     cache_key=cache_key,
                     model_output_text=candidate_text,
@@ -1666,12 +2373,15 @@ class JobManager:
                         )
                     )
                 block.translation_provenance = "llm_inference"
+                block.translation_is_mock = translator.is_mock
                 return "llm_inference", llm_calls
 
         # All attempts (initial + 2 retries) failed validation!
         # Section 11: Never delete placeholders to fake repair. Keep original source and record issue.
         block.translation_text = None
         block.status = BlockStatus.FALLBACK_ORIGINAL
+        block.needs_retranslation = False
+        block.translation_is_mock = translator.is_mock
         if last_val_res:
             for f in last_val_res.findings:
                 block.warnings.append(f.code)

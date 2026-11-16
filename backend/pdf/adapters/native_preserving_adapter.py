@@ -32,9 +32,13 @@ from backend.config import AppConfig
 from backend.domain.models import (
     Block,
     BlockKind,
+    BlockSplitPreviewResult,
+    BlockSplitRole,
+    BlockSplitSpec,
     BlockStatus,
     Document,
     InlineMathSpan,
+    InlineMathSubRun,
     IssueSeverity,
     ProtectedItem,
     ProtectedItemKind,
@@ -42,9 +46,17 @@ from backend.domain.models import (
     ProtectionRegion,
     TranslationJobConfig,
     ValidationIssue,
+    compute_source_text_hash,
 )
 from backend.pdf.adapters.base import PdfEngineAdapter
 from backend.pdf.coordinates import bbox_intersection_ratio, bbox_iou
+from backend.translation.validation.validator import find_placeholder_variant_tokens
+from backend.pdf.splitting import (
+    SplitExecutionOutcome,
+    build_raw_page_candidates,
+    evaluate_drag_split_candidate,
+    match_split_specs_to_page_candidates,
+)
 from backend.pdf.validation.preflight import verify_original_unchanged
 from backend.pdf.validation.visual_diff import (
     PageVisualComparisonReport,
@@ -82,6 +94,89 @@ _SUBSUP_TAIL = (
 _PROSE_SHORT_WORDS = (
     r"(?:in|of|on|to|at|by|or|as|is|it|we|be|do|no|so|up|us|an|if|he|me|my|go|am)"
 )
+_PROSE_STOPWORD_SET: frozenset[str] = frozenset(_PROSE_SHORT_WORDS[3:-1].split("|")) | {
+    "the",
+    "and",
+    "for",
+    "not",
+    "but",
+    "are",
+    "was",
+    "has",
+    "had",
+    "can",
+    "may",
+    "out",
+    "off",
+    "per",
+    "via",
+}
+_WORD_MATH_CHAR_RE = re.compile(r"[A-Za-z0-9\U0001d400-\U0001d7ff]")
+
+
+def _build_math_span_boundary_regex(cand: str) -> re.Pattern[str]:
+    """Compile a word-boundary-aware regex for matching `cand` without splitting ASCII/math tokens."""
+    left_guard = (
+        r"(?<![A-Za-z0-9\U0001d400-\U0001d7ff])"
+        if cand and _WORD_MATH_CHAR_RE.match(cand[0])
+        else ""
+    )
+    right_guard = (
+        r"(?![A-Za-z0-9\U0001d400-\U0001d7ff])"
+        if cand and _WORD_MATH_CHAR_RE.match(cand[-1])
+        else ""
+    )
+    return re.compile(left_guard + re.escape(cand) + right_guard)
+
+
+def _join_line_spans_with_ranges(
+    spans: list[dict],
+) -> tuple[str, list[tuple[int, int] | None]]:
+    """Join raw spans in a PDF line inserting missing horizontal word gaps, and return span char ranges."""
+    line_sizes = [float(s.get("size", 10.0)) for s in spans if str(s.get("text", "")).strip()]
+    max_line_size = max(line_sizes) if line_sizes else 10.0
+    line_parts: list[str] = []
+    span_ranges: list[tuple[int, int] | None] = [None] * len(spans)
+    cur_len = 0
+    prev_span: dict | None = None
+
+    for s_idx, s in enumerate(spans):
+        t = str(s.get("text", "")).replace("\xa0", " ")
+        if not t:
+            continue
+        if prev_span is not None:
+            prev_t = str(prev_span.get("text", "")).replace("\xa0", " ")
+            prev_bbox = prev_span.get("bbox")
+            cur_bbox = s.get("bbox")
+            if (
+                prev_t
+                and not prev_t[-1].isspace()
+                and not t[0].isspace()
+                and isinstance(prev_bbox, (list, tuple))
+                and len(prev_bbox) == 4
+                and isinstance(cur_bbox, (list, tuple))
+                and len(cur_bbox) == 4
+            ):
+                dx = float(cur_bbox[0]) - float(prev_bbox[2])
+                if dx >= max(1.8, max_line_size * 0.22):
+                    has_prose_boundary = bool(
+                        re.search(r"(?:[A-Za-z]{2,}|\b[aI])$", prev_t)
+                        or re.match(r"^\(?([A-Za-z]{2,}|[aI])\b", t)
+                    )
+                    if (
+                        has_prose_boundary
+                        and t[0] not in ".,;:!?)]}’”'"
+                        and prev_t[-1] not in "([{‘“"
+                    ):
+                        line_parts.append(" ")
+                        cur_len += 1
+        span_start = cur_len
+        line_parts.append(t)
+        cur_len += len(t)
+        span_ranges[s_idx] = (span_start, cur_len)
+        prev_span = s
+
+    return "".join(line_parts), span_ranges
 # Disallow 3+ letter plain ASCII prose words inside math function args unless they are known math functions
 _NON_PROSE_ARG = (
     r"\((?!(?:(?!"
@@ -106,17 +201,24 @@ _MATH_FUNC_CALL = (
     + _NON_PROSE_ARG
     + r"|(?!(?:"
     + _PROSE_SHORT_WORDS
-    + r")\b)[A-Za-z]{1,2}(?:[′″']+)+"
+    + r")\b)(?:"
+    + _HAT_CHARS
+    + r"\s*)?[A-Za-z]{1,2}(?:[′″']+)+"
     + _SUBSUP_TAIL
     + r"\([^()\n]+\)"
     + r"|(?!(?:"
     + _PROSE_SHORT_WORDS
-    + r")\b)[A-Za-z]{1,2}"
+    + r")\b)(?:"
+    + _HAT_CHARS
+    + r"\s*)?[A-Za-z]{1,2}"
     + _SUBSUP_TAIL
     + _NON_PROSE_ARG
     + r")"
 )
 _MATH_SET_ATOM = r"\{(?!v\d+\})[^}\n]*" + _SMP_OR_GREEK_OR_OP + r"[^}\n]*\}"
+_MATH_NORM_ATOM = (
+    r"∥(?![^\n∥]*\b[A-Za-z]{4,}\s+[A-Za-z]{4,}\b)[^∥\n]{1,48}∥" + _SUBSUP_TAIL
+)
 _MATH_DIM_ATOM = r"\b\d+(?:\.\d+)?(?:\s*[×±]\s*\d+(?:\.\d+)?)+\b"
 _MATH_SCI_ATOM = (
     r"(?<![A-Za-z\U0001d400-\U0001d7ff])\d+(?:\.\d+)?(?:e|E|\U0001d452)[+\-−]?\d+\b"
@@ -138,6 +240,8 @@ _MATH_ATOM = (
     r"(?:"
     + _MATH_SET_ATOM
     + r"|"
+    + _MATH_NORM_ATOM
+    + r"|"
     + _MATH_FUNC_CALL
     + r"|"
     + _MATH_DIM_ATOM
@@ -147,7 +251,7 @@ _MATH_ATOM = (
     + _MATH_SYMBOL_ATOM
     + r"|"
     + _MATH_ASCII_SUBSUP_ATOM
-    + r"|[\u2200-\u22ff\u2190-\u21ff]+[\ufe00\ufe01]?[A-Za-z\u0370-\u03ff\U0001d400-\U0001d7ff0-9_^{}\(\)′″']*"
+    + r"|(?<![A-Za-z0-9\U0001d400-\U0001d7ff])[\u2200-\u22ff\u2190-\u21ff]+[\ufe00\ufe01]?[A-Za-z\u0370-\u03ff\U0001d400-\U0001d7ff0-9_^{}\(\)′″']*"
     + r")"
 )
 _MATH_RHS_ATOM = (
@@ -155,8 +259,10 @@ _MATH_RHS_ATOM = (
     + _MATH_ATOM
     + r"|"
     + _NON_PROSE_ARG
+    + r"|[A-Za-z\u0370-\u03ff\U0001d400-\U0001d7ff][A-Za-z0-9_′″']*"
+    + _NON_PROSE_ARG
     + r"|[0-9]+(?:\.[0-9]+)?(?:e[+\-]?\d+)?"
-    + r"|(?<![A-Za-z\U0001d400-\U0001d7ff])[A-Za-z0-9_^{}\(\)′″']+(?![A-Za-z])"
+    + r"|(?<![A-Za-z\U0001d400-\U0001d7ff])[A-Za-z0-9_^{}′″']+(?:\([^()\n]*\))?(?![A-Za-z])"
     + r")"
 )
 _INLINE_MATH_EXPR_RE = re.compile(
@@ -175,10 +281,6 @@ _INLINE_MATH_EXPR_RE = re.compile(
     r")"
 )
 _EQUATION_NUM_ONLY_RE = re.compile(r"^\s*\(\d+(?:\.\d+)*[a-z]?\)\s*$")
-_UNRESOLVED_PH_CHECK_RE = re.compile(
-    r"(?:\{\s*v\s*\d+[A-Za-z0-9_]*\s*\}|［\s*v\s*\d+[A-Za-z0-9_]*\s*］|｛\s*v\s*\d+[A-Za-z0-9_]*\s*｝|\[\s*v\s*\d+[A-Za-z0-9_]*\s*\])",
-    re.IGNORECASE,
-)
 # Known TeX extension font (e.g. txexs) operator + Variation Selector-1/2 pairs where
 # U+FE00/U+FE01 selects operator display/text size in TeX but has no standalone PDF glyph.
 _KNOWN_TEX_OPERATOR_VS_RE = re.compile(r"([√∑∏∐∫∬∭∮⋀⋁⋂⋃])[\ufe00\ufe01]")
@@ -317,6 +419,144 @@ def _merge_horizontal_visual_lines(raw_lines: list[dict]) -> list[dict]:
     return merged
 
 
+def _sub_runs_signature(
+    sub_runs: list[InlineMathSubRun],
+) -> tuple[tuple[int, int, str, int], ...]:
+    """Return a canonical structural signature for nested script sub-runs."""
+    return tuple((sr.start, sr.end, sr.role, sr.level) for sr in sub_runs)
+
+
+def _build_script_sub_runs(
+    part_records: list[tuple[str, float, float]],
+    role_lit: Literal["super", "sub"],
+    base_sz: float,
+    lead_ws: int,
+    end_ws_limit: int,
+) -> tuple[list[InlineMathSubRun], str | None]:
+    """Classify span size/offset tiers inside a compound super/sub group into L1/L2 `InlineMathSubRun`s.
+
+    Returns `(sub_runs, unrepresentable_reason)`. Single-tier L1 scripts yield `([], None)`.
+    Nesting depth >= 3 sets `unrepresentable_reason="UNREPRESENTABLE_DEEP_NESTED_MATH"`
+    so rendering falls back explicitly instead of silently flattening deep scripts.
+    """
+    non_ws_sizes = [p_sz for p_t, p_sz, _ in part_records if p_t.strip()]
+    if not non_ws_sizes:
+        return [], None
+    l1_sz = max(non_ws_sizes)
+    tier2_sizes = [sz for sz in non_ws_sizes if sz < l1_sz * 0.84]
+    if not tier2_sizes:
+        return [], None
+    l2_sz = max(tier2_sizes)
+    if any(sz < l2_sz * 0.84 for sz in tier2_sizes):
+        return [], "UNREPRESENTABLE_DEEP_NESTED_MATH"
+
+    t1_oys = [
+        p_oy for p_t, p_sz, p_oy in part_records if p_t.strip() and p_sz >= l1_sz * 0.84
+    ]
+    l1_ref_oy = statistics.median(t1_oys) if t1_oys else part_records[0][2]
+
+    sub_runs: list[InlineMathSubRun] = []
+    raw_cursor = 0
+    for p_t, p_sz, p_oy in part_records:
+        raw_s = raw_cursor
+        raw_e = raw_cursor + len(p_t)
+        raw_cursor = raw_e
+        cs = max(raw_s, lead_ws) - lead_ws
+        ce = min(raw_e, end_ws_limit) - lead_ws
+        if cs >= ce:
+            continue
+        if not p_t.strip() or p_sz >= l1_sz * 0.84:
+            sr_role: Literal["super", "sub"] = role_lit
+            sr_level = 1
+            sr_scale = 0.78
+            sr_dy = -0.29 if role_lit == "super" else 0.18
+        else:
+            sr_level = 2
+            sr_scale = round(
+                max(0.42, min(0.78 * 0.82, 0.78 * (p_sz / max(l1_sz, 1e-3)))),
+                3,
+            )
+            delta_oy_em = (p_oy - l1_ref_oy) / max(base_sz, 1e-3)
+            if role_lit == "sub":
+                if delta_oy_em >= 0.03:
+                    sr_role = "sub"
+                    sr_dy = round(0.18 + max(0.08, min(0.16, delta_oy_em)), 3)
+                elif delta_oy_em <= -0.03:
+                    sr_role = "super"
+                    sr_dy = round(0.18 + min(-0.07, max(-0.14, delta_oy_em)), 3)
+                else:
+                    sr_role = "sub"
+                    sr_dy = 0.18
+            else:
+                if delta_oy_em <= -0.03:
+                    sr_role = "super"
+                    sr_dy = round(-0.29 + min(-0.08, max(-0.16, delta_oy_em)), 3)
+                elif delta_oy_em >= 0.03:
+                    sr_role = "sub"
+                    sr_dy = round(-0.29 + max(0.07, min(0.14, delta_oy_em)), 3)
+                else:
+                    sr_role = "super"
+                    sr_dy = -0.29
+
+        if (
+            sub_runs
+            and sub_runs[-1].end == cs
+            and sub_runs[-1].role == sr_role
+            and sub_runs[-1].level == sr_level
+            and sub_runs[-1].scale == sr_scale
+            and sub_runs[-1].dy_em == sr_dy
+        ):
+            sub_runs[-1] = sub_runs[-1].model_copy(update={"end": ce})
+        else:
+            sub_runs.append(
+                InlineMathSubRun(
+                    start=cs,
+                    end=ce,
+                    role=sr_role,
+                    level=sr_level,
+                    scale=sr_scale,
+                    dy_em=sr_dy,
+                )
+            )
+    return sub_runs, None
+
+
+def _is_maskable_math_script_span(
+    prev_span_dict: dict | None,
+    base_tok: str,
+    group_text: str,
+    role_lit: Literal["super", "sub"],
+) -> bool:
+    """Return True if a base+script math token (e.g. `h_t`, `t_0`, `t_N`, `a_t`) should be masked,
+    while excluding English ordinals (`1st`, `2nd`) and upright prose footnotes (`method^1`).
+    """
+    if role_lit == "super" and base_tok.isdigit():
+        if group_text.lower() in ("st", "nd", "rd", "th"):
+            return False
+    prev_font = str(prev_span_dict.get("font", "")).lower() if prev_span_dict else ""
+    prev_is_math_font = any(
+        tok in prev_font for tok in ("cmmi", "cmsy", "cmex", "math", "italic", "oblique")
+    ) or bool(re.search(r"[\u0370-\u03ff\U0001d400-\U0001d7ff]", base_tok))
+    if role_lit == "super" and not prev_is_math_font:
+        if (
+            base_tok.isdigit()
+            and len(base_tok) >= 3
+            and re.fullmatch(r"[0-9,\s]+", group_text)
+        ):
+            return False
+        if (
+            base_tok.isascii()
+            and base_tok.isalpha()
+            and re.fullmatch(r"[0-9,\-−–\s*∗†‡§¶]+", group_text)
+            and (
+                (len(base_tok) >= 3 and not re.fullmatch(_KNOWN_MATH_FUNCS, base_tok))
+                or base_tok.lower() in _PROSE_STOPWORD_SET
+            )
+        ):
+            return False
+    return True
+
+
 def extract_inline_math_spans(
     raw_lines: list[dict],
     page_drawings: list[dict] | None = None,
@@ -326,16 +566,58 @@ def extract_inline_math_spans(
     vector line drawings. Never guesses superscripts/subscripts from plain text.
     """
     lines = _merge_horizontal_visual_lines(raw_lines)
-    spans_out: list[InlineMathSpan] = []
-    seen_keys: set[tuple[str, str, str]] = set()
+    block_line_parts: list[str] = []
+    block_cursor = 0
+    span_global_ranges: dict[tuple[int, int], tuple[int, int]] = {}
+    for line_idx, line in enumerate(lines):
+        spans = line.get("spans", [])
+        if not spans:
+            continue
+        joined_line, local_ranges = _join_line_spans_with_ranges(spans)
+        stripped_line = joined_line.strip()
+        if not stripped_line:
+            continue
+        lstrip_delta = len(joined_line) - len(joined_line.lstrip())
+        if block_line_parts:
+            block_cursor += 1
+        line_base = block_cursor
+        for s_idx, rng in enumerate(local_ranges):
+            if rng is None:
+                continue
+            ls, le = rng
+            gs = line_base + max(0, ls - lstrip_delta)
+            ge = line_base + max(0, min(le - lstrip_delta, len(stripped_line)))
+            span_global_ranges[(line_idx, s_idx)] = (gs, ge)
+        block_line_parts.append(stripped_line)
+        block_cursor += len(stripped_line)
+    block_text = " ".join(block_line_parts)
 
-    def _add(item: InlineMathSpan) -> None:
-        key = (item.role, item.context_text, item.target_text)
-        if key not in seen_keys:
-            seen_keys.add(key)
+    spans_out: list[InlineMathSpan] = []
+    seen_keys: set[tuple[str, str, str, tuple[tuple[int, int, str, int], ...]]] = set()
+    script_char_ranges: dict[tuple[str, str, str], list[tuple[int, int]]] = {}
+    maskable_script_keys: set[tuple[str, str, str]] = set()
+
+    def _add(
+        item: InlineMathSpan,
+        script_range: tuple[int, int] | None = None,
+        maskable: bool = False,
+    ) -> None:
+        base_key = (item.role, item.context_text, item.target_text)
+        sig_key = (
+            item.role,
+            item.context_text,
+            item.target_text,
+            _sub_runs_signature(item.sub_runs),
+        )
+        if script_range is not None:
+            script_char_ranges.setdefault(base_key, []).append(script_range)
+        if maskable:
+            maskable_script_keys.add(base_key)
+        if sig_key not in seen_keys:
+            seen_keys.add(sig_key)
             spans_out.append(item)
 
-    for line in lines:
+    for line_idx, line in enumerate(lines):
         spans = line["spans"]
         line_sizes = [
             float(s.get("size", 10.0)) for s in spans if str(s.get("text", "")).strip()
@@ -361,9 +643,41 @@ def extract_inline_math_spans(
                 else 0.0
             )
 
-        script_base_by_idx: dict[int, tuple[str, Literal["super", "sub"]]] = {}
+        script_base_by_idx: dict[int, tuple[str, Literal["super", "sub"], str]] = {}
+        span_roles: list[str] = []
+        for s in spans:
+            s_raw = normalize_for_pdf_rendering(str(s.get("text", "")))
+            s_st = s_raw.strip()
+            if not s_st:
+                span_roles.append("space")
+                continue
+            if s_st == "ˆ":
+                span_roles.append("hat")
+                continue
+            s_sz = float(s.get("size", 10.0))
+            s_orig = s.get("origin")
+            if not (isinstance(s_orig, (list, tuple)) and len(s_orig) >= 2):
+                span_roles.append("normal")
+                continue
+            s_oy = float(s_orig[1])
+            s_is_sup = s_sz < max_sz * 0.86 and s_oy < baseline_y - max_sz * 0.10
+            s_is_sub = (
+                not s_is_sup
+                and s_sz < max_sz * 0.86
+                and s_oy > baseline_y + max_sz * 0.08
+            )
+            if s_is_sup:
+                span_roles.append("super")
+            elif s_is_sub:
+                span_roles.append("sub")
+            else:
+                span_roles.append("normal")
 
-        for idx, s in enumerate(spans):
+        idx = 0
+        while idx < len(spans):
+            cur_idx = idx
+            idx += 1
+            s = spans[cur_idx]
             raw_t = normalize_for_pdf_rendering(str(s.get("text", "")))
             st = raw_t.strip()
             if not st:
@@ -373,8 +687,8 @@ def extract_inline_math_spans(
                 continue
 
             # 1. Circumflex hat over immediately following math symbol
-            if st == "ˆ" and idx + 1 < len(spans):
-                ns = spans[idx + 1]
+            if st == "ˆ" and cur_idx + 1 < len(spans):
+                ns = spans[cur_idx + 1]
                 nt = normalize_for_pdf_rendering(str(ns.get("text", ""))).strip()
                 ns_bbox = ns.get("bbox")
                 s_orig = s.get("origin")
@@ -433,7 +747,7 @@ def extract_inline_math_spans(
                         )
                         if starts_at_radical and (ry0 - 3.0 <= dy0 <= ry1 + 2.0):
                             acc = rad_suffix
-                            for j in range(idx + 1, len(spans)):
+                            for j in range(cur_idx + 1, len(spans)):
                                 jt = normalize_for_pdf_rendering(str(spans[j].get("text", "")))
                                 j_bbox = spans[j].get("bbox")
                                 if not (isinstance(j_bbox, (list, tuple)) and len(j_bbox) == 4):
@@ -464,20 +778,12 @@ def extract_inline_math_spans(
                                         )
                                     break
 
-            # 3. Superscript / Subscript span attached to preceding base token
-            sz = float(s.get("size", 10.0))
-            s_orig = s.get("origin")
-            if not (isinstance(s_orig, (list, tuple)) and len(s_orig) >= 2):
-                continue
-            oy = float(s_orig[1])
-            is_sup = st != "ˆ" and (sz < max_sz * 0.86 and oy < baseline_y - max_sz * 0.10)
-            is_sub = (
-                st != "ˆ"
-                and not is_sup
-                and (sz < max_sz * 0.86 and oy > baseline_y + max_sz * 0.08)
-            )
-            if (is_sup or is_sub) and idx > 0:
-                ps_idx = idx - 1
+            # 3. Superscript / Subscript contiguous span run attached to preceding base token
+            cur_role = span_roles[cur_idx]
+            is_sup = cur_role == "super"
+            is_sub = cur_role == "sub"
+            if (is_sup or is_sub) and cur_idx > 0:
+                ps_idx = cur_idx - 1
                 ps = spans[ps_idx]
                 crossed_ws = False
                 if ps_idx >= 1 and not normalize_for_pdf_rendering(str(ps.get("text", ""))).strip():
@@ -495,27 +801,165 @@ def extract_inline_math_spans(
                     pt = normalize_for_pdf_rendering(str(ps.get("text", "")))
                     role_lit: Literal["super", "sub"] = "super" if is_sup else "sub"
                     dy_val = -0.29 if is_sup else 0.18
+
+                    # Group contiguous same-role script spans (plus smaller-tier Level-2 nested scripts
+                    # even when their offset sits near/across baseline_y without rewinding under base)
+                    # into a single compound run tracking tier sizes and y-origins.
+                    end_idx = cur_idx
+                    cur_s_orig = s.get("origin")
+                    cur_oy = (
+                        float(cur_s_orig[1])
+                        if isinstance(cur_s_orig, (list, tuple)) and len(cur_s_orig) >= 2
+                        else baseline_y
+                    )
+                    cur_sz = float(s.get("size", 10.0))
+                    part_records: list[tuple[str, float, float]] = [
+                        (raw_t.lstrip(), cur_sz, cur_oy)
+                    ]
+                    l1_anchor_sz = cur_sz
+                    while end_idx + 1 < len(spans):
+                        nxt = end_idx + 1
+                        prev_box = spans[end_idx].get("bbox")
+                        if not (isinstance(prev_box, (list, tuple)) and len(prev_box) == 4):
+                            break
+                        nxt_s = spans[nxt]
+                        nxt_role = span_roles[nxt]
+                        nxt_box = nxt_s.get("bbox")
+                        nxt_raw = normalize_for_pdf_rendering(str(nxt_s.get("text", "")))
+                        nxt_st = nxt_raw.strip()
+                        nxt_sz = float(nxt_s.get("size", 10.0))
+                        nxt_orig = nxt_s.get("origin")
+                        nxt_oy = (
+                            float(nxt_orig[1])
+                            if isinstance(nxt_orig, (list, tuple)) and len(nxt_orig) >= 2
+                            else baseline_y
+                        )
+                        if nxt_role == role_lit:
+                            if not (isinstance(nxt_box, (list, tuple)) and len(nxt_box) == 4):
+                                break
+                            gap_x = float(nxt_box[0]) - float(prev_box[2])
+                            if -max_sz * 0.30 <= gap_x <= max(2.5, max_sz * 0.40):
+                                part_records.append((nxt_raw, nxt_sz, nxt_oy))
+                                l1_anchor_sz = max(l1_anchor_sz, nxt_sz)
+                                end_idx = nxt
+                                continue
+                            break
+                        if (
+                            nxt_role in ("normal", "super", "sub")
+                            and isinstance(nxt_box, (list, tuple))
+                            and len(nxt_box) == 4
+                            and nxt_sz < l1_anchor_sz * 0.84
+                            and nxt_st not in ("", "ˆ")
+                            and not _EQUATION_NUM_ONLY_RE.match(nxt_raw)
+                        ):
+                            gap_x = float(nxt_box[0]) - float(prev_box[2])
+                            not_rewound = (
+                                nxt_role == "normal"
+                                or float(nxt_box[0]) >= float(prev_box[0]) + 0.5
+                            )
+                            if (
+                                not_rewound
+                                and not (nxt_raw[0].isspace() and gap_x > max_sz * 0.15)
+                                and -max_sz * 0.15 <= gap_x <= max(1.5, max_sz * 0.25)
+                            ):
+                                part_records.append((nxt_raw, nxt_sz, nxt_oy))
+                                end_idx = nxt
+                                continue
+                        if (
+                            nxt_role == "space"
+                            and nxt + 1 < len(spans)
+                            and span_roles[nxt + 1] == role_lit
+                            and nxt_sz < max_sz * 0.86
+                            and len(str(nxt_s.get("text", ""))) <= 2
+                        ):
+                            nxt2_s = spans[nxt + 1]
+                            nxt2_box = nxt2_s.get("bbox")
+                            if (
+                                isinstance(nxt2_box, (list, tuple))
+                                and len(nxt2_box) == 4
+                                and -max_sz * 0.30
+                                <= (float(nxt2_box[0]) - float(prev_box[2]))
+                                <= max(2.5, max_sz * 0.40)
+                            ):
+                                nxt2_raw = normalize_for_pdf_rendering(
+                                    str(nxt2_s.get("text", ""))
+                                )
+                                nxt2_sz = float(nxt2_s.get("size", 10.0))
+                                nxt2_orig = nxt2_s.get("origin")
+                                nxt2_oy = (
+                                    float(nxt2_orig[1])
+                                    if isinstance(nxt2_orig, (list, tuple))
+                                    and len(nxt2_orig) >= 2
+                                    else baseline_y
+                                )
+                                part_records.append((nxt_raw, nxt_sz, nxt_oy))
+                                part_records.append((nxt2_raw, nxt2_sz, nxt2_oy))
+                                l1_anchor_sz = max(l1_anchor_sz, nxt2_sz)
+                                end_idx = nxt + 1
+                                continue
+                        break
+
+                    raw_group = "".join(p_t for p_t, _, _ in part_records)
+                    lead_ws = len(raw_group) - len(raw_group.lstrip())
+                    group_text = raw_group.strip()
+                    if not group_text:
+                        continue
+                    end_ws_limit = lead_ws + len(group_text)
+                    sub_runs, unrep_reason = _build_script_sub_runs(
+                        part_records=part_records,
+                        role_lit=role_lit,
+                        base_sz=max_sz,
+                        lead_ws=lead_ws,
+                        end_ws_limit=end_ws_limit,
+                    )
+                    r0 = span_global_ranges.get((line_idx, cur_idx))
+                    r1 = span_global_ranges.get((line_idx, end_idx))
+                    script_rng: tuple[int, int] | None = None
+                    if r0 is not None and r1 is not None:
+                        s0, s1 = r0[0], r1[1]
+                        while s0 < s1 and block_text[s0].isspace():
+                            s0 += 1
+                        while s1 > s0 and block_text[s1 - 1].isspace():
+                            s1 -= 1
+                        if s1 > s0:
+                            script_rng = (s0, s1)
+
                     prev_script = script_base_by_idx.get(ps_idx)
                     if prev_script is not None and prev_script[1] != role_lit:
-                        base_tok = prev_script[0] + pt.strip()
+                        base_tok = prev_script[0] + prev_script[2]
                         _add(
                             InlineMathSpan(
-                                context_text=f"{base_tok} {st}",
-                                target_text=st,
+                                context_text=f"{base_tok} {group_text}",
+                                target_text=group_text,
                                 role=role_lit,
                                 scale=0.78,
                                 dy_em=dy_val,
-                            )
+                                sub_runs=sub_runs,
+                                unrepresentable_reason=unrep_reason,
+                            ),
+                            script_range=script_rng,
+                            maskable=_is_maskable_math_script_span(
+                                None, prev_script[0], group_text, role_lit
+                            ),
                         )
                         _add(
                             InlineMathSpan(
-                                context_text=f"{base_tok}{st}",
-                                target_text=st,
+                                context_text=f"{base_tok}{group_text}",
+                                target_text=group_text,
                                 role=role_lit,
                                 scale=0.78,
                                 dy_em=dy_val,
-                            )
+                                sub_runs=sub_runs,
+                                unrepresentable_reason=unrep_reason,
+                            ),
+                            script_range=script_rng,
+                            maskable=_is_maskable_math_script_span(
+                                None, prev_script[0], group_text, role_lit
+                            ),
                         )
+                        idx = end_idx + 1
+                    elif prev_script is not None:
+                        continue
                     elif pt.strip() == "∗" and ps_idx >= 1:
                         pps_idx = ps_idx - 1
                         if pps_idx >= 1 and not normalize_for_pdf_rendering(str(spans[pps_idx].get("text", ""))).strip():
@@ -527,42 +971,65 @@ def extract_inline_math_spans(
                         p_tok = p_parts[-1] if p_parts else ""
                         if p_tok:
                             base_tok = p_tok + "∗"
-                            _add(
-                                InlineMathSpan(
-                                    context_text=f"{base_tok} {st}",
-                                    target_text=st,
-                                    role=role_lit,
-                                    scale=0.78,
-                                    dy_em=dy_val,
-                                )
+                            is_m = _is_maskable_math_script_span(
+                                spans[pps_idx], p_tok, group_text, role_lit
                             )
                             _add(
                                 InlineMathSpan(
-                                    context_text=f"{base_tok}{st}",
-                                    target_text=st,
+                                    context_text=f"{base_tok} {group_text}",
+                                    target_text=group_text,
                                     role=role_lit,
                                     scale=0.78,
                                     dy_em=dy_val,
-                                )
+                                    sub_runs=sub_runs,
+                                    unrepresentable_reason=unrep_reason,
+                                ),
+                                script_range=script_rng,
+                                maskable=is_m,
                             )
+                            _add(
+                                InlineMathSpan(
+                                    context_text=f"{base_tok}{group_text}",
+                                    target_text=group_text,
+                                    role=role_lit,
+                                    scale=0.78,
+                                    dy_em=dy_val,
+                                    sub_runs=sub_runs,
+                                    unrepresentable_reason=unrep_reason,
+                                ),
+                                script_range=script_rng,
+                                maskable=is_m,
+                            )
+                            idx = end_idx + 1
                     else:
                         pt_parts = [
                             tok for tok in re.split(r"[\s(\[{,=+\-−*/√]+", pt) if tok
                         ]
                         base_tok = pt_parts[-1] if pt_parts else ""
+                        if not base_tok or not re.search(
+                            r"[A-Za-z0-9\u0370-\u03ff\U0001d400-\U0001d7ff]", base_tok
+                        ):
+                            continue
                         if is_sub and base_tok.isdigit():
                             continue
                         if base_tok:
-                            script_base_by_idx[idx] = (base_tok, role_lit)
+                            script_base_by_idx[end_idx] = (base_tok, role_lit, group_text)
                             _add(
                                 InlineMathSpan(
-                                    context_text=f"{base_tok}{st}",
-                                    target_text=st,
+                                    context_text=f"{base_tok}{group_text}",
+                                    target_text=group_text,
                                     role=role_lit,
                                     scale=0.78,
                                     dy_em=dy_val,
-                                )
+                                    sub_runs=sub_runs,
+                                    unrepresentable_reason=unrep_reason,
+                                ),
+                                script_range=script_rng,
+                                maskable=_is_maskable_math_script_span(
+                                    ps, base_tok, group_text, role_lit
+                                ),
                             )
+                            idx = end_idx + 1
 
     # Detect any super/sub InlineMathSpan whose `context_text` appears multiple times
     # in the same block with conflicting structures (e.g. both super and sub, sub/super and
@@ -570,14 +1037,20 @@ def extract_inline_math_spans(
     # Instead of silently dropping spans into flat plain text, mark conflicting spans `ambiguous=True`
     # so `typeset_and_export` safely falls back to original PDF with an explicit warning before redaction.
     if spans_out:
-        variants_by_ctx: dict[str, set[tuple[str, str]]] = {}
+        variants_by_ctx: dict[
+            str, set[tuple[str, str, tuple[tuple[int, int, str, int], ...]]]
+        ] = {}
         for item in spans_out:
             if item.role in ("super", "sub"):
                 variants_by_ctx.setdefault(item.context_text, set()).add(
-                    (item.role, item.target_text)
+                    (
+                        item.role,
+                        item.target_text,
+                        _sub_runs_signature(item.sub_runs),
+                    )
                 )
         if variants_by_ctx:
-            normal_chunks: list[str] = []
+            normal_chunks: list[list[tuple[str, bool]]] = []
             for line in lines:
                 spans = line["spans"]
                 line_sizes = [
@@ -606,7 +1079,7 @@ def extract_inline_math_spans(
                         else 0.0
                     )
                 )
-                cur_normal: list[str] = []
+                cur_normal: list[tuple[str, bool]] = []
                 for s in spans:
                     raw_t = normalize_for_pdf_rendering(str(s.get("text", "")))
                     st = raw_t.strip()
@@ -629,29 +1102,53 @@ def extract_inline_math_spans(
                     )
                     if is_sup or is_sub or st == "ˆ":
                         if cur_normal:
-                            normal_chunks.append("".join(cur_normal))
+                            normal_chunks.append(cur_normal)
                             cur_normal = []
                     else:
-                        cur_normal.append(raw_t)
+                        s_font = str(s.get("font", "")).lower()
+                        is_math_or_italic = any(
+                            tok in s_font
+                            for tok in ("cmmi", "cmsy", "cmex", "math", "italic", "oblique")
+                        ) or bool(re.search(r"[\u0370-\u03ff\U0001d400-\U0001d7ff]", raw_t))
+                        cur_normal.append((raw_t, is_math_or_italic))
                 if cur_normal:
-                    normal_chunks.append("".join(cur_normal))
+                    normal_chunks.append(cur_normal)
 
-            _WORD_MATH_CH_RE = re.compile(r"[A-Za-z0-9\U0001d400-\U0001d7ff]")
             for ctx, vset in variants_by_ctx.items():
-                left_guard = (
-                    r"(?<![A-Za-z0-9\U0001d400-\U0001d7ff])"
-                    if ctx and _WORD_MATH_CH_RE.match(ctx[0])
-                    else ""
-                )
-                right_guard = (
-                    r"(?![A-Za-z0-9\U0001d400-\U0001d7ff])"
-                    if ctx and _WORD_MATH_CH_RE.match(ctx[-1])
-                    else ""
-                )
-                pat = re.compile(left_guard + re.escape(ctx) + right_guard)
-                for chunk in normal_chunks:
-                    if pat.search(chunk):
-                        vset.add(("normal", ctx))
+                pat = _build_math_span_boundary_regex(ctx)
+                is_lower_stopword = ctx.islower() and ctx in _PROSE_STOPWORD_SET
+                for chunk_parts in normal_chunks:
+                    chunk_text = "".join(t for t, _ in chunk_parts)
+                    found_non_stopword_match = False
+                    for m in pat.finditer(chunk_text):
+                        if not is_lower_stopword:
+                            found_non_stopword_match = True
+                            break
+                        # Check whether matched span uses italic/math font or sits outside English prose words
+                        m_start, m_end = m.start(), m.end()
+                        pos = 0
+                        touches_math_font = False
+                        for seg_t, seg_is_math in chunk_parts:
+                            seg_end = pos + len(seg_t)
+                            if seg_end > m_start and pos < m_end and seg_is_math:
+                                touches_math_font = True
+                                break
+                            pos = seg_end
+                        has_adjacent_prose_word = bool(
+                            re.search(
+                                r"(?:[A-Za-z]{2,}\s+"
+                                + re.escape(ctx)
+                                + r"\b|\b"
+                                + re.escape(ctx)
+                                + r"\s+[A-Za-z]{2,})",
+                                chunk_text,
+                            )
+                        )
+                        if touches_math_font or not has_adjacent_prose_word:
+                            found_non_stopword_match = True
+                            break
+                    if found_non_stopword_match:
+                        vset.add(("normal", ctx, ()))
                         break
 
             final_spans: list[InlineMathSpan] = []
@@ -664,6 +1161,30 @@ def extract_inline_math_spans(
                             seen_ambiguous.add(key)
                             final_spans.append(item.model_copy(update={"ambiguous": True}))
                         continue
+                    ctx_clean = item.context_text.strip()
+                    tgt_clean = item.target_text.strip()
+                    base_key = (item.role, item.context_text, item.target_text)
+                    is_compound_tgt = any(ch in tgt_clean for ch in ",+-−*/.")
+                    should_compute_occ = bool(ctx_clean) and not is_compound_tgt and (
+                        ctx_clean.lower() in _PROSE_STOPWORD_SET
+                        or base_key in maskable_script_keys
+                    )
+                    if should_compute_occ:
+                        ranges = script_char_ranges.get(base_key, [])
+                        if ranges and block_text:
+                            pat = _build_math_span_boundary_regex(ctx_clean)
+                            occ_indices = [
+                                occ_i
+                                for occ_i, m in enumerate(pat.finditer(block_text))
+                                if any(
+                                    rs >= m.start() and re_ <= m.end()
+                                    for rs, re_ in ranges
+                                )
+                            ]
+                            if occ_indices:
+                                item = item.model_copy(
+                                    update={"mask_occurrence_indices": occ_indices}
+                                )
                 final_spans.append(item)
             spans_out = final_spans
 
@@ -766,10 +1287,20 @@ def _build_styled_line_plan(
                         and char_role[t1] == "normal"
                     ):
                         continue
+                    if any(char_role[k] != "normal" for k in range(t0, t1)):
+                        continue
                     for k in range(t0, t1):
                         char_role[k] = mspan.role
                         char_scale[k] = mspan.scale
                         char_dy_em[k] = mspan.dy_em
+                    if mspan.sub_runs:
+                        for sr in mspan.sub_runs:
+                            s0 = max(0, sr.start)
+                            s1 = min(len(tgt), sr.end)
+                            for rel_k in range(s0, s1):
+                                k = t0 + rel_k
+                                char_scale[k] = sr.scale
+                                char_dy_em[k] = sr.dy_em
                 elif mspan.role == "radicand" and mspan.overbar and ctx.endswith(tgt):
                     t1 = pos + len(ctx)
                     t0 = t1 - len(tgt)
@@ -908,6 +1439,10 @@ def _build_styled_line_plan(
     bot_em = 0.22
     if any(r == "sub" for r in char_role):
         bot_em = max(bot_em, 0.36)
+    for idx_c in range(n):
+        if char_role[idx_c] in ("super", "sub", "hat"):
+            top_em = max(top_em, round(-char_dy_em[idx_c] + 0.76 * char_scale[idx_c], 3))
+            bot_em = max(bot_em, round(char_dy_em[idx_c] + 0.24 * char_scale[idx_c], 3))
 
     return styled_runs, overbars, max_rendered_x1, top_em, bot_em
 
@@ -1007,6 +1542,58 @@ def _rewrite_tounicode_cmap_smp_bytes(raw: bytes) -> bytes:
     return out
 
 
+def _preserve_page_transparency_groups(
+    src_doc: pymupdf.Document,
+    dst_doc: pymupdf.Document,
+    page_pairs: list[tuple[int, int]],
+) -> int:
+    """Copy page-level `/Group` transparency dicts and referenced color spaces from `src_doc` to `dst_doc`.
+
+    PyMuPDF's `insert_pdf()` and `show_pdf_page()` omit each page's `/Group` entry (such as
+    `<< /Type /Group /S /Transparency /CS ... >>`), causing CMYK/ICCBased or isolated-group pages
+    to blend under the default sRGB transparency space on re-render. Grafting the `/Group` object
+    via a shared `Graftmap` remaps all referenced indirect objects (e.g., `/ICCBased` streams)
+    into `dst_doc` cleanly, preserves attributes (`/CS`, `/S`, `/Type`, `/I`, `/K`), and
+    deduplicates shared ICC profile streams across pages without hardcoding resource names or xrefs.
+    All low-level MuPDF handles remain local so file descriptors release cleanly on close.
+    """
+    mupdf = getattr(pymupdf, "mupdf", None)
+    if mupdf is None or not page_pairs:
+        return 0
+    src_pdf = mupdf.pdf_specifics(src_doc.this)
+    dst_pdf = mupdf.pdf_specifics(dst_doc.this)
+    gmap = pymupdf.Graftmap(dst_doc)
+    restored = 0
+    src_len = len(src_doc)
+    dst_len = len(dst_doc)
+    for src_idx, dst_idx in page_pairs:
+        if src_idx < 0 or src_idx >= src_len or dst_idx < 0 or dst_idx >= dst_len:
+            continue
+        src_page_obj = mupdf.pdf_lookup_page_obj(src_pdf, src_idx)
+        src_group = mupdf.pdf_dict_gets(src_page_obj, "Group")
+        if src_group is None or getattr(src_group, "m_internal", None) is None or mupdf.pdf_is_null(src_group):
+            continue
+        if hasattr(mupdf, "pdf_is_dict") and not mupdf.pdf_is_dict(src_group):
+            continue
+        dst_page_obj = mupdf.pdf_lookup_page_obj(dst_pdf, dst_idx)
+        existing_group = mupdf.pdf_dict_gets(dst_page_obj, "Group")
+        if (
+            existing_group is not None
+            and getattr(existing_group, "m_internal", None) is not None
+            and not mupdf.pdf_is_null(existing_group)
+        ):
+            continue
+        dst_group = mupdf.pdf_graft_mapped_object(gmap.this, src_group)
+        if (
+            dst_group is not None
+            and getattr(dst_group, "m_internal", None) is not None
+            and not mupdf.pdf_is_null(dst_group)
+        ):
+            mupdf.pdf_dict_puts(dst_page_obj, "Group", dst_group)
+            restored += 1
+    return restored
+
+
 def _collect_document_tounicode_xrefs(doc: pymupdf.Document) -> set[int]:
     """Return the set of all `/ToUnicode` stream xrefs currently referenced anywhere in `doc`."""
     tu_xrefs: set[int] = set()
@@ -1074,12 +1661,12 @@ def _fix_embedded_tounicode_smp(
 
 def _find_unresolved_placeholders(restored_text: str, source_text: str) -> list[str]:
     """Return any placeholder-like tokens remaining in restored_text that were not
-    literally present in the original source_text.
+    literally present in the original source_text (detecting fullwidth/space variants).
     """
-    found = _UNRESOLVED_PH_CHECK_RE.findall(restored_text)
+    found = find_placeholder_variant_tokens(restored_text)
     if not found:
         return []
-    src_tokens = _UNRESOLVED_PH_CHECK_RE.findall(source_text or "")
+    src_tokens = find_placeholder_variant_tokens(source_text or "")
     unresolved: list[str] = []
     remaining_src = list(src_tokens)
     for tok in found:
@@ -1162,17 +1749,135 @@ class NativePreservingAdapter(PdfEngineAdapter):
     # ------------------------------------------------------------------
     # Stages 4 - 7: Parsing, Reading Order, Protection, Inline Masking
     # ------------------------------------------------------------------
+    def _build_text_block_from_lines(
+        self,
+        *,
+        block_id: str,
+        page_index: int,
+        bbox: list[float],
+        lines: list[dict],
+        drawings: list[dict],
+        page_w: float,
+        page_h: float,
+        body_font_size: float,
+        frontmatter_end_y: float,
+        drawing_boxes: list[list[float]],
+        in_references_section: bool,
+        page_manual: list[ProtectionRegion],
+        cfg: TranslationJobConfig,
+        spatial_fraction_equation: bool = False,
+        split_spec_id: str | None = None,
+        split_role: BlockSplitRole | None = None,
+        parent_block_id: str | None = None,
+        parent_bbox: list[float] | None = None,
+        parent_source_hash: str | None = None,
+        sibling_formula_bbox: list[float] | None = None,
+    ) -> tuple[Block | None, bool]:
+        if not lines:
+            return None, in_references_section
+
+        text_lines, avg_font_size, has_math_font, has_sub_super = (
+            self._extract_lines_and_style(lines)
+        )
+        full_text = " ".join(t.strip() for t in text_lines if t.strip()).strip()
+        if not full_text:
+            return None, in_references_section
+
+        (
+            kind,
+            semantic_cat,
+            prot_reason,
+            prot_rule_id,
+            prot_conf,
+            is_uncertain,
+            in_references_section,
+        ) = self._classify_academic_block(
+            text=full_text,
+            line_count=len(text_lines),
+            p_idx=page_index,
+            bbox=bbox,
+            page_w=page_w,
+            page_h=page_h,
+            avg_font_size=avg_font_size,
+            body_font_size=body_font_size,
+            frontmatter_end_y=frontmatter_end_y,
+            has_math_font=has_math_font,
+            has_sub_super=has_sub_super,
+            drawing_boxes=drawing_boxes,
+            in_references_section=in_references_section,
+        )
+        if spatial_fraction_equation and split_role is None:
+            kind = BlockKind.ISOLATED_FORMULA
+            semantic_cat = "formula"
+            prot_reason = "自動：分数線・上下テキスト・式番号の幾何構造"
+            prot_rule_id = "RULE_SPATIAL_FRACTION_EQUATION"
+            prot_conf = "high"
+            is_uncertain = False
+
+        if split_role == "formula":
+            kind = BlockKind.ISOLATED_FORMULA
+            semantic_cat = "formula"
+            prot_reason = "手動分割：独立数式として原文保護"
+            prot_rule_id = "RULE_MANUAL_DRAG_SPLIT_FORMULA"
+            prot_conf = "high"
+            is_uncertain = False
+        elif split_role in ("top", "bottom") and (
+            kind == BlockKind.ISOLATED_FORMULA or is_uncertain
+        ):
+            # User explicitly split the display equation out; keep remaining prose translatable
+            kind = BlockKind.PARAGRAPH
+            semantic_cat = "body"
+            prot_reason = None
+            prot_rule_id = None
+            prot_conf = "high"
+            is_uncertain = False
+
+        inline_spans = extract_inline_math_spans(lines, drawings)
+        blk = Block(
+            id=block_id,
+            page_index=page_index,
+            bbox=[round(float(x), 2) for x in bbox],
+            kind=kind,
+            source_text=full_text,
+            source_text_hash=compute_source_text_hash(full_text),
+            inline_math_spans=inline_spans,
+            font_size_pt=round(avg_font_size, 2),
+            is_uncertain_region=is_uncertain,
+            semantic_category=semantic_cat,
+            protection_reason=prot_reason,
+            protection_rule_id=prot_rule_id,
+            protection_confidence=prot_conf,
+            split_spec_id=split_spec_id,
+            split_role=split_role,
+            parent_block_id=parent_block_id,
+            parent_bbox=list(parent_bbox) if parent_bbox else None,
+            parent_source_hash=parent_source_hash,
+        )
+        self._apply_protection_and_masking(
+            blk,
+            page_manual,
+            cfg,
+            sibling_formula_bbox=sibling_formula_bbox,
+        )
+        return blk, in_references_section
+
     def parse_and_extract_blocks(
         self,
         document: Document,
         page_indices: list[int],
         manual_regions: list[ProtectionRegion] | None = None,
         job_config: TranslationJobConfig | None = None,
+        split_specs: list[BlockSplitSpec] | None = None,
+        updated_split_specs_out: list[BlockSplitSpec] | None = None,
     ) -> list[Block]:
         cfg = job_config or TranslationJobConfig()
         manual_by_page: dict[int, list[ProtectionRegion]] = {}
         for reg in manual_regions or []:
             manual_by_page.setdefault(reg.page_index, []).append(reg)
+
+        splits_by_page: dict[int, list[BlockSplitSpec]] = {}
+        for sp in split_specs or []:
+            splits_by_page.setdefault(sp.page_index, []).append(sp)
 
         mupdf_doc = pymupdf.open(document.safe_storage_path)
         all_blocks: list[Block] = []
@@ -1188,6 +1893,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 page_w = float(mpage.cropbox.width)
                 page_h = float(mpage.cropbox.height)
                 page_manual = manual_by_page.get(p_idx, [])
+                page_splits = splits_by_page.get(p_idx, [])
 
                 raw_dict = mpage.get_text("dict")
                 raw_blocks = self._preprocess_page_raw_blocks(
@@ -1199,7 +1905,6 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 raw_blocks = self._group_spatial_fraction_equations(raw_blocks, drawings)
 
                 page_candidates: list[Block] = []
-                block_seq = 0
 
                 frontmatter_end_y = (
                     self._find_page1_frontmatter_boundary_y(raw_blocks, page_h, body_font_size)
@@ -1209,38 +1914,56 @@ class NativePreservingAdapter(PdfEngineAdapter):
 
                 # Extract vector drawing clusters as figure/table protection candidates
                 drawing_boxes = self._cluster_vector_drawings(drawings, page_w, page_h)
-                for d_box in drawing_boxes:
-                    block_seq += 1
-                    d_blk = Block(
-                        id=f"{document.id}:page-{p_idx + 1}:block-{block_seq}",
-                        page_index=p_idx,
-                        bbox=d_box,
-                        kind=BlockKind.FIGURE,
-                        source_text="[Vector Figure / Diagram]",
-                        masked_source_text="[Vector Figure / Diagram]",
-                        status=BlockStatus.PROTECTED_SKIP,
-                        protection_source="auto",
-                        semantic_category="figure",
-                        protection_reason="自動：図・ベクター要素",
-                        protection_rule_id="RULE_FIGURE_VECTOR",
-                        protection_confidence="high",
-                    )
-                    self._apply_protection_and_masking(d_blk, page_manual, cfg)
-                    page_candidates.append(d_blk)
+                raw_candidates = build_raw_page_candidates(
+                    document_id=document.id,
+                    page_index=p_idx,
+                    drawing_boxes=drawing_boxes,
+                    raw_blocks=raw_blocks,
+                    drawings=drawings,
+                    body_font_size=body_font_size,
+                    extract_text_fn=self._extract_lines_and_style,
+                )
 
-                for b_item in raw_blocks:
-                    b_type = b_item.get("type", 0)
-                    bbox = [round(float(x), 2) for x in b_item.get("bbox", [0, 0, 0, 0])]
-                    if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+                matched_splits: dict[str, tuple[BlockSplitSpec, SplitExecutionOutcome]] = {}
+                consumed_eq_ids: set[str] = set()
+                if page_splits:
+                    matched_splits, consumed_eq_ids, updated_specs = match_split_specs_to_page_candidates(
+                        document_id=document.id,
+                        page_index=p_idx,
+                        page_w=page_w,
+                        candidates=raw_candidates,
+                        page_specs=page_splits,
+                        drawings=drawings,
+                        extract_text_fn=self._extract_lines_and_style,
+                    )
+                    if updated_split_specs_out is not None:
+                        updated_split_specs_out.extend(updated_specs)
+
+                for cand in raw_candidates:
+                    if cand.item_type == "vector_drawing":
+                        d_blk = Block(
+                            id=cand.base_block_id,
+                            page_index=p_idx,
+                            bbox=list(cand.bbox),
+                            kind=BlockKind.FIGURE,
+                            source_text="[Vector Figure / Diagram]",
+                            masked_source_text="[Vector Figure / Diagram]",
+                            status=BlockStatus.PROTECTED_SKIP,
+                            protection_source="auto",
+                            semantic_category="figure",
+                            protection_reason="自動：図・ベクター要素",
+                            protection_rule_id="RULE_FIGURE_VECTOR",
+                            protection_confidence="high",
+                        )
+                        self._apply_protection_and_masking(d_blk, page_manual, cfg)
+                        page_candidates.append(d_blk)
                         continue
 
-                    if b_type == 1:
-                        # Raster image block -> protect as figure
-                        block_seq += 1
+                    if cand.item_type == "raster_image":
                         img_blk = Block(
-                            id=f"{document.id}:page-{p_idx + 1}:block-{block_seq}",
+                            id=cand.base_block_id,
                             page_index=p_idx,
-                            bbox=bbox,
+                            bbox=list(cand.bbox),
                             kind=BlockKind.FIGURE,
                             source_text="[Raster Image]",
                             masked_source_text="[Raster Image]",
@@ -1255,69 +1978,79 @@ class NativePreservingAdapter(PdfEngineAdapter):
                         page_candidates.append(img_blk)
                         continue
 
+                    if cand.base_block_id in consumed_eq_ids:
+                        continue
+
+                    split_entry = matched_splits.get(cand.base_block_id)
+                    if split_entry is not None:
+                        spec, outcome = split_entry
+                        child_specs: list[tuple[BlockSplitRole, list[float] | None, list[dict]]] = [
+                            (
+                                "top",
+                                outcome.top_bbox,
+                                outcome.top_lines,
+                            ),
+                            (
+                                "formula",
+                                outcome.formula_bbox,
+                                outcome.formula_lines,
+                            ),
+                            (
+                                "bottom",
+                                outcome.bottom_bbox,
+                                outcome.bottom_lines,
+                            ),
+                        ]
+                        for c_role, c_bbox, c_lines in child_specs:
+                            if not c_lines or c_bbox is None:
+                                continue
+                            child_blk, in_references_section = self._build_text_block_from_lines(
+                                block_id=f"{cand.base_block_id}:split-{spec.id}:{c_role}",
+                                page_index=p_idx,
+                                bbox=c_bbox,
+                                lines=c_lines,
+                                drawings=drawings,
+                                page_w=page_w,
+                                page_h=page_h,
+                                body_font_size=body_font_size,
+                                frontmatter_end_y=frontmatter_end_y,
+                                drawing_boxes=drawing_boxes,
+                                in_references_section=in_references_section,
+                                page_manual=page_manual,
+                                cfg=cfg,
+                                split_spec_id=spec.id,
+                                split_role=c_role,
+                                parent_block_id=cand.base_block_id,
+                                parent_bbox=cand.bbox,
+                                parent_source_hash=cand.source_text_hash,
+                                sibling_formula_bbox=(
+                                    outcome.formula_bbox if c_role in ("top", "bottom") else None
+                                ),
+                            )
+                            if child_blk is not None:
+                                page_candidates.append(child_blk)
+                        continue
+
+                    b_item = cand.raw_item or {}
                     lines = b_item.get("lines", [])
-                    if not lines:
-                        continue
-
-                    text_lines, avg_font_size, has_math_font, has_sub_super = (
-                        self._extract_lines_and_style(lines)
-                    )
-                    full_text = " ".join(t.strip() for t in text_lines if t.strip()).strip()
-                    if not full_text:
-                        continue
-
-                    # Stage 4: Classify block kind & academic semantic category
-                    (
-                        kind,
-                        semantic_cat,
-                        prot_reason,
-                        prot_rule_id,
-                        prot_conf,
-                        is_uncertain,
-                        in_references_section,
-                    ) = self._classify_academic_block(
-                        text=full_text,
-                        line_count=len(text_lines),
-                        p_idx=p_idx,
-                        bbox=bbox,
+                    blk, in_references_section = self._build_text_block_from_lines(
+                        block_id=cand.base_block_id,
+                        page_index=p_idx,
+                        bbox=cand.bbox,
+                        lines=lines,
+                        drawings=drawings,
                         page_w=page_w,
                         page_h=page_h,
-                        avg_font_size=avg_font_size,
                         body_font_size=body_font_size,
                         frontmatter_end_y=frontmatter_end_y,
-                        has_math_font=has_math_font,
-                        has_sub_super=has_sub_super,
                         drawing_boxes=drawing_boxes,
                         in_references_section=in_references_section,
+                        page_manual=page_manual,
+                        cfg=cfg,
+                        spatial_fraction_equation=bool(b_item.get("_spatial_fraction_equation")),
                     )
-                    if b_item.get("_spatial_fraction_equation"):
-                        kind = BlockKind.ISOLATED_FORMULA
-                        semantic_cat = "formula"
-                        prot_reason = "自動：分数線・上下テキスト・式番号の幾何構造"
-                        prot_rule_id = "RULE_SPATIAL_FRACTION_EQUATION"
-                        prot_conf = "high"
-                        is_uncertain = False
-
-                    block_seq += 1
-                    inline_spans = extract_inline_math_spans(lines, drawings)
-                    blk = Block(
-                        id=f"{document.id}:page-{p_idx + 1}:block-{block_seq}",
-                        page_index=p_idx,
-                        bbox=bbox,
-                        kind=kind,
-                        source_text=full_text,
-                        inline_math_spans=inline_spans,
-                        font_size_pt=round(avg_font_size, 2),
-                        is_uncertain_region=is_uncertain,
-                        semantic_category=semantic_cat,
-                        protection_reason=prot_reason,
-                        protection_rule_id=prot_rule_id,
-                        protection_confidence=prot_conf,
-                    )
-
-                    # Stage 6: Apply protection rules & manual region overrides
-                    self._apply_protection_and_masking(blk, page_manual, cfg)
-                    page_candidates.append(blk)
+                    if blk is not None:
+                        page_candidates.append(blk)
 
                 # Reclassify vector drawing boxes and internal cells adjacent to Table captions as TABLE
                 table_captions = [
@@ -1366,6 +2099,112 @@ class NativePreservingAdapter(PdfEngineAdapter):
 
             attach_continuation_candidates(all_blocks)
             return all_blocks
+        finally:
+            mupdf_doc.close()
+
+    def preview_block_split(
+        self,
+        document: Document,
+        page_index: int,
+        drag_bbox: list[float],
+        *,
+        existing_splits: list[BlockSplitSpec] | None = None,
+        include_equation_number: bool = True,
+        manual_edit_block_ids: set[str] | None = None,
+        manual_regions: list[ProtectionRegion] | None = None,
+    ) -> BlockSplitPreviewResult:
+        """Compute live drag-split snapping/rejection preview from immutable original PDF."""
+        mupdf_doc = pymupdf.open(document.safe_storage_path)
+        try:
+            if page_index < 0 or page_index >= len(mupdf_doc):
+                return BlockSplitPreviewResult(
+                    valid=False,
+                    document_id=document.id,
+                    page_index=page_index,
+                    requested_bbox=list(drag_bbox),
+                    rejection_code="INVALID_PAGE",
+                    rejection_reason=f"ページ番号 {page_index + 1} は範囲外です。",
+                    retry_guidance="有効なページ内で数式範囲をドラッグしてください。",
+                )
+            body_font_size = self._estimate_document_body_font_size(
+                mupdf_doc, list(range(len(mupdf_doc)))
+            )
+            mpage = mupdf_doc[page_index]
+            page_w = float(mpage.cropbox.width)
+            page_h = float(mpage.cropbox.height)
+            raw_dict = mpage.get_text("dict")
+            raw_blocks = self._preprocess_page_raw_blocks(
+                raw_dict.get("blocks", []),
+                p_idx=page_index,
+                page_w=page_w,
+            )
+            drawings = mpage.get_drawings()
+            raw_blocks = self._group_spatial_fraction_equations(raw_blocks, drawings)
+            drawing_boxes = self._cluster_vector_drawings(drawings, page_w, page_h)
+            candidates = build_raw_page_candidates(
+                document_id=document.id,
+                page_index=page_index,
+                drawing_boxes=drawing_boxes,
+                raw_blocks=raw_blocks,
+                drawings=drawings,
+                body_font_size=body_font_size,
+                extract_text_fn=self._extract_lines_and_style,
+            )
+            page_splits = [s for s in (existing_splits or []) if s.page_index == page_index]
+            preview, _ = evaluate_drag_split_candidate(
+                document_id=document.id,
+                page_index=page_index,
+                page_w=page_w,
+                candidates=candidates,
+                drag_bbox=drag_bbox,
+                existing_splits=page_splits,
+                drawings=drawings,
+                extract_text_fn=self._extract_lines_and_style,
+                include_equation_number=include_equation_number,
+                manual_edit_block_ids=manual_edit_block_ids,
+            )
+            if preview.valid and manual_regions and preview.snapped_bbox:
+                page_manual = [r for r in manual_regions if r.page_index == page_index]
+                has_prose_region_overlap = False
+                suppressed_conflict_labels: list[str] = []
+                for part in preview.parts:
+                    if part.role not in ("top", "bottom"):
+                        continue
+                    for reg in page_manual:
+                        if self._manual_region_suppressed_by_split_formula(
+                            part_role=part.role,
+                            part_bbox=part.bbox,
+                            reg=reg,
+                            sibling_formula_bbox=preview.snapped_bbox,
+                        ):
+                            if (
+                                bbox_intersection_ratio(part.bbox, reg.bbox) >= 0.15
+                                or bbox_iou(part.bbox, reg.bbox) >= 0.10
+                            ):
+                                label = (reg.note or reg.mode.value).strip()
+                                if label not in suppressed_conflict_labels:
+                                    suppressed_conflict_labels.append(label)
+                            continue
+                        if (
+                            bbox_intersection_ratio(part.bbox, reg.bbox) >= 0.35
+                            or bbox_iou(part.bbox, reg.bbox) >= 0.25
+                        ):
+                            if reg.mode != ProtectionMode.TRANSLATE_AS_BODY:
+                                part.will_protect = True
+                                has_prose_region_overlap = True
+                            elif reg.mode == ProtectionMode.TRANSLATE_AS_BODY:
+                                part.will_protect = False
+                                break
+                if suppressed_conflict_labels:
+                    labels_txt = "、".join(suppressed_conflict_labels)
+                    preview.warnings.append(
+                        f"既存の手動保護領域（{labels_txt}）は本文側にも一部重なっていますが、数式分離指定を優先し分割後の本文は翻訳対象としています（本文も非翻訳にする場合は確定後に「非翻訳にする」を選択してください）。"
+                    )
+                if has_prose_region_overlap:
+                    preview.warnings.append(
+                        "既存の手動保護領域が上下の本文部分とも大きく重なっているため、該当本文にも保護設定が引き継がれます（翻訳対象にする場合は確定後に「翻訳対象にする」または該当保護領域の削除を行ってください）。"
+                    )
+            return preview
         finally:
             mupdf_doc.close()
 
@@ -1685,8 +2524,6 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 continue
             line_sizes = [float(s.get("size", 10.0)) for s in spans if s.get("text", "").strip()]
             max_line_size = max(line_sizes) if line_sizes else 10.0
-            line_parts: list[str] = []
-            prev_span: dict | None = None
 
             for s in spans:
                 t = str(s.get("text", "")).replace("\xa0", " ")
@@ -1702,36 +2539,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 if (flags & 1) or (sz < max_line_size * 0.78 and len(t.strip()) <= 4):
                     has_sub_super = True
 
-                if prev_span is not None:
-                    prev_t = str(prev_span.get("text", "")).replace("\xa0", " ")
-                    prev_bbox = prev_span.get("bbox")
-                    cur_bbox = s.get("bbox")
-                    if (
-                        prev_t
-                        and not prev_t[-1].isspace()
-                        and not t[0].isspace()
-                        and isinstance(prev_bbox, (list, tuple))
-                        and len(prev_bbox) == 4
-                        and isinstance(cur_bbox, (list, tuple))
-                        and len(cur_bbox) == 4
-                    ):
-                        dx = float(cur_bbox[0]) - float(prev_bbox[2])
-                        if dx >= max(1.8, max_line_size * 0.22):
-                            has_prose_boundary = bool(
-                                re.search(r"(?:[A-Za-z]{2,}|\b[aI])$", prev_t)
-                                or re.match(r"^\(?([A-Za-z]{2,}|[aI])\b", t)
-                            )
-                            if (
-                                has_prose_boundary
-                                and t[0] not in ".,;:!?)]}’”'"
-                                and prev_t[-1] not in "([{‘“"
-                            ):
-                                line_parts.append(" ")
-
-                line_parts.append(t)
-                prev_span = s
-
-            joined_line = "".join(line_parts)
+            joined_line, _ = _join_line_spans_with_ranges(spans)
             if joined_line.strip():
                 text_lines.append(joined_line)
 
@@ -1974,19 +2782,32 @@ class NativePreservingAdapter(PdfEngineAdapter):
                     in_references_section,
                 )
 
-        # 3. Inside a vector drawing / table box -> classify as FIGURE
+        # 3. Inside or tightly attached outside a vector drawing / table box -> classify as FIGURE
+        is_small_drawing_label = (
+            not _CAPTION_RE.match(stripped)
+            and len(stripped) <= 32
+            and line_count <= 2
+            and avg_font_size <= min(body_font_size - 1.4, body_font_size * 0.86)
+        )
         for d_box in drawing_boxes:
-            if bbox_intersection_ratio(bbox, d_box) >= 0.65:
-                if not _CAPTION_RE.match(stripped):
-                    return (
-                        BlockKind.FIGURE,
-                        "figure",
-                        "自動：図表内部テキスト",
-                        "RULE_FIGURE_INTERNAL_TEXT",
-                        "high",
-                        False,
-                        in_references_section,
-                    )
+            inside_drawing = bbox_intersection_ratio(bbox, d_box) >= 0.65
+            near_drawing_label = False
+            if is_small_drawing_label and not inside_drawing:
+                gap_x = max(0.0, d_box[0] - bbox[2], bbox[0] - d_box[2])
+                gap_y = max(0.0, d_box[1] - bbox[3], bbox[1] - d_box[3])
+                near_drawing_label = (gap_x == 0.0 and gap_y <= 5.0) or (
+                    gap_y == 0.0 and gap_x <= 5.0
+                )
+            if (inside_drawing and not _CAPTION_RE.match(stripped)) or near_drawing_label:
+                return (
+                    BlockKind.FIGURE,
+                    "figure",
+                    "自動：図表内部テキスト",
+                    "RULE_FIGURE_INTERNAL_TEXT",
+                    "high",
+                    False,
+                    in_references_section,
+                )
 
         # 4. Caption check
         if _CAPTION_RE.match(stripped):
@@ -2239,12 +3060,52 @@ class NativePreservingAdapter(PdfEngineAdapter):
             in_references_section,
         )
 
+    @staticmethod
+    def _manual_region_suppressed_by_split_formula(
+        *,
+        part_role: BlockSplitRole | None,
+        part_bbox: list[float],
+        reg: ProtectionRegion,
+        sibling_formula_bbox: list[float] | None,
+    ) -> bool:
+        """Avoid letting a formula-targeted manual ProtectionRegion re-protect split prose."""
+        if (
+            part_role not in ("top", "bottom")
+            or sibling_formula_bbox is None
+            or reg.mode
+            not in (
+                ProtectionMode.DO_NOT_TRANSLATE,
+                ProtectionMode.PROTECT_AS_FORMULA,
+                ProtectionMode.PROTECT_AS_FIGURE,
+            )
+        ):
+            return False
+        formula_cov = bbox_intersection_ratio(sibling_formula_bbox, reg.bbox)
+        if formula_cov < 0.50:
+            return False
+        return bbox_intersection_ratio(part_bbox, reg.bbox) < 0.85
+
     def _apply_protection_and_masking(
         self,
         block: Block,
         page_manual_regions: list[ProtectionRegion],
         cfg: TranslationJobConfig,
+        sibling_formula_bbox: list[float] | None = None,
     ) -> None:
+        # -1. Split formula child blocks stay strictly protected regardless of force_translate or TRANSLATE_AS_BODY
+        if block.split_role == "formula":
+            block.kind = BlockKind.ISOLATED_FORMULA
+            block.semantic_category = "formula"
+            block.status = BlockStatus.PROTECTED_SKIP
+            block.protection_source = "manual"
+            block.protection_reason = "手動分割：独立数式として原文保護"
+            block.protection_rule_id = "RULE_MANUAL_DRAG_SPLIT_FORMULA"
+            block.protection_confidence = "high"
+            block.masked_source_text = block.source_text
+            block.translation_provenance = "protected_skip"
+            block.user_protection_override = None
+            return
+
         # 0. Explicit block-level user override (`force_translate` or `force_protect`) takes top precedence
         if block.user_protection_override == "force_protect":
             block.status = BlockStatus.PROTECTED_SKIP
@@ -2262,6 +3123,13 @@ class NativePreservingAdapter(PdfEngineAdapter):
         # 1. Check if a manual protection region rectangle overrides this block (Stage 6)
         if not manual_override_translate:
             for reg in page_manual_regions:
+                if self._manual_region_suppressed_by_split_formula(
+                    part_role=block.split_role,
+                    part_bbox=block.bbox,
+                    reg=reg,
+                    sibling_formula_bbox=sibling_formula_bbox,
+                ):
+                    continue
                 overlap = bbox_intersection_ratio(block.bbox, reg.bbox)
                 iou = bbox_iou(block.bbox, reg.bbox)
                 if overlap >= 0.35 or iou >= 0.25:
@@ -2369,7 +3237,10 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 return
 
         # 3. Stage 7: Inline formula, symbol, URL/DOI, and equation-ref masking (`{v1}`, `{v2}`, ...)
-        masked, items = mask_inline_protected_elements(block.source_text)
+        masked, items = mask_inline_protected_elements(
+            block.source_text,
+            inline_math_spans=block.inline_math_spans,
+        )
         block.masked_source_text = masked
         block.protected_items = items
         block.status = BlockStatus.PENDING
@@ -2625,6 +3496,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 for blk in page_blocks:
                     if blk.status not in (BlockStatus.TRANSLATED, BlockStatus.MANUALLY_EDITED):
                         continue
+                    blk.warnings = [w for w in blk.warnings if w not in TYPESETTING_ISSUE_CODES]
                     effective_txt = blk.effective_translation
                     if not effective_txt:
                         continue
@@ -2711,40 +3583,86 @@ class NativePreservingAdapter(PdfEngineAdapter):
                                 effective_txt,
                             )
                         )
-                        norm_orig_trans = normalize_for_pdf_rendering(blk.translation_text or "")
                         active_math_spans = [
                             ms
                             for ms in blk.inline_math_spans
-                            if (
-                                any(ms.context_text in orig_t for orig_t in kept_orig_texts)
-                                and ms.context_text not in stripped_manual
-                            )
-                            or (
-                                not any(ms.context_text in orig_t for orig_t in all_prot_texts)
-                                and bool(norm_orig_trans)
-                                and ms.context_text in norm_orig_trans
+                            if ms.context_text in render_ready_text
+                            and (
+                                (
+                                    any(ms.context_text in orig_t for orig_t in kept_orig_texts)
+                                    and ms.context_text not in stripped_manual
+                                )
+                                or (
+                                    not any(ms.context_text in orig_t for orig_t in all_prot_texts)
+                                    and ms.context_text in stripped_manual
+                                )
                             )
                         ]
                     else:
-                        active_math_spans = list(blk.inline_math_spans)
+                        active_math_spans = [
+                            ms
+                            for ms in blk.inline_math_spans
+                            if ms.context_text in render_ready_text
+                        ]
 
                     # Pre-redaction check 3: Refuse to flatten conflicting super/sub/normal math roles
                     ambiguous_ctxs = sorted(
-                        {ms.context_text for ms in active_math_spans if ms.ambiguous}
+                        {
+                            ms.context_text
+                            for ms in active_math_spans
+                            if ms.ambiguous and ms.context_text in render_ready_text
+                        }
                     )
                     if ambiguous_ctxs:
-                        _record_fallback(
-                            blk,
-                            "AMBIGUOUS_INLINE_MATH_FALLBACK",
-                            (
-                                f"同一ブロック内で上付き・下付き・通常表記が競合する数式表現（{ambiguous_ctxs}）があり、"
-                                "意味を損なわず安全に組版できないため原文要素を保持しました。"
-                            ),
-                            {"ambiguous_contexts": ambiguous_ctxs},
-                        )
-                        continue
+                        if blk.status == BlockStatus.MANUALLY_EDITED:
+                            amb_set = set(ambiguous_ctxs)
+                            active_math_spans = [
+                                ms for ms in active_math_spans if ms.context_text not in amb_set
+                            ]
+                        else:
+                            _record_fallback(
+                                blk,
+                                "AMBIGUOUS_INLINE_MATH_FALLBACK",
+                                (
+                                    f"同一ブロック内で上付き・下付き・通常表記が競合する数式表現（{ambiguous_ctxs}）があり、"
+                                    "意味を損なわず安全に組版できないため原文要素を保持しました。"
+                                ),
+                                {"ambiguous_contexts": ambiguous_ctxs},
+                            )
+                            continue
 
-                    # Fit Japanese lines within bbox respecting min_font_size_pt (Section 12)
+                    # Pre-redaction check 3b: Refuse to flatten depth >= 3 or unrepresentable nested math
+                    unrep_ctxs = sorted(
+                        {
+                            ms.context_text
+                            for ms in active_math_spans
+                            if ms.unrepresentable_reason and ms.context_text in render_ready_text
+                        }
+                    )
+                    if unrep_ctxs:
+                        if blk.status == BlockStatus.MANUALLY_EDITED:
+                            unrep_set = set(unrep_ctxs)
+                            active_math_spans = [
+                                ms for ms in active_math_spans if ms.context_text not in unrep_set
+                            ]
+                        else:
+                            _record_fallback(
+                                blk,
+                                "UNREPRESENTABLE_DEEP_NESTED_MATH_FALLBACK",
+                                (
+                                    f"安全に表現できない多重ネスト添字（{unrep_ctxs}）を含むため、"
+                                    "階層構造を潰さず原文要素を保持しました（要手動確認）。"
+                                ),
+                                {"unrepresentable_contexts": unrep_ctxs},
+                            )
+                            continue
+
+                    # Fit Japanese lines within bbox respecting min_font_size_pt (Section 12).
+                    # For split siblings adjacent to a protected formula seam, shift line 1 baseline
+                    # down slightly (accounting for CJK ascender ~1.14em) and tighten vertical slack
+                    # so rendered glyph boxes never protrude across the seam into protected math.
+                    first_baseline_em = 1.20 if blk.split_role == "bottom" else 0.95
+                    vertical_slack_em = 0.15 if blk.split_role == "top" else 0.45
                     fitted_size, wrapped_lines, fits = fit_japanese_text_in_bbox(
                         text=render_ready_text,
                         bbox=blk.bbox,
@@ -2753,6 +3671,8 @@ class NativePreservingAdapter(PdfEngineAdapter):
                         ja_font=ja_font_obj,
                         math_font=math_font_obj,
                         inline_math_spans=active_math_spans,
+                        first_baseline_em=first_baseline_em,
+                        vertical_slack_em=vertical_slack_em,
                     )
                     if not fits:
                         # Section 12: Never shrink below min_font_size_pt, never delete text,
@@ -2768,6 +3688,39 @@ class NativePreservingAdapter(PdfEngineAdapter):
                                 "min_font_size_pt": job_config.min_font_size_pt,
                                 "restored_text": restored_text,
                             },
+                        )
+                        continue
+
+                    compact_render = re.sub(r"\s+", "", render_ready_text)
+                    broken_nested_ctxs = sorted(
+                        {
+                            ms.context_text
+                            for ms in blk.inline_math_spans
+                            if not ms.ambiguous
+                            and any(sr.level >= 2 for sr in ms.sub_runs)
+                            and (
+                                ms.context_text in render_ready_text
+                                or (
+                                    len(re.sub(r"\s+", "", normalize_for_pdf_rendering(ms.context_text))) >= 4
+                                    and ms.context_text in blk.source_text
+                                    and re.sub(r"\s+", "", normalize_for_pdf_rendering(ms.context_text)) in compact_render
+                                )
+                            )
+                            and not any(
+                                normalize_for_pdf_rendering(ms.context_text) in wline
+                                for wline in wrapped_lines
+                            )
+                        }
+                    )
+                    if broken_nested_ctxs:
+                        _record_fallback(
+                            blk,
+                            "INLINE_MATH_HIERARCHY_FALLBACK",
+                            (
+                                f"ネスト添字を含む数式表現（{broken_nested_ctxs}）が折り返し行境界で分断され、"
+                                "階層構造を保持して組版できないため原文要素を保持しました。"
+                            ),
+                            {"broken_nested_contexts": broken_nested_ctxs},
                         )
                         continue
 
@@ -2882,7 +3835,8 @@ class NativePreservingAdapter(PdfEngineAdapter):
 
                     for blk, fitted_size, wrapped_lines, active_math_spans in approved_typeset_items:
                         line_height = fitted_size * 1.32
-                        cursor_y = blk.bbox[1] + fitted_size * 0.95
+                        first_baseline_em = 1.20 if blk.split_role == "bottom" else 0.95
+                        cursor_y = blk.bbox[1] + fitted_size * first_baseline_em
                         base_x = float(blk.bbox[0])
                         for line_str in wrapped_lines:
                             styled_runs, overbars, _, _, _ = _build_styled_line_plan(
@@ -2917,6 +3871,11 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 out_doc,
                 target_font_tags=("F_JA", "F_MATH"),
                 protected_tounicode_xrefs=orig_tounicode_xrefs,
+            )
+            _preserve_page_transparency_groups(
+                src_doc,
+                out_doc,
+                [(i, i) for i in range(min(len(src_doc), len(out_doc)))],
             )
 
             if mono_output_path:
@@ -2966,9 +3925,12 @@ class NativePreservingAdapter(PdfEngineAdapter):
         src = pymupdf.open(str(original_path))
         dst = pymupdf.open()
         try:
+            page_pairs: list[tuple[int, int]] = []
             for idx in page_indices:
                 if 0 <= idx < len(src):
                     dst.insert_pdf(src, from_page=idx, to_page=idx)
+                    page_pairs.append((idx, len(dst) - 1))
+            _preserve_page_transparency_groups(src, dst, page_pairs)
             dst.save(str(temp_path), garbage=1, deflate=True)
         finally:
             dst.close()
@@ -2992,6 +3954,8 @@ class NativePreservingAdapter(PdfEngineAdapter):
         dual_doc = pymupdf.open()
 
         try:
+            orig_group_pairs: list[tuple[int, int]] = []
+            trans_group_pairs: list[tuple[int, int]] = []
             for out_idx, p_idx in enumerate(page_indices):
                 if p_idx < 0 or p_idx >= len(orig_doc):
                     continue
@@ -3001,11 +3965,16 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 h = float(orig_page.rect.height)
 
                 new_page = dual_doc.new_page(width=w * 2.0, height=h)
+                dual_page_idx = len(dual_doc) - 1
                 left_rect = pymupdf.Rect(0, 0, w, h)
                 right_rect = pymupdf.Rect(w, 0, w * 2.0, h)
                 new_page.show_pdf_page(left_rect, orig_doc, p_idx)
+                orig_group_pairs.append((p_idx, dual_page_idx))
                 if 0 <= trans_page_idx < len(trans_doc):
                     new_page.show_pdf_page(right_rect, trans_doc, trans_page_idx)
+                    trans_group_pairs.append((trans_page_idx, dual_page_idx))
+            _preserve_page_transparency_groups(orig_doc, dual_doc, orig_group_pairs)
+            _preserve_page_transparency_groups(trans_doc, dual_doc, trans_group_pairs)
             dual_doc.save(str(temp_dual), garbage=2, deflate=True)
         finally:
             dual_doc.close()
@@ -3086,6 +4055,8 @@ TYPESETTING_ISSUE_CODES: frozenset[str] = frozenset(
         "UNRESOLVED_PLACEHOLDER_FALLBACK",
         "UNRENDERABLE_GLYPH_FALLBACK",
         "AMBIGUOUS_INLINE_MATH_FALLBACK",
+        "UNREPRESENTABLE_DEEP_NESTED_MATH_FALLBACK",
+        "INLINE_MATH_HIERARCHY_FALLBACK",
         "TYPESETTING_OVERFLOW_FALLBACK",
         "PROTECTED_REGION_OVERLAP_FALLBACK",
     }
@@ -3095,7 +4066,34 @@ TYPESETTING_ISSUE_CODES: frozenset[str] = frozenset(
 # ----------------------------------------------------------------------
 # Helper functions for Inline Formula Masking & Kinsoku Japanese Fitting
 # ----------------------------------------------------------------------
-def mask_inline_protected_elements(text: str) -> tuple[str, list[ProtectedItem]]:
+def _map_orig_chars_to_working(
+    working_str: str,
+    orig_text: str,
+    items_list: list[tuple[ProtectedItemKind, str]],
+    sentinel_base_cp: int,
+) -> dict[int, int] | None:
+    """Map unmasked original character offsets in `orig_text` to current indices in `working_str`."""
+    orig_to_work: dict[int, int] = {}
+    orig_pos = 0
+    item_count = len(items_list)
+    for work_pos, ch in enumerate(working_str):
+        code = ord(ch) - sentinel_base_cp
+        if 0 <= code < item_count:
+            orig_pos += len(items_list[code][1])
+        else:
+            if orig_pos >= len(orig_text) or orig_text[orig_pos] != ch:
+                return None
+            orig_to_work[orig_pos] = work_pos
+            orig_pos += 1
+    if orig_pos != len(orig_text):
+        return None
+    return orig_to_work
+
+
+def mask_inline_protected_elements(
+    text: str,
+    inline_math_spans: list[InlineMathSpan] | None = None,
+) -> tuple[str, list[ProtectedItem]]:
     """Detect inline formulas, Greek/math symbols, sub/superscripts, and URLs/DOIs,
     replacing them with `{v1}`, `{v2}`, ... while leaving `[1]` citation brackets visible
     (or protected) for validation. Also safely protects any pre-existing literal `{vN}`
@@ -3158,6 +4156,81 @@ def mask_inline_protected_elements(text: str) -> tuple[str, list[ProtectedItem]]
     working = _INLINE_MATH_EXPR_RE.sub(
         lambda m: _replace(m, ProtectedItemKind.INLINE_FORMULA), working
     )
+    if inline_math_spans:
+        hat_prefixes = {
+            ms.context_text[1:]
+            for ms in inline_math_spans
+            if ms.role == "hat" and ms.context_text.startswith("ˆ") and len(ms.context_text) > 1
+        }
+        compound_candidates: list[str] = []
+        seen_cand: set[str] = set()
+        occ_by_ctx: dict[str, set[int]] = {}
+        for ms in inline_math_spans:
+            if ms.role not in ("super", "sub") or ms.ambiguous:
+                continue
+            ctx = ms.context_text.strip()
+            tgt = ms.target_text.strip()
+            if not ctx or not tgt:
+                continue
+            if any(ch in tgt for ch in ",+-−*/."):
+                if ctx[0] in hat_prefixes:
+                    hat_ctx = f"ˆ{ctx}"
+                    if hat_ctx not in seen_cand:
+                        seen_cand.add(hat_ctx)
+                        compound_candidates.append(hat_ctx)
+                if ctx not in seen_cand:
+                    seen_cand.add(ctx)
+                    compound_candidates.append(ctx)
+            elif ms.mask_occurrence_indices:
+                occ_by_ctx.setdefault(ctx, set()).update(
+                    idx for idx in ms.mask_occurrence_indices if idx >= 0
+                )
+        compound_candidates.sort(key=len, reverse=True)
+        for cand in compound_candidates:
+            if sentinel_re.search(cand):
+                continue
+            cand_re = _build_math_span_boundary_regex(cand)
+            working = cand_re.sub(
+                lambda m: _alloc_sentinel(ProtectedItemKind.INLINE_FORMULA, m.group(0)),
+                working,
+            )
+        if occ_by_ctx:
+            for cand in sorted(occ_by_ctx, key=len, reverse=True):
+                if sentinel_re.search(cand):
+                    continue
+                occ_set = occ_by_ctx[cand]
+                if not occ_set:
+                    continue
+                orig_to_work = _map_orig_chars_to_working(
+                    working, text, pending_items, base_cp
+                )
+                if orig_to_work is None:
+                    continue
+                cand_re = _build_math_span_boundary_regex(cand)
+                replacements: list[tuple[int, int, str]] = []
+                for occ_idx, m in enumerate(cand_re.finditer(text)):
+                    if occ_idx not in occ_set:
+                        continue
+                    m_start, m_end = m.start(), m.end()
+                    if (
+                        m_start > 0
+                        and cand[0] in hat_prefixes
+                        and text[m_start - 1] == "ˆ"
+                        and (m_start - 1) in orig_to_work
+                    ):
+                        m_start -= 1
+                    if not all(pos in orig_to_work for pos in range(m_start, m_end)):
+                        continue
+                    w_start = orig_to_work[m_start]
+                    w_end = orig_to_work[m_end - 1] + 1
+                    if w_end - w_start != m_end - m_start:
+                        continue
+                    replacements.append((w_start, w_end, text[m_start:m_end]))
+                for w_start, w_end, orig_slice in reversed(replacements):
+                    sentinel = _alloc_sentinel(
+                        ProtectedItemKind.INLINE_FORMULA, orig_slice
+                    )
+                    working = working[:w_start] + sentinel + working[w_end:]
 
     items: list[ProtectedItem] = []
     counter = 0
@@ -3337,6 +4410,8 @@ def fit_japanese_text_in_bbox(
     ja_font: pymupdf.Font | None = None,
     math_font: pymupdf.Font | None = None,
     inline_math_spans: list[InlineMathSpan] | None = None,
+    first_baseline_em: float = 0.95,
+    vertical_slack_em: float = 0.45,
 ) -> tuple[float, list[str], bool]:
     """Find the largest font size in `[min_font_size, initial_font_size]` (step 0.5pt)
     such that the wrapped text (including any superscript/hat/radical top ascent,
@@ -3383,8 +4458,8 @@ def fit_japanese_text_in_bbox(
             )
             if last_bot_em > 0.25:
                 extra_bottom = (last_bot_em - 0.22) * sz
-        required_h = len(lines) * line_h + extra_bottom
-        vertical_fits = required_h <= box_h + sz * 0.45
+        required_h = max(0.0, first_baseline_em - 0.95) * sz + len(lines) * line_h + extra_bottom
+        vertical_fits = required_h <= box_h + sz * vertical_slack_em
         horizontal_fits = all(
             _measure_rendered_line_width(
                 line_str=line,

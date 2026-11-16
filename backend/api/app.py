@@ -32,6 +32,8 @@ from backend.config import AppConfig
 from backend.diagnostics import collect_system_diagnostics
 from backend.domain.models import (
     Block,
+    BlockSplitPreviewResult,
+    BlockSplitSpec,
     Document,
     ExportArtifact,
     Glossary,
@@ -59,6 +61,30 @@ class CreateProtectionRegionRequest(BaseModel):
     bbox: list[float]
     mode: ProtectionMode
     note: str | None = None
+
+
+class BlockSplitPreviewRequest(BaseModel):
+    page_index: int
+    requested_bbox: list[float]
+    include_equation_number: bool = True
+
+
+class CreateBlockSplitRequest(BaseModel):
+    page_index: int
+    requested_bbox: list[float]
+    include_equation_number: bool = True
+    note: str | None = None
+    expected_protection_revision: int | None = None
+    expected_parse_revision: int | None = None
+    expected_parent_signature: str | None = None
+
+
+class BlockSplitMutationResponse(BaseModel):
+    split: BlockSplitSpec | None = None
+    deleted: bool = False
+    document: Document
+    blocks: list[Block]
+    splits: list[BlockSplitSpec]
 
 
 class ManualEditBlockRequest(BaseModel):
@@ -351,6 +377,10 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            if "JobConflict" in str(exc):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise
 
     @app.get("/api/documents/{document_id}/blocks", response_model=list[Block])
     async def list_document_blocks(
@@ -370,6 +400,10 @@ def create_app(
                     )
                 except KeyError as exc:
                     raise HTTPException(status_code=404, detail=str(exc)) from exc
+                except RuntimeError as exc:
+                    if "JobConflict" in str(exc):
+                        raise HTTPException(status_code=409, detail=str(exc)) from exc
+                    raise
                 blocks = mgr.db.list_blocks(document_id, page_index=page_index)
         return blocks
 
@@ -383,22 +417,22 @@ def create_app(
         _sec: None = Depends(verify_security_headers),
     ) -> ProtectionRegion:
         _validate_safe_id(document_id, "document_id")
-        doc = mgr.db.get_document(document_id)
-        if not doc:
-            raise HTTPException(status_code=404, detail="Document not found")
-        if req.page_index < 0 or req.page_index >= max(1, doc.page_count):
-            raise HTTPException(status_code=400, detail="page_index out of bounds")
-        region = ProtectionRegion(
-            id=f"reg-{uuid.uuid4().hex[:10]}",
-            document_id=document_id,
-            page_index=req.page_index,
-            bbox=req.bbox,
-            mode=req.mode,
-            source="manual",
-            note=req.note,
-        )
-        mgr.db.save_protection_region(region)
-        return region
+        try:
+            return mgr.add_protection_region(
+                document_id,
+                page_index=req.page_index,
+                bbox=req.bbox,
+                mode=req.mode,
+                note=req.note,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            if "JobConflict" in str(exc):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise
 
     @app.get(
         "/api/documents/{document_id}/protection-regions",
@@ -420,10 +454,135 @@ def create_app(
     ) -> dict[str, bool]:
         _validate_safe_id(document_id, "document_id")
         _validate_safe_id(region_id, "region_id")
-        deleted = mgr.db.delete_protection_region(document_id, region_id)
+        try:
+            deleted = mgr.remove_protection_region(document_id, region_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            if "JobConflict" in str(exc):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise
         if not deleted:
             raise HTTPException(status_code=404, detail="Protection region not found")
         return {"deleted": True}
+
+    @app.get(
+        "/api/documents/{document_id}/block-splits",
+        response_model=list[BlockSplitSpec],
+    )
+    def list_block_splits_endpoint(
+        document_id: str,
+        page_index: int | None = None,
+        _sec: None = Depends(verify_security_headers),
+    ) -> list[BlockSplitSpec]:
+        _validate_safe_id(document_id, "document_id")
+        if not mgr.db.get_document(document_id):
+            raise HTTPException(status_code=404, detail="Document not found")
+        return mgr.db.list_block_splits(document_id, page_index=page_index)
+
+    @app.post(
+        "/api/documents/{document_id}/block-splits/preview",
+        response_model=BlockSplitPreviewResult,
+    )
+    async def preview_block_split_endpoint(
+        document_id: str,
+        req: BlockSplitPreviewRequest,
+        _sec: None = Depends(verify_security_headers),
+    ) -> BlockSplitPreviewResult:
+        _validate_safe_id(document_id, "document_id")
+        try:
+            return await anyio.to_thread.run_sync(
+                lambda: mgr.preview_block_split(
+                    document_id,
+                    page_index=req.page_index,
+                    requested_bbox=req.requested_bbox,
+                    include_equation_number=req.include_equation_number,
+                )
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post(
+        "/api/documents/{document_id}/block-splits",
+        response_model=BlockSplitMutationResponse,
+    )
+    async def create_block_split_endpoint(
+        document_id: str,
+        req: CreateBlockSplitRequest,
+        _sec: None = Depends(verify_security_headers),
+    ) -> BlockSplitMutationResponse:
+        _validate_safe_id(document_id, "document_id")
+        try:
+            res = await anyio.to_thread.run_sync(
+                lambda: mgr.create_block_split(
+                    document_id,
+                    page_index=req.page_index,
+                    requested_bbox=req.requested_bbox,
+                    include_equation_number=req.include_equation_number,
+                    note=req.note,
+                    expected_protection_revision=req.expected_protection_revision,
+                    expected_parse_revision=req.expected_parse_revision,
+                    expected_parent_signature=req.expected_parent_signature,
+                )
+            )
+            return BlockSplitMutationResponse(
+                split=res["split"],
+                deleted=False,
+                document=res["document"],
+                blocks=res["blocks"],
+                splits=res["splits"],
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            msg = str(exc)
+            if "RevisionConflict" in msg:
+                raise HTTPException(status_code=409, detail=msg) from exc
+            if "InvalidSplitSelection" in msg:
+                raise HTTPException(status_code=422, detail=msg) from exc
+            raise HTTPException(status_code=400, detail=msg) from exc
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "JobConflict" in msg:
+                raise HTTPException(status_code=409, detail=msg) from exc
+            raise HTTPException(status_code=500, detail=msg) from exc
+
+    @app.delete(
+        "/api/documents/{document_id}/block-splits/{split_id}",
+        response_model=BlockSplitMutationResponse,
+    )
+    async def delete_block_split_endpoint(
+        document_id: str,
+        split_id: str,
+        _sec: None = Depends(verify_security_headers),
+    ) -> BlockSplitMutationResponse:
+        _validate_safe_id(document_id, "document_id")
+        _validate_safe_id(split_id, "split_id")
+        try:
+            res = await anyio.to_thread.run_sync(
+                lambda: mgr.delete_block_split(document_id, split_id)
+            )
+            return BlockSplitMutationResponse(
+                split=None,
+                deleted=True,
+                document=res["document"],
+                blocks=res["blocks"],
+                splits=res["splits"],
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            msg = str(exc)
+            if "RevisionConflict" in msg:
+                raise HTTPException(status_code=409, detail=msg) from exc
+            raise HTTPException(status_code=400, detail=msg) from exc
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "JobConflict" in msg:
+                raise HTTPException(status_code=409, detail=msg) from exc
+            raise HTTPException(status_code=500, detail=msg) from exc
 
     @app.put(
         "/api/documents/{document_id}/blocks/{block_id}/manual-edit",
@@ -437,7 +596,7 @@ def create_app(
     ) -> Block:
         _validate_safe_id(document_id, "document_id")
         try:
-            return mgr.db.update_block_manual_translation(
+            return mgr.manual_edit_block(
                 document_id,
                 block_id,
                 req.manual_translation_text,
@@ -449,6 +608,10 @@ def create_app(
             if "RevisionConflict" in str(exc):
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            if "JobConflict" in str(exc):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise
 
     # --- Auto Protection Endpoints ---
     @app.put(
@@ -468,6 +631,10 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            if "JobConflict" in str(exc):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise
 
     @app.post("/api/documents/{document_id}/reapply-auto-protection")
     def reapply_auto_protection_endpoint(
@@ -486,6 +653,10 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            if "JobConflict" in str(exc):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise
 
     # --- Glossary Endpoints ---
     @app.get("/api/glossaries", response_model=list[Glossary])
@@ -559,11 +730,21 @@ def create_app(
                 from backend.pdf.coordinates import parse_page_range_spec
 
                 parse_page_range_spec(job_config.page_range_spec, doc.page_count)
+            if mgr.has_active_document_operation(document_id):
+                raise RuntimeError(
+                    f"JobConflict: Document '{document_id}' already has an active operation."
+                )
             job = mgr.create_job(document_id, job_config=job_config)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
+            if "PendingSplitsConflict" in str(exc):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            if "JobConflict" in str(exc):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            raise
 
         if background:
             threading.Thread(target=mgr.run_job, args=(job.id,), daemon=True).start()
@@ -670,8 +851,11 @@ def create_app(
         job = mgr.db.get_job(job_id)
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
-        if mgr.is_job_active(job_id):
-            raise HTTPException(status_code=409, detail=f"Job '{job_id}' is already running.")
+        if mgr.is_job_active(job_id) or mgr.has_active_document_operation(job.document_id):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Document '{job.document_id}' / Job '{job_id}' is already running.",
+            )
 
         if background:
             threading.Thread(
