@@ -574,6 +574,9 @@ describe("Full Application E2E Workflow (Screen 1 -> Screen 2 -> Screen 3 -> Scr
     await waitFor(() => {
       expect(screen.getByTestId("preflight-result-card")).toBeInTheDocument();
     });
+    const modeSelect = screen.getByTestId("inference-mode-select");
+    expect(modeSelect).toHaveTextContent("@ 127.0.0.1:8089");
+    expect(modeSelect).not.toHaveTextContent("127.0.0.1:8000");
 
     // 2. Navigate to Screen 2 (Protection Editor) and wait for initial sync
     fireEvent.click(screen.getByTestId("open-screen2-btn"));

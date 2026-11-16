@@ -800,8 +800,9 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
                       {diagnostics.llama_connection_status === "server_unreachable"
                         ? "推論エンドポイントへ接続できません（サーバー未起動のほか、ポート・URL設定の差異や接続制限により接続できない可能性があります）。"
                         : "現在の推論エンドポイント接続状態はまだ確認されていません。"}{" "}
-                      実機翻訳を行う場合は、選択中の翻訳モデルを指定した <code>llama-server</code>（既定{" "}
-                      <code>127.0.0.1:8000</code>
+                      実機翻訳を行う場合は、選択中の翻訳モデルを指定した{" "}
+                      <code>llama-server</code>（接続先設定:{" "}
+                      <code>{diagnostics.llama_server_url}</code>
                       ）へ接続できる状態にしたうえで、上部の「🔌 推論サーバ疎通確認 (probe_llama=true)」を押してください（疎通確認は{" "}
                       <code>GET /v1/models</code>{" "}
                       の軽量確認のみを行い、翻訳リクエストは送信しません）。モデル未導入で画面遷移のみ試す場合は画面1で「モック推論」を選択できますが、モックは決定論的な疑似翻訳であり実翻訳ではありません。

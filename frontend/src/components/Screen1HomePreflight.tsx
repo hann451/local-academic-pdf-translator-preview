@@ -25,6 +25,7 @@ export interface Screen1Props {
   currentDocument: Document | null;
   jobConfig: TranslationJobConfig;
   glossaries: Glossary[];
+  llamaServerUrl?: string | null;
   modelsOverview?: ModelsOverviewResponse | null;
   activeModelDownload?: ModelDownloadJob | null;
   isLoadingModels?: boolean;
@@ -53,10 +54,21 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
+export function formatLlamaEndpointDisplay(llamaServerUrl?: string | null): string | null {
+  const raw = (llamaServerUrl || "").trim().replace(/\/+$/, "");
+  if (!raw) return null;
+  const httpMatch = raw.match(/^http:\/\/([^/]+)(?:\/v1)?$/i);
+  if (httpMatch) {
+    return httpMatch[1];
+  }
+  return raw.replace(/\/v1$/i, "");
+}
+
 export const Screen1HomePreflight: React.FC<Screen1Props> = ({
   currentDocument,
   jobConfig,
   glossaries,
+  llamaServerUrl = null,
   modelsOverview = null,
   activeModelDownload = null,
   isLoadingModels = false,
@@ -81,6 +93,7 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const [lastSelectedFile, setLastSelectedFile] = useState<File | null>(null);
+  const endpointDisplay = formatLlamaEndpointDisplay(llamaServerUrl);
   const [showModelDrawer, setShowModelDrawer] = useState<boolean>(false);
   const [quickSwitchError, setQuickSwitchError] = useState<string | null>(null);
   const [isQuickSwitching, setIsQuickSwitching] = useState<boolean>(false);
@@ -782,7 +795,7 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
                       {activeModel
                         ? `${activeModel.display_name} ${activeModel.quantization}`
                         : "PLaMo 3 Translate 2B Q4_K_M"}{" "}
-                      @ 127.0.0.1:8000）
+                      {endpointDisplay ? `@ ${endpointDisplay}` : "/ 設定済みllama-server"}）
                     </option>
                     <option value="mock">
                       モック推論（UI・パイプライン検証用の決定論的疑似翻訳）
@@ -805,7 +818,14 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
                       style={{ marginTop: "8px", fontSize: "12px", color: "#334155" }}
                     >
                       実機翻訳には、本アプリとは別ターミナルで推論サーバ（選択中の翻訳モデルを指定した{" "}
-                      <code>llama-server</code>、既定 <code>127.0.0.1:8000</code>
+                      <code>llama-server</code>、
+                      {endpointDisplay ? (
+                        <>
+                          接続先設定: <code>{endpointDisplay}</code>
+                        </>
+                      ) : (
+                        "設定済み接続先"
+                      )}
                       ）が応答し、接続できる状態である必要があります。接続できない場合（未起動のほか、ポート・URL設定差異や接続制限の可能性があります）や別モデルが応答する場合は、開始時エラーまたは中断となります。事前確認は画面4の「推論サーバ疎通確認」（翻訳リクエストは送信しません）で行えます。モデル未導入で画面動作のみ確認する場合は「モック推論」（実翻訳ではありません）を選択してください。
                     </div>
                   )}

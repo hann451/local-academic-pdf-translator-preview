@@ -979,6 +979,7 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
             currentDocument={currentDocument}
             jobConfig={jobConfig}
             glossaries={glossaries}
+            llamaServerUrl={diagnostics?.llama_server_url ?? null}
             modelsOverview={modelsOverview}
             activeModelDownload={activeModelDownload}
             isLoadingModels={isLoadingModels}

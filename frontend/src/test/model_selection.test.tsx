@@ -1129,4 +1129,119 @@ describe("Model Selection, Download, Local Registry & Consistency UI", () => {
     expect(screen.getByTestId("screen1-model-card")).toHaveTextContent("過去の検証実績");
     expect(screen.getByTestId("screen1-current-server-status")).toHaveTextContent("未確認");
   });
+
+  it("displays Screen 1 real inference endpoint from llamaServerUrl (:8000, :8001, and fallback when unloaded)", () => {
+    const reg08b = makeRegistered({
+      registration_id: "reg-08b",
+      catalog_model_id: "plamo-3-translate-0.8b-q4_k_m",
+      display_name: "PLaMo 3 Translate 0.8B (Q4_K_M)",
+      short_name: "PLaMo 3 Translate 0.8B",
+      parameter_size: "0.8B",
+    });
+    const overview08b: ModelsOverviewResponse = {
+      catalog: makeCatalog(),
+      unsupported_policies: {},
+      registered: [reg08b],
+      active_model_id: reg08b.registration_id,
+      active_model: reg08b,
+      has_active_translation_job: false,
+      managed_models_dir: "C:\\runtime\\models",
+      downloads: [],
+      server_match: null,
+    };
+    const cfg: TranslationJobConfig = {
+      page_range_spec: null,
+      source_lang: "en",
+      target_lang: "ja",
+      form: "plain",
+      model_name: "plamo-3-translate-0.8b-Q4_K_M",
+      model_id: "plamo-3-translate-0.8b-q4_k_m",
+      quantization: "Q4_K_M",
+      context_length: 8192,
+      translate_captions: true,
+      translate_tables: false,
+      translate_references: false,
+      translate_figures: false,
+      min_font_size_pt: 8,
+      glossary_id: null,
+      output_mono_pdf: true,
+      output_dual_pdf: true,
+      only_roundtrip_preservation: false,
+      pause_for_review: false,
+      use_mock_translator: false,
+    };
+
+    const { rerender } = render(
+      <Screen1HomePreflight
+        currentDocument={null}
+        jobConfig={cfg}
+        glossaries={[]}
+        llamaServerUrl={null}
+        modelsOverview={overview08b}
+        isUploading={false}
+        uploadError={null}
+        isStartingJob={false}
+        jobStartError={null}
+        onUploadFile={vi.fn()}
+        onUpdateJobConfig={vi.fn()}
+        onOpenProtectionScreen={vi.fn()}
+        onStartTranslationJob={vi.fn()}
+      />
+    );
+    const select = screen.getByTestId("inference-mode-select");
+    const realOpt = Array.from(select.querySelectorAll("option")).find((o) => o.value === "real");
+    expect(realOpt?.textContent).toContain("設定済みllama-server");
+    expect(realOpt?.textContent).not.toContain("127.0.0.1:8000");
+    expect(screen.getByTestId("real-inference-prerequisite-note")).not.toHaveTextContent(
+      "127.0.0.1:8000"
+    );
+
+    rerender(
+      <Screen1HomePreflight
+        currentDocument={null}
+        jobConfig={cfg}
+        glossaries={[]}
+        llamaServerUrl="http://127.0.0.1:8000/v1"
+        modelsOverview={overview08b}
+        isUploading={false}
+        uploadError={null}
+        isStartingJob={false}
+        jobStartError={null}
+        onUploadFile={vi.fn()}
+        onUpdateJobConfig={vi.fn()}
+        onOpenProtectionScreen={vi.fn()}
+        onStartTranslationJob={vi.fn()}
+      />
+    );
+    expect(realOpt?.textContent).toContain("@ 127.0.0.1:8000");
+    expect(screen.getByTestId("real-inference-prerequisite-note")).toHaveTextContent(
+      "接続先設定: 127.0.0.1:8000"
+    );
+
+    rerender(
+      <Screen1HomePreflight
+        currentDocument={null}
+        jobConfig={cfg}
+        glossaries={[]}
+        llamaServerUrl="http://127.0.0.1:8001/v1"
+        modelsOverview={overview08b}
+        isUploading={false}
+        uploadError={null}
+        isStartingJob={false}
+        jobStartError={null}
+        onUploadFile={vi.fn()}
+        onUpdateJobConfig={vi.fn()}
+        onOpenProtectionScreen={vi.fn()}
+        onStartTranslationJob={vi.fn()}
+      />
+    );
+    expect(realOpt?.textContent).toContain("@ 127.0.0.1:8001");
+    expect(realOpt?.textContent).not.toContain("127.0.0.1:8000");
+    expect(screen.getByTestId("real-inference-prerequisite-note")).toHaveTextContent(
+      "接続先設定: 127.0.0.1:8001"
+    );
+    expect(screen.getByTestId("real-inference-prerequisite-note")).not.toHaveTextContent(
+      "127.0.0.1:8000"
+    );
+  });
 });
