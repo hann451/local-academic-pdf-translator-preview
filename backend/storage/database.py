@@ -308,6 +308,7 @@ class DatabaseRepository:
                     translated_text=manual_text,
                     protected_items=block.protected_items,
                     finish_reason="stop",
+                    unmasked_math_variables=block.unmasked_math_variables,
                 )
                 block.manual_validation_errors = list(val_res.error_codes)
                 block.manual_validation_warnings = list(val_res.warning_codes)

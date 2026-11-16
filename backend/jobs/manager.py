@@ -49,6 +49,10 @@ from backend.pdf.hyphenation import (
     PREPROCESSING_VERSION_DEHYPHENATED,
     PREPROCESSING_VERSION_RAW,
 )
+from backend.pdf.inline_math_vars import (
+    INLINE_MASK_VERSION_LEGACY,
+    INLINE_MASK_VERSION_STANDALONE_VAR,
+)
 from backend.pdf.validation.preflight import (
     compute_sha256,
     inspect_pdf_preflight,
@@ -88,6 +92,7 @@ _TRANSIENT_BLOCK_WARNING_CODES: frozenset[str] = TYPESETTING_ISSUE_CODES | froze
         "UNTRANSLATED_SOURCE_RETURNED",
         "ABNORMALLY_SHORT_TRANSLATION",
         "NUMERIC_VALUE_MISMATCH",
+        "MATH_VARIABLE_MISSING",
     }
 )
 
@@ -1780,17 +1785,33 @@ class JobManager:
                 "is_mock": job.is_mock_run,
                 "only_roundtrip_preservation": job.config.only_roundtrip_preservation,
                 "normalize_line_break_hyphens": job.config.normalize_line_break_hyphens,
+                "protect_isolated_math_vars": job.config.protect_isolated_math_vars,
                 "preprocessing_version": (
                     PREPROCESSING_VERSION_DEHYPHENATED
                     if job.config.normalize_line_break_hyphens
                     else PREPROCESSING_VERSION_RAW
+                ),
+                "masking_version": (
+                    INLINE_MASK_VERSION_STANDALONE_VAR
+                    if job.config.protect_isolated_math_vars
+                    else INLINE_MASK_VERSION_LEGACY
                 ),
                 "line_break_hyphen_normalized_blocks": sum(
                     1
                     for b in blocks
                     if job.config.normalize_line_break_hyphens and b.llm_input_text is not None
                 ),
-                "protection_policy_version": "v2.0-academic-auto-protect",
+                "standalone_math_var_protected_blocks": sum(
+                    1
+                    for b in blocks
+                    if job.config.protect_isolated_math_vars
+                    and any(s.role == "standalone_var" for s in b.inline_math_spans)
+                ),
+                "protection_policy_version": (
+                    "v2.1-inline-standalone-var"
+                    if job.config.protect_isolated_math_vars
+                    else "v2.0-academic-auto-protect"
+                ),
                 "total_blocks": len(blocks),
                 "newly_inferenced_blocks": newly_inferenced_blocks,
                 "llm_api_calls_made": llm_api_calls_made,
@@ -2063,6 +2084,7 @@ class JobManager:
                         translated_text=eff or "",
                         protected_items=blk.protected_items,
                         finish_reason="stop",
+                        unmasked_math_variables=blk.unmasked_math_variables,
                     )
                     if blk.status == BlockStatus.MANUALLY_EDITED:
                         blk.manual_validation_errors = list(val_res.error_codes)
@@ -2435,6 +2457,11 @@ class JobManager:
 
         block.warnings = _clear_transient_block_warnings(block.warnings)
         masked_src, preprocessing_version = _resolve_block_llm_input(block, job.config)
+        masking_version = (
+            INLINE_MASK_VERSION_STANDALONE_VAR
+            if job.config.protect_isolated_math_vars
+            else INLINE_MASK_VERSION_LEGACY
+        )
         cache_key = compute_translation_cache_key(
             masked_source_text=masked_src,
             model_id=job.config.model_id or "",
@@ -2452,6 +2479,7 @@ class JobManager:
             adapter_version=translator.adapter_version,
             is_mock=translator.is_mock,
             preprocessing_version=preprocessing_version,
+            masking_version=masking_version,
         )
 
         cached = self.db.get_cached_translation(
@@ -2465,11 +2493,30 @@ class JobManager:
                 translated_text=cached["model_output_text"],
                 protected_items=block.protected_items,
                 finish_reason="stop",
+                unmasked_math_variables=block.unmasked_math_variables,
             )
             if val_res.is_valid:
                 block.translation_text = cached["model_output_text"]
                 block.status = BlockStatus.TRANSLATED
                 block.needs_retranslation = False
+                for w_find in val_res.findings:
+                    if w_find.code not in block.warnings:
+                        block.warnings.append(w_find.code)
+                    issues.append(
+                        ValidationIssue(
+                            id=f"iss-{uuid.uuid4().hex[:10]}",
+                            job_id=job.id,
+                            document_id=doc.id,
+                            page_index=block.page_index,
+                            block_id=block.id,
+                            bbox=block.bbox,
+                            code=w_find.code,
+                            severity=w_find.severity,
+                            message=w_find.message,
+                            details=w_find.details,
+                            fallback_applied=False,
+                        )
+                    )
                 block.translation_provenance = "cache_hit"
                 block.translation_is_mock = bool(cached.get("is_mock", translator.is_mock))
                 return "cache_hit", 0
@@ -2559,6 +2606,7 @@ class JobManager:
                 translated_text=candidate_text,
                 protected_items=block.protected_items,
                 finish_reason=finish_reason,
+                unmasked_math_variables=block.unmasked_math_variables,
             )
             last_val_res = val_res
 

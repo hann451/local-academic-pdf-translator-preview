@@ -19,6 +19,7 @@ import hashlib
 import json
 
 from backend.domain.models import GlossaryEntry, ProtectedItem
+from backend.pdf.inline_math_vars import INLINE_MASK_VERSION_LEGACY
 from backend.translation.prompts.pfml3 import HistoryPair, filter_active_glossary
 
 
@@ -40,6 +41,7 @@ def compute_translation_cache_key(
     adapter_version: str = "1.0.0",
     is_mock: bool = False,
     preprocessing_version: str = "raw-v0",
+    masking_version: str = INLINE_MASK_VERSION_LEGACY,
 ) -> str:
     """Compute a deterministic SHA-256 hex key that invalidates whenever any relevant factor changes."""
     active_glossary = filter_active_glossary(masked_source_text, glossary_entries)
@@ -74,6 +76,7 @@ def compute_translation_cache_key(
         "adapter_version": adapter_version,
         "is_mock": bool(is_mock),
         "preprocessing_version": preprocessing_version,
+        "masking_version": masking_version,
     }
     serialized = json.dumps(key_payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()

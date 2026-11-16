@@ -45,6 +45,7 @@ from backend.domain.models import (
     ProtectionMode,
     ProtectionRegion,
     TranslationJobConfig,
+    UnmaskedMathVariableCandidate,
     ValidationIssue,
     compute_source_text_hash,
 )
@@ -68,6 +69,11 @@ from backend.pdf.hyphenation import (
     build_document_token_inventory,
     detect_line_break_hyphen_edits,
     project_line_break_edits_to_masked,
+)
+from backend.pdf.inline_math_vars import (
+    collect_unmasked_math_candidates,
+    extract_standalone_math_variable_spans,
+    is_block_eligible_for_standalone_math_vars,
 )
 from backend.translation.continuation import attach_continuation_candidates
 
@@ -564,13 +570,14 @@ def _is_maskable_math_script_span(
     return True
 
 
-def extract_inline_math_spans(
+def extract_inline_math_spans_with_candidates(
     raw_lines: list[dict],
     page_drawings: list[dict] | None = None,
-) -> list[InlineMathSpan]:
-    """Extract structured `InlineMathSpan` annotations (superscripts, subscripts, circumflex hats
-    over base symbols, and radical vinculum overbars) strictly from the PDF's span geometry and
-    vector line drawings. Never guesses superscripts/subscripts from plain text.
+    *,
+    allow_standalone_math_vars: bool = True,
+) -> tuple[list[InlineMathSpan], list[UnmaskedMathVariableCandidate]]:
+    """Extract structured `InlineMathSpan` annotations and unmasked single-letter math variable
+    candidates strictly from the PDF's span geometry and vector line drawings.
     """
     lines = _merge_horizontal_visual_lines(raw_lines)
     block_line_parts: list[str] = []
@@ -602,6 +609,9 @@ def extract_inline_math_spans(
     spans_out: list[InlineMathSpan] = []
     seen_keys: set[tuple[str, str, str, tuple[tuple[int, int, str, int], ...]]] = set()
     script_char_ranges: dict[tuple[str, str, str], list[tuple[int, int]]] = {}
+    all_protected_span_ranges: list[tuple[int, int]] = []
+    script_base_positions: set[tuple[int, int]] = set()
+    line_span_roles: list[list[str]] = [[] for _ in lines]
     maskable_script_keys: set[tuple[str, str, str]] = set()
 
     def _add(
@@ -618,6 +628,7 @@ def extract_inline_math_spans(
         )
         if script_range is not None:
             script_char_ranges.setdefault(base_key, []).append(script_range)
+            all_protected_span_ranges.append(script_range)
         if maskable:
             maskable_script_keys.add(base_key)
         if sig_key not in seen_keys:
@@ -679,6 +690,7 @@ def extract_inline_math_spans(
                 span_roles.append("sub")
             else:
                 span_roles.append("normal")
+        line_span_roles[line_idx] = span_roles
 
         idx = 0
         while idx < len(spans):
@@ -721,6 +733,10 @@ def extract_inline_math_spans(
                     ):
                         raw_dy = (float(s_orig[1]) - float(ns_orig[1])) / max_sz
                         dy_em = round(min(-0.15, max(-0.35, raw_dy)), 3)
+                    script_base_positions.add((line_idx, cur_idx + 1))
+                    hat_tgt_rng = span_global_ranges.get((line_idx, cur_idx + 1))
+                    if hat_tgt_rng is not None:
+                        all_protected_span_ranges.append(hat_tgt_rng)
                     _add(
                         InlineMathSpan(
                             context_text=f"ˆ{nt[0]}",
@@ -767,6 +783,10 @@ def extract_inline_math_spans(
                                 ):
                                     rad_t = acc.rstrip().rstrip(".,;:")
                                     if rad_t:
+                                        for rk in range(cur_idx, j + 1):
+                                            rrng = span_global_ranges.get((line_idx, rk))
+                                            if rrng is not None:
+                                                all_protected_span_ranges.append(rrng)
                                         _add(
                                             InlineMathSpan(
                                                 context_text=f"√{rad_t}",
@@ -978,6 +998,14 @@ def extract_inline_math_spans(
                         p_tok = p_parts[-1] if p_parts else ""
                         if p_tok:
                             base_tok = p_tok + "∗"
+                            script_base_positions.add((line_idx, ps_idx))
+                            script_base_positions.add((line_idx, pps_idx))
+                            for base_rng in (
+                                span_global_ranges.get((line_idx, ps_idx)),
+                                span_global_ranges.get((line_idx, pps_idx)),
+                            ):
+                                if base_rng is not None:
+                                    all_protected_span_ranges.append(base_rng)
                             is_m = _is_maskable_math_script_span(
                                 spans[pps_idx], p_tok, group_text, role_lit
                             )
@@ -1020,6 +1048,10 @@ def extract_inline_math_spans(
                         if is_sub and base_tok.isdigit():
                             continue
                         if base_tok:
+                            script_base_positions.add((line_idx, ps_idx))
+                            base_rng = span_global_ranges.get((line_idx, ps_idx))
+                            if base_rng is not None:
+                                all_protected_span_ranges.append(base_rng)
                             script_base_by_idx[end_idx] = (base_tok, role_lit, group_text)
                             _add(
                                 InlineMathSpan(
@@ -1195,6 +1227,33 @@ def extract_inline_math_spans(
                 final_spans.append(item)
             spans_out = final_spans
 
+    standalone_spans, unmasked_candidates = extract_standalone_math_variable_spans(
+        lines=lines,
+        block_text=block_text,
+        span_global_ranges=span_global_ranges,
+        line_span_roles=line_span_roles,
+        script_base_positions=script_base_positions,
+        existing_script_ranges=all_protected_span_ranges,
+        normalize_fn=normalize_for_pdf_rendering,
+        boundary_regex_fn=_build_math_span_boundary_regex,
+        allow_extraction=allow_standalone_math_vars,
+    )
+    spans_out.extend(standalone_spans)
+    return spans_out, unmasked_candidates
+
+
+def extract_inline_math_spans(
+    raw_lines: list[dict],
+    page_drawings: list[dict] | None = None,
+    *,
+    allow_standalone_math_vars: bool = True,
+) -> list[InlineMathSpan]:
+    """Extract structured `InlineMathSpan` annotations strictly from PDF geometry and drawings."""
+    spans_out, _ = extract_inline_math_spans_with_candidates(
+        raw_lines,
+        page_drawings=page_drawings,
+        allow_standalone_math_vars=allow_standalone_math_vars,
+    )
     return spans_out
 
 
@@ -1257,7 +1316,7 @@ def _build_styled_line_plan(
             reverse=True,
         )
         for mspan in ordered_spans:
-            if mspan.ambiguous:
+            if mspan.ambiguous or mspan.role == "standalone_var":
                 continue
             ctx = mspan.context_text
             tgt = mspan.target_text
@@ -1840,7 +1899,14 @@ class NativePreservingAdapter(PdfEngineAdapter):
             prot_conf = "high"
             is_uncertain = False
 
-        inline_spans = extract_inline_math_spans(lines, drawings)
+        allow_standalone_vars = is_block_eligible_for_standalone_math_vars(
+            kind, semantic_cat
+        )
+        inline_spans, standalone_candidates = extract_inline_math_spans_with_candidates(
+            lines,
+            drawings,
+            allow_standalone_math_vars=allow_standalone_vars,
+        )
         blk_bbox = [round(float(x), 2) for x in bbox]
         line_break_edits = (
             detect_line_break_hyphen_edits(
@@ -1879,6 +1945,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
             cfg,
             sibling_formula_bbox=sibling_formula_bbox,
             line_break_edits=line_break_edits,
+            standalone_candidates=standalone_candidates,
         )
         return blk, in_references_section
 
@@ -3134,8 +3201,11 @@ class NativePreservingAdapter(PdfEngineAdapter):
         cfg: TranslationJobConfig,
         sibling_formula_bbox: list[float] | None = None,
         line_break_edits: list[LineBreakHyphenEdit] | None = None,
+        standalone_candidates: list[UnmaskedMathVariableCandidate] | None = None,
     ) -> None:
+        prev_unmasked_candidates = list(block.unmasked_math_variables)
         block.llm_input_text = None
+        block.unmasked_math_variables = []
         # -1. Split formula child blocks stay strictly protected regardless of force_translate or TRANSLATE_AS_BODY
         if block.split_role == "formula":
             block.kind = BlockKind.ISOLATED_FORMULA
@@ -3284,9 +3354,18 @@ class NativePreservingAdapter(PdfEngineAdapter):
         masked, items, orig_to_masked = mask_inline_protected_elements_with_mapping(
             block.source_text,
             inline_math_spans=block.inline_math_spans,
+            include_standalone_vars=cfg.protect_isolated_math_vars,
         )
         block.masked_source_text = masked
         block.protected_items = items
+        cand_source = (
+            standalone_candidates
+            if standalone_candidates is not None
+            else prev_unmasked_candidates
+        )
+        block.unmasked_math_variables = collect_unmasked_math_candidates(
+            block.source_text, orig_to_masked, cand_source
+        )
         if cfg.normalize_line_break_hyphens and line_break_edits:
             block.llm_input_text = project_line_break_edits_to_masked(
                 block.source_text,
@@ -3639,7 +3718,8 @@ class NativePreservingAdapter(PdfEngineAdapter):
                         active_math_spans = [
                             ms
                             for ms in blk.inline_math_spans
-                            if ms.context_text in render_ready_text
+                            if ms.role != "standalone_var"
+                            and ms.context_text in render_ready_text
                             and (
                                 (
                                     any(ms.context_text in orig_t for orig_t in kept_orig_texts)
@@ -3655,7 +3735,8 @@ class NativePreservingAdapter(PdfEngineAdapter):
                         active_math_spans = [
                             ms
                             for ms in blk.inline_math_spans
-                            if ms.context_text in render_ready_text
+                            if ms.role != "standalone_var"
+                            and ms.context_text in render_ready_text
                         ]
 
                     # Pre-redaction check 3: Refuse to flatten conflicting super/sub/normal math roles
@@ -4146,6 +4227,8 @@ def _map_orig_chars_to_working(
 def mask_inline_protected_elements_with_mapping(
     text: str,
     inline_math_spans: list[InlineMathSpan] | None = None,
+    *,
+    include_standalone_vars: bool = True,
 ) -> tuple[str, list[ProtectedItem], dict[int, int] | None]:
     """Detect inline formulas, Greek/math symbols, sub/superscripts, and URLs/DOIs,
     replacing them with `{v1}`, `{v2}`, ... while returning an optional character map
@@ -4217,6 +4300,15 @@ def mask_inline_protected_elements_with_mapping(
         seen_cand: set[str] = set()
         occ_by_ctx: dict[str, set[int]] = {}
         for ms in inline_math_spans:
+            if ms.role == "standalone_var":
+                if not include_standalone_vars or ms.ambiguous:
+                    continue
+                ctx = ms.context_text.strip()
+                if ctx and ms.mask_occurrence_indices:
+                    occ_by_ctx.setdefault(ctx, set()).update(
+                        idx for idx in ms.mask_occurrence_indices if idx >= 0
+                    )
+                continue
             if ms.role not in ("super", "sub") or ms.ambiguous:
                 continue
             ctx = ms.context_text.strip()
@@ -4327,6 +4419,8 @@ def mask_inline_protected_elements_with_mapping(
 def mask_inline_protected_elements(
     text: str,
     inline_math_spans: list[InlineMathSpan] | None = None,
+    *,
+    include_standalone_vars: bool = True,
 ) -> tuple[str, list[ProtectedItem]]:
     """Detect inline formulas, Greek/math symbols, sub/superscripts, and URLs/DOIs,
     replacing them with `{v1}`, `{v2}`, ... while leaving `[1]` citation brackets visible
@@ -4337,6 +4431,7 @@ def mask_inline_protected_elements(
     final_masked, items, _ = mask_inline_protected_elements_with_mapping(
         text,
         inline_math_spans=inline_math_spans,
+        include_standalone_vars=include_standalone_vars,
     )
     return final_masked, items
 

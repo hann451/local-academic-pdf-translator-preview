@@ -203,7 +203,7 @@ class InlineMathSpan(BaseModel):
         ...,
         description="The specific substring within context_text that receives this styling (e.g. '2', '𝑐𝑙𝑠', 'ˆ', '(𝑎2 + 𝑏2)')",
     )
-    role: Literal["super", "sub", "hat", "radicand"]
+    role: Literal["super", "sub", "hat", "radicand", "standalone_var"]
     scale: float = Field(default=1.0, gt=0)
     dy_em: float = Field(
         default=0.0,
@@ -245,6 +245,19 @@ class InlineMathSpan(BaseModel):
     )
 
 
+class UnmaskedMathVariableCandidate(BaseModel):
+    """High-confidence standalone math-italic single-letter variable left unmasked
+    in `Block.masked_source_text` (e.g. when standalone protection is disabled or
+    skipped by formula-overlap guards), tracked for non-blocking missing-variable warnings.
+    """
+
+    symbol: str = Field(..., min_length=1, max_length=2)
+    source_start: int = Field(..., ge=0)
+    source_end: int = Field(..., gt=0)
+    context_excerpt: str = ""
+    evidence_basis: str = ""
+
+
 class ContinuationCandidate(BaseModel):
     counterpart_block_id: str
     direction: Literal["previous", "next"]
@@ -279,6 +292,13 @@ class Block(BaseModel):
     )
     protected_items: list[ProtectedItem] = Field(default_factory=list)
     inline_math_spans: list[InlineMathSpan] = Field(default_factory=list)
+    unmasked_math_variables: list[UnmaskedMathVariableCandidate] = Field(
+        default_factory=list,
+        description=(
+            "Unmasked high-confidence standalone math variable occurrences tracked "
+            "separately from `{vN}` placeholders for non-blocking `MATH_VARIABLE_MISSING` warnings."
+        ),
+    )
     continuation_candidates: list[ContinuationCandidate] = Field(default_factory=list)
     translation_text: str | None = None
     manual_translation_text: str | None = None
@@ -640,6 +660,7 @@ class TranslationJobConfig(BaseModel):
     use_mock_translator: bool = False
     allow_pending_splits: bool = False
     normalize_line_break_hyphens: bool = True
+    protect_isolated_math_vars: bool = True
 
 
 class Job(BaseModel):

@@ -24,7 +24,12 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 
-from backend.domain.models import IssueSeverity, ProtectedItem, ProtectedItemKind
+from backend.domain.models import (
+    IssueSeverity,
+    ProtectedItem,
+    ProtectedItemKind,
+    UnmaskedMathVariableCandidate,
+)
 
 TRANSLATION_VALIDATION_ISSUE_CODES: frozenset[str] = frozenset(
     {
@@ -41,6 +46,7 @@ TRANSLATION_VALIDATION_ISSUE_CODES: frozenset[str] = frozenset(
         "UNTRANSLATED_SOURCE_RETURNED",
         "ABNORMALLY_SHORT_TRANSLATION",
         "NUMERIC_VALUE_MISMATCH",
+        "MATH_VARIABLE_MISSING",
     }
 )
 
@@ -100,6 +106,13 @@ _EXPLANATION_PREFIX_RE = re.compile(
     r"^(?:翻訳(?:結果|文)?\s*[:：]|以下(?:が|は).*?(?:翻訳|訳文)です[。:：]?|Here is the translation\s*:|Translation\s*:)",
     re.IGNORECASE,
 )
+_VALIDATION_URL_DOI_EMAIL_RE = re.compile(
+    r"(?:https?://\S+|www\.\S+|doi:\s*\S+|\b10\.\d{4,9}/\S+|[\w.+-]+@[\w-]+\.[\w.-]+)",
+    re.IGNORECASE,
+)
+_NUM_WITH_UNIT_RE = re.compile(
+    rf"(?<![a-zA-Z0-9_])[-+]?(?:\d{{1,3}}(?:,\d{{3}})+|\d+)(?:\.\d+)?\s*(?:{_MEASUREMENT_UNIT_SUFFIX_RE})(?![A-Za-z0-9_])"
+)
 
 
 @dataclass
@@ -117,6 +130,7 @@ class TranslationValidationResult:
     should_retry: bool
     recommend_resplit: bool
     findings: list[ValidationFinding] = field(default_factory=list)
+    math_variable_checks: list[dict] = field(default_factory=list)
 
     @property
     def error_codes(self) -> list[str]:
@@ -174,6 +188,7 @@ def validate_translation_output(
     translated_text: str | None,
     protected_items: list[ProtectedItem] | None = None,
     finish_reason: str | None = None,
+    unmasked_math_variables: list[UnmaskedMathVariableCandidate] | None = None,
 ) -> TranslationValidationResult:
     """Validate a single block's translated text against all Section 11 criteria."""
     findings: list[ValidationFinding] = []
@@ -363,6 +378,16 @@ def validate_translation_output(
                 )
             )
 
+    # 11. Auxiliary non-blocking check for high-confidence unmasked math-italic variables (Proposal B)
+    math_var_checks: list[dict] = []
+    if unmasked_math_variables:
+        var_findings, math_var_checks = _check_unmasked_math_variables(
+            masked_source_text=masked_source_text,
+            out=out,
+            unmasked_math_variables=unmasked_math_variables,
+        )
+        findings.extend(var_findings)
+
     has_errors = any(f.severity == IssueSeverity.ERROR for f in findings)
     has_warnings = any(f.severity == IssueSeverity.WARNING for f in findings)
     recommend_resplit = any(
@@ -376,7 +401,129 @@ def validate_translation_output(
         should_retry=has_errors,
         recommend_resplit=recommend_resplit,
         findings=findings,
+        math_variable_checks=math_var_checks,
     )
+
+
+def _strip_non_standalone_var_contexts(text: str) -> str:
+    """Strip `{vN}`, `[N]`, URLs/DOIs/emails, and number+SI-unit tokens before matching standalone vars."""
+    cleaned = _PLACEHOLDER_RE.sub(" ", text)
+    cleaned = _CITATION_BRACKET_RE.sub(" ", cleaned)
+    cleaned = _VALIDATION_URL_DOI_EMAIL_RE.sub(" ", cleaned)
+    cleaned = _NUM_WITH_UNIT_RE.sub(" ", cleaned)
+    return cleaned
+
+
+def _count_isolated_var_tokens(cleaned_text: str, sym: str) -> int:
+    pat = re.compile(
+        rf"(?<![A-Za-z0-9_@/:\\-])(?<!\.[A-Za-z]){re.escape(sym)}(?![A-Za-z0-9_@-])(?!\.[A-Za-z])"
+    )
+    return len(pat.findall(cleaned_text))
+
+
+def _check_unmasked_math_variables(
+    *,
+    masked_source_text: str,
+    out: str,
+    unmasked_math_variables: list[UnmaskedMathVariableCandidate],
+) -> tuple[list[ValidationFinding], list[dict]]:
+    findings: list[ValidationFinding] = []
+    checks: list[dict] = []
+
+    by_symbol: dict[str, list[UnmaskedMathVariableCandidate]] = {}
+    for cand in unmasked_math_variables:
+        by_symbol.setdefault(cand.symbol, []).append(cand)
+
+    src_cleaned = _strip_non_standalone_var_contexts(masked_source_text)
+    out_cleaned = _strip_non_standalone_var_contexts(out)
+
+    for sym, cand_list in by_symbol.items():
+        cand_count = len(cand_list)
+        src_isolated_total = _count_isolated_var_tokens(src_cleaned, sym)
+        # Skip if all occurrences were actually masked into placeholders (never double-count)
+        if src_isolated_total == 0:
+            continue
+        other_unmasked_count = max(0, src_isolated_total - cand_count)
+        out_isolated_count = _count_isolated_var_tokens(out_cleaned, sym)
+        pos_records = [
+            {
+                "start": c.source_start,
+                "end": c.source_end,
+                "context_excerpt": c.context_excerpt,
+                "evidence_basis": c.evidence_basis,
+            }
+            for c in cand_list
+        ]
+
+        if out_isolated_count == 0:
+            basis = (
+                f"未保護の高確信度・数式斜体変数 '{sym}'（{cand_count}件, 原文位置 "
+                f"{[(c.source_start, c.source_end) for c in cand_list]}）が、"
+                "通常英単語・URL・別{vN}数式・数値単位を除外した訳文中の独立トークンとして0件となり消失を確認。"
+            )
+            checks.append(
+                {
+                    "symbol": sym,
+                    "status": "missing_detected",
+                    "status_ja": "消失検出",
+                    "unmasked_candidate_count": cand_count,
+                    "other_unmasked_isolated_count": other_unmasked_count,
+                    "output_isolated_count": out_isolated_count,
+                    "source_positions": pos_records,
+                    "evidence_basis": basis,
+                }
+            )
+            findings.append(
+                ValidationFinding(
+                    code="MATH_VARIABLE_MISSING",
+                    severity=IssueSeverity.WARNING,
+                    message=(
+                        f"未保護の単文字数式変数 '{sym}' が訳文から脱落している可能性があります"
+                        f"（原文位置: {[(c.source_start, c.source_end) for c in cand_list]}）。"
+                    ),
+                    details={
+                        "symbol": sym,
+                        "source_positions": pos_records,
+                        "unmasked_candidate_count": cand_count,
+                        "other_unmasked_isolated_count": other_unmasked_count,
+                        "output_isolated_count": out_isolated_count,
+                        "verification_status": "missing_detected",
+                        "evidence_basis": basis,
+                    },
+                )
+            )
+        elif other_unmasked_count > 0 or out_isolated_count < cand_count:
+            basis = (
+                f"原文に未保護候補 '{sym}'（{cand_count}件）以外の独立出現（{other_unmasked_count}件）または"
+                f"複数候補があり、訳文中の独立出現（{out_isolated_count}件）との一対一対応を確定できないため照合不能。"
+            )
+            checks.append(
+                {
+                    "symbol": sym,
+                    "status": "unverifiable",
+                    "status_ja": "照合不能",
+                    "unmasked_candidate_count": cand_count,
+                    "other_unmasked_isolated_count": other_unmasked_count,
+                    "output_isolated_count": out_isolated_count,
+                    "source_positions": pos_records,
+                    "evidence_basis": basis,
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "symbol": sym,
+                    "status": "verified_preserved",
+                    "status_ja": "保持確認",
+                    "unmasked_candidate_count": cand_count,
+                    "other_unmasked_isolated_count": other_unmasked_count,
+                    "output_isolated_count": out_isolated_count,
+                    "source_positions": pos_records,
+                    "evidence_basis": "全未保護候補に対応する独立変数トークンが訳文中に残存。",
+                }
+            )
+
+    return findings, checks
 
 
 def _has_abnormal_repetition(text: str) -> bool:
