@@ -398,7 +398,10 @@ def test_server_match_matrix_detects_exact_copy_mismatch_and_unverified(tmp_path
 
     mgr.register_local_model(file_path=p2b, license_accepted=True, set_active=True)
 
-    assert mgr.compare_with_running_server({"status": "server_unreachable"}).match_status == "server_unreachable"
+    unreachable_res = mgr.compare_with_running_server({"status": "server_unreachable"})
+    assert unreachable_res.match_status == "server_unreachable"
+    assert "接続できません" in unreachable_res.message_ja
+    assert "停止中" not in unreachable_res.message_ja
 
     # Exact path match
     m_exact = mgr.compare_with_running_server(

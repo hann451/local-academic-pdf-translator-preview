@@ -8,6 +8,7 @@ import React, { useEffect, useState } from "react";
 import type {
   CatalogModel,
   ModelDownloadJob,
+  ModelServerMatchResult,
   ModelsOverviewResponse,
   RegisteredModel,
   RegisterLocalModelRequest,
@@ -72,7 +73,8 @@ export function verificationStatusLabel(
       stage: "unverified",
       label: "未検証（ファイル欠損・要再指定）",
       badgeClass: "badge-error",
-      detailText: "モデルファイルが見つかりません。場所の再指定または再ダウンロードを行ってください。",
+      detailText:
+        "モデルファイルが見つかりません（欠損中は未検証・利用不可です）。場所の再指定または再ダウンロード後に再検証してください。",
     };
   }
   if (!v.format_valid || v.hash_status === "mismatch") {
@@ -80,7 +82,8 @@ export function verificationStatusLabel(
       stage: "unverified",
       label: "未検証（整合性エラー）",
       badgeClass: "badge-error",
-      detailText: "GGUF形式またはSHA-256がカタログ定義と一致しません。",
+      detailText:
+        "GGUF形式またはSHA-256がカタログ定義と一致しません（過去の検証実績はリセット済み・利用不可）。",
     };
   }
   if (v.hash_status === "unverified" || !v.backend_compatible) {
@@ -96,7 +99,8 @@ export function verificationStatusLabel(
       stage: "translation_verified",
       label: "実翻訳確認済み",
       badgeClass: "badge-success",
-      detailText: "SHA-256検証・実機サーバー起動・実翻訳推論完了を確認済みです。",
+      detailText:
+        "この登録モデルについての過去の検証実績: SHA-256検証・実機接続・実翻訳推論の完了を確認済み（機械推論の完了実績であり、人間による訳文品質承認ではありません）。現在の接続・一致状態は別欄で確認してください。",
     };
   }
   if (v.launch_verified) {
@@ -104,14 +108,118 @@ export function verificationStatusLabel(
       stage: "launch_verified",
       label: "起動確認済み",
       badgeClass: "badge-launch",
-      detailText: "SHA-256検証および実機 llama-server 起動・一致確認済み（実翻訳は未実施）。",
+      detailText:
+        "この登録モデルについての過去の検証実績: SHA-256検証と過去の llama-server 接続・モデル一致を確認済み（実翻訳推論の実績はまだありません）。現在この瞬間の接続・一致状態は別欄で確認してください。",
     };
   }
   return {
     stage: "file_verified",
     label: "ファイル検証済み",
     badgeClass: "badge-info",
-    detailText: "ファイル存在・GGUF形式・SHA-256確認済み（実機サーバー起動・翻訳は未確認）。",
+    detailText:
+      "この登録モデルについての検証実績: ファイル存在・GGUF形式・SHA-256確認済み（実機接続・実翻訳の実績はまだありません）。",
+  };
+}
+
+export interface ServerMatchDisplayInfo {
+  statusCode: string;
+  labelJa: string;
+  summaryJa: string;
+  detailJa: string;
+  badgeClass: string;
+  alertClass: string;
+}
+
+const MATCH_STATUS_LABELS: Record<
+  string,
+  { labelJa: string; badgeClass: string; alertClass: string }
+> = {
+  matched: {
+    labelJa: "接続可・一致 (matched)",
+    badgeClass: "badge-success",
+    alertClass: "alert-success",
+  },
+  matched_same_model_different_path: {
+    labelJa: "接続可・同一モデル別パス (matched_same_model_different_path)",
+    badgeClass: "badge-success",
+    alertClass: "alert-warning",
+  },
+  mismatch: {
+    labelJa: "不一致 (mismatch)",
+    badgeClass: "badge-error",
+    alertClass: "alert-error",
+  },
+  server_unreachable: {
+    labelJa: "接続できない (server_unreachable)",
+    badgeClass: "badge-error",
+    alertClass: "alert-warning",
+  },
+  selected_model_invalid: {
+    labelJa: "選択モデル利用不可 (selected_model_invalid)",
+    badgeClass: "badge-error",
+    alertClass: "alert-error",
+  },
+  no_active_model: {
+    labelJa: "モデル未選択 (no_active_model)",
+    badgeClass: "badge-neutral",
+    alertClass: "alert-warning",
+  },
+  server_path_unverified: {
+    labelJa: "接続可・パス未確認 (server_path_unverified)",
+    badgeClass: "badge-info",
+    alertClass: "alert-info",
+  },
+  not_probed: {
+    labelJa: "未確認 (not_probed)",
+    badgeClass: "badge-neutral",
+    alertClass: "alert-info",
+  },
+};
+
+export function describeServerMatchStatus(
+  serverMatch: Pick<ModelServerMatchResult, "match_status" | "message_ja" | "is_matched"> | null | undefined,
+  fallbackStatus?: string | null
+): ServerMatchDisplayInfo {
+  const code = serverMatch?.match_status || fallbackStatus || "not_probed";
+  const meta = MATCH_STATUS_LABELS[code] || {
+    labelJa: `状態: ${code}`,
+    badgeClass: "badge-neutral",
+    alertClass: "alert-warning",
+  };
+
+  if (!serverMatch || code === "not_probed") {
+    return {
+      statusCode: "not_probed",
+      labelJa: "未確認 (not_probed)",
+      summaryJa: "未確認",
+      detailJa:
+        "現在の推論エンドポイント接続・一致状態は未確認です（初期表示では自動接続確認を行っていません）。「再確認」または画面4の「推論サーバ疎通確認」で確認できます。",
+      badgeClass: "badge-neutral",
+      alertClass: "alert-info",
+    };
+  }
+
+  if (code === "server_unreachable") {
+    const backendMsg = serverMatch.message_ja?.trim();
+    return {
+      statusCode: code,
+      labelJa: meta.labelJa,
+      summaryJa: "接続できない",
+      detailJa: backendMsg
+        ? `${backendMsg}（接続できない事実のみの報告であり、未起動のほかにポート・URL設定差異や接続制限の可能性があります）`
+        : "推論エンドポイントへ接続できません（未起動のほか、ポート・URL設定差異や接続制限の可能性があります）。",
+      badgeClass: meta.badgeClass,
+      alertClass: meta.alertClass,
+    };
+  }
+
+  return {
+    statusCode: code,
+    labelJa: meta.labelJa,
+    summaryJa: meta.labelJa,
+    detailJa: serverMatch.message_ja || meta.labelJa,
+    badgeClass: meta.badgeClass,
+    alertClass: meta.alertClass,
   };
 }
 
@@ -359,47 +467,56 @@ export const ModelSelectionPanel: React.FC<ModelSelectionPanelProps> = ({
         </div>
       )}
 
-      {/* Running Server vs Selected Model Consistency */}
-      {serverMatch && (
-        <div
-          role={serverMatch.match_status === "mismatch" ? "alert" : undefined}
-          data-testid={
-            serverMatch.match_status === "mismatch"
-              ? "model-server-mismatch-alert"
-              : "model-server-match-banner"
-          }
-          className={`alert ${
-            serverMatch.is_matched
-              ? "alert-success"
-              : serverMatch.match_status === "mismatch" ||
-                serverMatch.match_status === "selected_model_invalid"
-              ? "alert-error"
-              : "alert-warning"
-          }`}
-          style={{ marginBottom: "10px", fontSize: "12px" }}
-        >
-          <strong>
-            {serverMatch.is_matched
-              ? "推論サーバー一致:"
-              : serverMatch.match_status === "mismatch"
-              ? "使用モデルと稼働中推論サーバーの不一致:"
-              : "推論サーバー確認結果:"}
-          </strong>{" "}
-          {serverMatch.message_ja}
-          {serverMatch.match_status === "mismatch" && (
-            <div style={{ marginTop: "4px" }}>
-              選択中: <code>{serverMatch.active_display_name ?? "-"}</code>（
-              <code>{serverMatch.active_file_path ?? "-"}</code>） / サーバー稼働中:{" "}
-              <code>
-                {serverMatch.running_identified_display_name ??
-                  serverMatch.running_loaded_alias ??
-                  "不明"}
-              </code>
-              （<code>{serverMatch.running_model_path ?? serverMatch.running_model_file ?? "-"}</code>）
+      {/* Running Server vs Selected Model Current Connection & Consistency */}
+      {(() => {
+        const matchDisplay = describeServerMatchStatus(serverMatch);
+        const headingPrefix = "現在の接続・一致状態:";
+        if (!serverMatch) {
+          return (
+            <div
+              data-testid="model-current-server-status"
+              className="alert alert-info"
+              style={{ marginBottom: "10px", fontSize: "12px" }}
+            >
+              <strong>{headingPrefix}</strong>{" "}
+              <span className={`badge ${matchDisplay.badgeClass}`} style={{ marginRight: "6px" }}>
+                {matchDisplay.labelJa}
+              </span>
+              {matchDisplay.detailJa}
             </div>
-          )}
-        </div>
-      )}
+          );
+        }
+        return (
+          <div
+            role={serverMatch.match_status === "mismatch" ? "alert" : undefined}
+            data-testid={
+              serverMatch.match_status === "mismatch"
+                ? "model-server-mismatch-alert"
+                : "model-server-match-banner"
+            }
+            className={`alert ${matchDisplay.alertClass}`}
+            style={{ marginBottom: "10px", fontSize: "12px" }}
+          >
+            <strong>{headingPrefix}</strong>{" "}
+            <span className={`badge ${matchDisplay.badgeClass}`} style={{ marginRight: "6px" }}>
+              {matchDisplay.labelJa}
+            </span>
+            {matchDisplay.detailJa}
+            {serverMatch.match_status === "mismatch" && (
+              <div style={{ marginTop: "4px" }}>
+                選択中: <code>{serverMatch.active_display_name ?? "-"}</code>（
+                <code>{serverMatch.active_file_path ?? "-"}</code>） / サーバー応答側:{" "}
+                <code>
+                  {serverMatch.running_identified_display_name ??
+                    serverMatch.running_loaded_alias ??
+                    "不明"}
+                </code>
+                （<code>{serverMatch.running_model_path ?? serverMatch.running_model_file ?? "-"}</code>）
+              </div>
+            )}
+          </div>
+        );
+      })()}
 
       {/* Action Feedback / Error */}
       {displayError && (
@@ -487,9 +604,13 @@ export const ModelSelectionPanel: React.FC<ModelSelectionPanelProps> = ({
                           使用中
                         </span>
                       )}
+                      <span style={{ color: "#475569", fontSize: "11px" }}>
+                        過去の検証実績:
+                      </span>
                       <span
                         data-testid={`verification-badge-${reg.registration_id}`}
                         data-verification-stage={verInfo.stage}
+                        title="この登録モデルについての過去の検証実績（現在の接続状態は上の欄を参照）"
                         className={`badge ${verInfo.badgeClass}`}
                       >
                         {verInfo.label}
@@ -552,7 +673,7 @@ export const ModelSelectionPanel: React.FC<ModelSelectionPanelProps> = ({
                     data-testid={`verification-detail-${reg.registration_id}`}
                     style={{ marginTop: "2px", color: "#475569", fontSize: "11px" }}
                   >
-                    検証段階: {verInfo.detailText}
+                    {verInfo.detailText}
                   </div>
                   {reg.verification.validation_error && (
                     <div style={{ marginTop: "4px", color: "#b91c1c" }}>

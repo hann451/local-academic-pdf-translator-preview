@@ -807,6 +807,14 @@ class ModelRegistryManager:
             )
 
         if health_status != "connected":
+            reason_ja = (
+                "未確認（まだ接続確認を行っていません）"
+                if health_status == "not_probed"
+                else (
+                    f"推論エンドポイントへ接続できません: {health_status}。"
+                    "サーバー未起動のほか、ポート・URL設定の差異や接続制限の可能性があります"
+                )
+            )
             return ModelServerMatchResult(
                 match_status="server_unreachable",
                 is_matched=False,
@@ -820,7 +828,7 @@ class ModelRegistryManager:
                 running_model_file=running_file,
                 running_identified_model_id=running_cat_id,
                 running_identified_display_name=running_cat_name,
-                message_ja=f"選択中モデル: {active.display_name}（稼働中の llama-server 未接続: {health_status}）",
+                message_ja=f"選択中モデル: {active.display_name}（{reason_ja}）",
             )
 
         # Connected! Verify running server identity against active registered model

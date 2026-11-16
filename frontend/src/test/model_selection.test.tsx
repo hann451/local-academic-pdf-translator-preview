@@ -933,4 +933,200 @@ describe("Model Selection, Download, Local Registry & Consistency UI", () => {
     expect(s1Badge()).toHaveAttribute("data-verification-stage", "unverified");
     expect(s1Badge()).toHaveTextContent("未検証（整合性エラー）");
   });
+
+  it("Proposal A: clarifies historical verification achievements separately from current connection state (not_probed / server_unreachable)", () => {
+    const regLaunch: RegisteredModel = {
+      registration_id: "reg-2b-hist",
+      catalog_model_id: "plamo-3-translate-2b-q4_k_m",
+      display_name: "PLaMo 3 Translate 2B (Q4_K_M)",
+      short_name: "PLaMo 3 Translate 2B",
+      provider: "Preferred Networks, Inc.",
+      parameter_size: "2B",
+      quantization: "Q4_K_M",
+      source_type: "reference",
+      file_path: "C:\\models\\2b.gguf",
+      file_name: "2b.gguf",
+      file_size_bytes: 1800000000,
+      file_mtime_ns: 1000,
+      measured_sha256: "b".repeat(64),
+      gguf_architecture: "plamo3",
+      gguf_model_name: "plamo-3-translate-2b",
+      verification: {
+        file_exists: true,
+        format_valid: true,
+        hash_status: "matched_known",
+        backend_compatible: true,
+        launch_verified: true,
+        translation_verified: false,
+        validated_at: "2026-11-16T00:00:00Z",
+      },
+      license_accepted: true,
+      created_at: "2026-11-16T00:00:00Z",
+      updated_at: "2026-11-16T00:00:00Z",
+    };
+    const regTrans: RegisteredModel = {
+      ...regLaunch,
+      registration_id: "reg-2b-trans-hist",
+      verification: {
+        ...regLaunch.verification,
+        launch_verified: true,
+        translation_verified: true,
+      },
+    };
+    const overviewNotProbed: ModelsOverviewResponse = {
+      catalog: makeCatalog(),
+      unsupported_policies: {},
+      registered: [regLaunch, regTrans],
+      active_model_id: regLaunch.registration_id,
+      active_model: regLaunch,
+      has_active_translation_job: false,
+      managed_models_dir: "C:\\runtime\\models",
+      downloads: [],
+      server_match: null,
+    };
+
+    const s4 = render(
+      <Screen4GlossaryDiagnostics
+        glossaries={[]}
+        diagnostics={{
+          ...makeDiagnostics(),
+          llama_connection_status: "not_probed",
+          loaded_model_name: null,
+          model_server_match_status: "not_probed",
+          model_server_match_message: null,
+        }}
+        hasProbedLlama={false}
+        isLoadingDiagnostics={false}
+        diagnosticsError={null}
+        modelsOverview={overviewNotProbed}
+        activeModelDownload={null}
+        onRefreshDiagnostics={vi.fn().mockResolvedValue(undefined)}
+        onRefreshModels={vi.fn().mockResolvedValue(undefined)}
+        onBrowseLocalModelFile={vi.fn().mockResolvedValue(null)}
+        onRegisterLocalModel={vi.fn()}
+        onSelectModel={vi.fn().mockResolvedValue(undefined)}
+        onDeleteModel={vi.fn().mockResolvedValue(undefined)}
+        onStartModelDownload={vi.fn()}
+        onCancelModelDownload={vi.fn().mockResolvedValue(undefined)}
+        onCreateGlossary={vi.fn()}
+        onUpdateGlossary={vi.fn()}
+        onDeleteGlossary={vi.fn()}
+        onPurgeTempData={vi.fn()}
+        onRotateToken={vi.fn()}
+      />
+    );
+
+    // Registered cards state historical achievement + inference-only meaning for translation_verified
+    expect(screen.getByTestId("verification-detail-reg-2b-hist")).toHaveTextContent(
+      "過去の検証実績"
+    );
+    expect(screen.getByTestId("verification-detail-reg-2b-trans-hist")).toHaveTextContent(
+      "人間による訳文品質承認ではありません"
+    );
+    // Current connection status is separately displayed as 未確認 (not_probed)
+    expect(screen.getByTestId("model-current-server-status")).toHaveTextContent("未確認 (not_probed)");
+    expect(screen.getByTestId("diag-model-server-match")).toHaveTextContent("未確認 (not_probed)");
+    expect(screen.getByTestId("diag-llama-status")).toHaveTextContent("未確認 (not_probed");
+
+    // When probed & server_unreachable, shows "接続できない" without claiming server is definitely stopped
+    s4.rerender(
+      <Screen4GlossaryDiagnostics
+        glossaries={[]}
+        diagnostics={{
+          ...makeDiagnostics(),
+          llama_connection_status: "server_unreachable",
+          loaded_model_name: null,
+          model_server_match_status: "server_unreachable",
+          model_server_match_message:
+            "選択中モデル: PLaMo 3 Translate 2B (Q4_K_M)（推論エンドポイントへ接続できません: server_unreachable）",
+        }}
+        hasProbedLlama={true}
+        isLoadingDiagnostics={false}
+        diagnosticsError={null}
+        modelsOverview={{
+          ...overviewNotProbed,
+          server_match: {
+            match_status: "server_unreachable",
+            is_matched: false,
+            active_registration_id: regLaunch.registration_id,
+            active_catalog_model_id: regLaunch.catalog_model_id,
+            active_display_name: regLaunch.display_name,
+            active_file_path: regLaunch.file_path,
+            message_ja:
+              "選択中モデル: PLaMo 3 Translate 2B (Q4_K_M)（推論エンドポイントへ接続できません）",
+          },
+        }}
+        activeModelDownload={null}
+        onRefreshDiagnostics={vi.fn().mockResolvedValue(undefined)}
+        onRefreshModels={vi.fn().mockResolvedValue(undefined)}
+        onBrowseLocalModelFile={vi.fn().mockResolvedValue(null)}
+        onRegisterLocalModel={vi.fn()}
+        onSelectModel={vi.fn().mockResolvedValue(undefined)}
+        onDeleteModel={vi.fn().mockResolvedValue(undefined)}
+        onStartModelDownload={vi.fn()}
+        onCancelModelDownload={vi.fn().mockResolvedValue(undefined)}
+        onCreateGlossary={vi.fn()}
+        onUpdateGlossary={vi.fn()}
+        onDeleteGlossary={vi.fn()}
+        onPurgeTempData={vi.fn()}
+        onRotateToken={vi.fn()}
+      />
+    );
+    expect(screen.getByTestId("model-server-match-banner")).toHaveTextContent(
+      "接続できない (server_unreachable)"
+    );
+    expect(screen.getByTestId("diag-llama-status")).toHaveTextContent(
+      "接続できない (server_unreachable)"
+    );
+    expect(screen.getByTestId("diag-llama-status")).not.toHaveTextContent("停止");
+
+    // Screen 1 separates historical verification badge from current endpoint connection status
+    const cfg: TranslationJobConfig = {
+      page_range_spec: null,
+      source_lang: "en",
+      target_lang: "ja",
+      form: "plain",
+      model_name: "plamo-3-translate-2b-Q4_K_M",
+      model_id: "plamo-3-translate-2b-q4_k_m",
+      quantization: "Q4_K_M",
+      context_length: 8192,
+      translate_captions: true,
+      translate_tables: false,
+      translate_references: false,
+      translate_figures: false,
+      min_font_size_pt: 8,
+      glossary_id: null,
+      output_mono_pdf: true,
+      output_dual_pdf: true,
+      only_roundtrip_preservation: false,
+      pause_for_review: false,
+      use_mock_translator: false,
+    };
+    render(
+      <Screen1HomePreflight
+        currentDocument={null}
+        jobConfig={cfg}
+        glossaries={[]}
+        modelsOverview={overviewNotProbed}
+        isUploading={false}
+        uploadError={null}
+        isStartingJob={false}
+        jobStartError={null}
+        onUploadFile={vi.fn()}
+        onUpdateJobConfig={vi.fn()}
+        onOpenProtectionScreen={vi.fn()}
+        onOpenModelsScreen={vi.fn()}
+        onRefreshModels={vi.fn().mockResolvedValue(undefined)}
+        onBrowseLocalModelFile={vi.fn().mockResolvedValue(null)}
+        onRegisterLocalModel={vi.fn()}
+        onSelectModel={vi.fn().mockResolvedValue(undefined)}
+        onDeleteModel={vi.fn()}
+        onStartModelDownload={vi.fn()}
+        onCancelModelDownload={vi.fn()}
+        onStartTranslationJob={vi.fn()}
+      />
+    );
+    expect(screen.getByTestId("screen1-model-card")).toHaveTextContent("過去の検証実績");
+    expect(screen.getByTestId("screen1-current-server-status")).toHaveTextContent("未確認");
+  });
 });

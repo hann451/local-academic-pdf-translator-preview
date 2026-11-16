@@ -15,7 +15,11 @@ import type {
 } from "../types/api";
 import { parseGlossaryInput, type GlossaryParseReport } from "../utils/glossaryParser";
 import { ModelLicenseNotice, resolveActiveCatalogModel } from "./ModelLicenseNotice";
-import { ModelSelectionPanel, verificationStatusLabel } from "./ModelSelectionPanel";
+import {
+  describeServerMatchStatus,
+  ModelSelectionPanel,
+  verificationStatusLabel,
+} from "./ModelSelectionPanel";
 
 export interface Screen4Props {
   glossaries: Glossary[];
@@ -212,7 +216,7 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
   // Determine explicit connection label from server response (never hardcoded)
   const renderConnectionBadge = (diag: SystemDiagnostics) => {
     const status = diag.llama_connection_status;
-    if (!hasProbedLlama && status === "not_connected") {
+    if (status === "not_probed" || (!hasProbedLlama && status === "not_connected")) {
       return (
         <span data-testid="diag-llama-status" className="badge badge-neutral">
           未確認 (not_probed: `probe_llama=false` — 「推論サーバ疎通確認」を押してください)
@@ -229,7 +233,7 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
     if (status === "server_unreachable") {
       return (
         <span data-testid="diag-llama-status" className="badge badge-error">
-          推論サーバ未接続 (server_unreachable)
+          接続できない (server_unreachable)
         </span>
       );
     }
@@ -697,7 +701,7 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
                 </dd>
               </div>
               <div>
-                <dt>UI選択中の翻訳モデル / 状態</dt>
+                <dt>UI選択中の翻訳モデル / 過去の検証実績（履歴）</dt>
                 <dd data-testid="diag-active-model">
                   {diagnostics.active_model_display_name || "未登録 / 既定"} (
                   {diagnostics.active_model_status || "unregistered"})
@@ -705,19 +709,28 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
                     (() => {
                       const verInfo = verificationStatusLabel(modelsOverview.active_model);
                       return (
-                        <span
-                          data-testid="diag-active-model-verification-badge"
-                          data-verification-stage={verInfo.stage}
-                          className={`badge ${verInfo.badgeClass}`}
-                          style={{ marginLeft: "6px" }}
-                        >
-                          {verInfo.label}
-                        </span>
+                        <>
+                          {" "}
+                          <span
+                            data-testid="diag-active-model-verification-badge"
+                            data-verification-stage={verInfo.stage}
+                            title="この登録モデルについての過去の検証実績"
+                            className={`badge ${verInfo.badgeClass}`}
+                            style={{ marginLeft: "6px" }}
+                          >
+                            {verInfo.label}
+                          </span>
+                          <div
+                            data-testid="diag-verification-history-note"
+                            style={{ fontSize: "11px", color: "#475569", marginTop: "3px" }}
+                          >
+                            {verInfo.detailText}
+                          </div>
+                        </>
                       );
                     })()}
                   {diagnostics.active_model_file_path && (
                     <>
-                      <br />
                       <code style={{ fontSize: "11px", wordBreak: "break-all" }}>
                         {diagnostics.active_model_file_path}
                       </code>
@@ -726,30 +739,40 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
                 </dd>
               </div>
               <div>
-                <dt>選択モデルと起動中サーバの整合</dt>
+                <dt>現在のサーバー接続・モデル一致状態</dt>
                 <dd data-testid="diag-model-server-match">
-                  <span
-                    className={`badge ${
-                      diagnostics.model_server_mismatch
-                        ? "badge-error"
-                        : diagnostics.model_server_match_status === "matched" ||
-                          diagnostics.model_server_match_status ===
-                            "matched_same_model_different_path"
-                        ? "badge-success"
-                        : "badge-neutral"
-                    }`}
-                  >
-                    {diagnostics.model_server_match_status || "unverified"}
-                  </span>{" "}
-                  {diagnostics.model_server_match_message && (
-                    <span style={{ fontSize: "12px" }}>
-                      {diagnostics.model_server_match_message}
-                    </span>
-                  )}
+                  {(() => {
+                    const fallbackCode = diagnostics.model_server_match_status || "not_probed";
+                    const syntheticMatch =
+                      modelsOverview?.server_match ??
+                      (fallbackCode === "not_probed"
+                        ? null
+                        : {
+                            match_status: fallbackCode as NonNullable<
+                              ModelsOverviewResponse["server_match"]
+                            >["match_status"],
+                            is_matched:
+                              fallbackCode === "matched" ||
+                              fallbackCode === "matched_same_model_different_path",
+                            message_ja: diagnostics.model_server_match_message || "",
+                          });
+                    const info = describeServerMatchStatus(syntheticMatch, fallbackCode);
+                    const displayMessage =
+                      diagnostics.model_server_match_message ||
+                      (fallbackCode === "not_probed" ? info.detailJa : "");
+                    return (
+                      <>
+                        <span className={`badge ${info.badgeClass}`}>{info.labelJa}</span>{" "}
+                        {displayMessage && (
+                          <span style={{ fontSize: "12px" }}>{displayMessage}</span>
+                        )}
+                      </>
+                    );
+                  })()}
                 </dd>
               </div>
               <div style={{ gridColumn: "1 / -1" }}>
-                <dt>推論サーバ接続状態・ロード済みモデル</dt>
+                <dt>現在の推論エンドポイント接続状態・ロード済みモデル</dt>
                 <dd style={{ marginTop: "4px" }}>
                   {renderConnectionBadge(diagnostics)}
                   {diagnostics.model_server_mismatch && (
@@ -759,7 +782,7 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
                       className="alert alert-error"
                       style={{ marginTop: "8px", fontSize: "12px" }}
                     >
-                      <strong>選択モデルと起動中 llama-server が一致していません:</strong>{" "}
+                      <strong>選択モデルと応答中 llama-server が一致していません:</strong>{" "}
                       {diagnostics.model_server_match_message ||
                         "選択したモデルの再起動または実機切替が必要です。"}
                     </div>
@@ -774,9 +797,12 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
                         lineHeight: 1.5,
                       }}
                     >
-                      実機翻訳を行う場合は、別ターミナルで選択中の翻訳モデルを指定して{" "}
-                      <code>llama-server</code>（既定 <code>127.0.0.1:8000</code>
-                      ）を起動し、上部の「🔌 推論サーバ疎通確認 (probe_llama=true)」を押してください（疎通確認は{" "}
+                      {diagnostics.llama_connection_status === "server_unreachable"
+                        ? "推論エンドポイントへ接続できません（サーバー未起動のほか、ポート・URL設定の差異や接続制限により接続できない可能性があります）。"
+                        : "現在の推論エンドポイント接続状態はまだ確認されていません。"}{" "}
+                      実機翻訳を行う場合は、選択中の翻訳モデルを指定した <code>llama-server</code>（既定{" "}
+                      <code>127.0.0.1:8000</code>
+                      ）へ接続できる状態にしたうえで、上部の「🔌 推論サーバ疎通確認 (probe_llama=true)」を押してください（疎通確認は{" "}
                       <code>GET /v1/models</code>{" "}
                       の軽量確認のみを行い、翻訳リクエストは送信しません）。モデル未導入で画面遷移のみ試す場合は画面1で「モック推論」を選択できますが、モックは決定論的な疑似翻訳であり実翻訳ではありません。
                     </div>

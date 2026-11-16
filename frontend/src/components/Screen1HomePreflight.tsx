@@ -15,7 +15,11 @@ import type {
 } from "../types/api";
 import { validateAndParsePageRange } from "../utils/pageRange";
 import { ModelLicenseNotice, resolveActiveCatalogModel } from "./ModelLicenseNotice";
-import { ModelSelectionPanel, verificationStatusLabel } from "./ModelSelectionPanel";
+import {
+  describeServerMatchStatus,
+  ModelSelectionPanel,
+  verificationStatusLabel,
+} from "./ModelSelectionPanel";
 
 export interface Screen1Props {
   currentDocument: Document | null;
@@ -574,13 +578,17 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
                           (() => {
                             const verInfo = verificationStatusLabel(activeModel);
                             return (
-                              <span
-                                data-testid="screen1-active-model-verification-badge"
-                                data-verification-stage={verInfo.stage}
-                                className={`badge ${verInfo.badgeClass}`}
-                                style={{ marginLeft: "8px" }}
-                              >
-                                {verInfo.label}
+                              <span style={{ marginLeft: "8px", fontSize: "12px", color: "#334155" }}>
+                                （この登録モデルの過去の検証実績:{" "}
+                                <span
+                                  data-testid="screen1-active-model-verification-badge"
+                                  data-verification-stage={verInfo.stage}
+                                  title="この登録モデルについての過去の検証実績"
+                                  className={`badge ${verInfo.badgeClass}`}
+                                >
+                                  {verInfo.label}
+                                </span>
+                                ）
                               </span>
                             );
                           })()}
@@ -613,9 +621,38 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
 
                     {activeModel && (
                       <div style={{ fontSize: "12px", color: "#334155", marginBottom: "6px" }}>
-                        ファイル: <code>{activeModel.file_path}</code>
+                        <div>
+                          ファイル: <code>{activeModel.file_path}</code>
+                        </div>
+                        <div
+                          data-testid="screen1-verification-history-note"
+                          style={{ fontSize: "11px", color: "#475569", marginTop: "2px" }}
+                        >
+                          {verificationStatusLabel(activeModel).detailText}
+                        </div>
                       </div>
                     )}
+
+                    {(() => {
+                      const matchDisplay = describeServerMatchStatus(serverMatch);
+                      return (
+                        <div
+                          data-testid="screen1-current-server-status"
+                          style={{ fontSize: "12px", color: "#334155", marginBottom: "6px" }}
+                        >
+                          <strong>現在の接続・一致状態:</strong>{" "}
+                          <span
+                            className={`badge ${matchDisplay.badgeClass}`}
+                            style={{ marginRight: "6px" }}
+                          >
+                            {matchDisplay.summaryJa}
+                          </span>
+                          <span style={{ fontSize: "11px", color: "#475569" }}>
+                            {matchDisplay.detailJa}
+                          </span>
+                        </div>
+                      );
+                    })()}
 
                     {usableRegistered.length > 0 && onSelectModel && (
                       <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
@@ -767,10 +804,9 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
                       className="field-hint"
                       style={{ marginTop: "8px", fontSize: "12px", color: "#334155" }}
                     >
-                      実機翻訳には、本アプリ（<code>127.0.0.1:8080</code>）とは別ターミナルで推論サーバ（
-                      選択中の翻訳モデルを指定した <code>llama-server</code>、既定{" "}
-                      <code>127.0.0.1:8000</code>
-                      ）の起動が必要です。推論サーバ未起動または別モデルが起動中のまま開始すると中断またはエラーとなります。事前確認は画面4の「推論サーバ疎通確認」（翻訳リクエストは送信しません）で行えます。モデル未導入で画面動作のみ確認する場合は「モック推論」（実翻訳ではありません）を選択してください。
+                      実機翻訳には、本アプリとは別ターミナルで推論サーバ（選択中の翻訳モデルを指定した{" "}
+                      <code>llama-server</code>、既定 <code>127.0.0.1:8000</code>
+                      ）が応答し、接続できる状態である必要があります。接続できない場合（未起動のほか、ポート・URL設定差異や接続制限の可能性があります）や別モデルが応答する場合は、開始時エラーまたは中断となります。事前確認は画面4の「推論サーバ疎通確認」（翻訳リクエストは送信しません）で行えます。モデル未導入で画面動作のみ確認する場合は「モック推論」（実翻訳ではありません）を選択してください。
                     </div>
                   )}
 
