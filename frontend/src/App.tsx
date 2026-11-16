@@ -2,7 +2,7 @@
  * PaperBridge Local Main Application (Phase 3: Screens 1–4 Integration).
  */
 
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ApiHttpError,
   browseLocalModelFile,
@@ -104,6 +104,12 @@ export interface AppProps {
 export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
   const [activeScreen, setActiveScreen] = useState<ScreenId>("screen1");
   const [pendingNavScreen, setPendingNavScreen] = useState<ScreenId | null>(null);
+  const [pendingUnsavedSource, setPendingUnsavedSource] = useState<"screen2" | "screen3" | null>(
+    null
+  );
+  const [isScreen2Dirty, setIsScreen2Dirty] = useState<boolean>(false);
+  const isScreen2DirtyRef = useRef<boolean>(false);
+  isScreen2DirtyRef.current = isScreen2Dirty;
   const [isScreen3Dirty, setIsScreen3Dirty] = useState<boolean>(false);
 
   // Shared Domain State
@@ -131,6 +137,12 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
   const [isStartingJob, setIsStartingJob] = useState<boolean>(false);
   const [jobStartError, setJobStartError] = useState<string | null>(null);
   const [isParsingBlocks, setIsParsingBlocks] = useState<boolean>(false);
+  const [screen2SyncStatus, setScreen2SyncStatus] = useState<"loading" | "synced" | "error">(
+    "synced"
+  );
+  const [screen2SyncError, setScreen2SyncError] = useState<string | null>(null);
+  const [screen2UnsavedSyncBlocked, setScreen2UnsavedSyncBlocked] = useState<boolean>(false);
+  const screen2SyncSeqRef = useRef<number>(0);
   const [protectionSaveStatus, setProtectionSaveStatus] = useState<
     "saved" | "saving" | "error"
   >("saved");
@@ -310,9 +322,60 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
     return () => window.clearInterval(timer);
   }, [currentJob?.id, currentJob?.state, currentDocument?.id, refreshJobDetails, maybeRefreshModelsAfterRealJob]);
 
+  const syncScreen2Data = useCallback(
+    async (docId: string, options?: { forceDiscardUnsaved?: boolean }) => {
+      if (isScreen2DirtyRef.current && !options?.forceDiscardUnsaved) {
+        setScreen2UnsavedSyncBlocked(true);
+        return;
+      }
+      if (options?.forceDiscardUnsaved) {
+        isScreen2DirtyRef.current = false;
+        setIsScreen2Dirty(false);
+        setScreen2UnsavedSyncBlocked(false);
+      }
+      const reqSeq = ++screen2SyncSeqRef.current;
+      setScreen2SyncStatus("loading");
+      setScreen2SyncError(null);
+      setScreen2UnsavedSyncBlocked(false);
+      try {
+        const [latestDoc, latestBlocks, latestSplits, latestRegs] = await Promise.all([
+          fetchDocument(docId),
+          fetchDocumentBlocks(docId),
+          fetchBlockSplits(docId),
+          fetchProtectionRegions(docId),
+        ]);
+        if (reqSeq !== screen2SyncSeqRef.current) return;
+        setCurrentDocument(latestDoc);
+        setBlocks(latestBlocks);
+        setBlockSplits(latestSplits);
+        setProtectionRegions(latestRegs);
+        setScreen2SyncStatus("synced");
+        setScreen2SyncError(null);
+      } catch (err) {
+        if (reqSeq !== screen2SyncSeqRef.current) return;
+        setScreen2SyncStatus("error");
+        setScreen2SyncError(err instanceof Error ? err.message : String(err));
+      }
+    },
+    []
+  );
+
   const handleNavigate = (targetScreen: ScreenId) => {
     if (activeScreen === "screen3" && isScreen3Dirty && targetScreen !== "screen3") {
+      setPendingUnsavedSource("screen3");
       setPendingNavScreen(targetScreen);
+      return;
+    }
+    if (activeScreen === "screen2" && isScreen2Dirty && targetScreen !== "screen2") {
+      setPendingUnsavedSource("screen2");
+      setPendingNavScreen(targetScreen);
+      return;
+    }
+    if (targetScreen === "screen2") {
+      setActiveScreen("screen2");
+      if (currentDocument) {
+        void syncScreen2Data(currentDocument.id);
+      }
       return;
     }
     setActiveScreen(targetScreen);
@@ -330,6 +393,11 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
       setTranslatedPdfBytes(null);
       setIssues([]);
       setArtifacts([]);
+      setIsScreen2Dirty(false);
+      isScreen2DirtyRef.current = false;
+      setScreen2UnsavedSyncBlocked(false);
+      setScreen2SyncStatus("synced");
+      setScreen2SyncError(null);
 
       // Fetch authenticated PDF bytes & pre-parse blocks if extractable
       const pdfRes = await fetchDocumentPdfBytes(doc.id);
@@ -861,13 +929,18 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
         >
           <div>
             <strong>画面移動の確認:</strong>{" "}
-            手動修正エディタに未保存の変更があります。破棄して画面を切り替えますか？
+            {pendingUnsavedSource === "screen2"
+              ? "画面2（保護領域・分割エディタ）に未確定の分割プレビューまたは入力中のメモがあります。破棄して画面を切り替えますか？"
+              : "手動修正エディタに未保存の変更があります。破棄して画面を切り替えますか？"}
           </div>
           <div style={{ display: "flex", gap: "8px" }}>
             <button
               type="button"
               className="btn btn-secondary"
-              onClick={() => setPendingNavScreen(null)}
+              onClick={() => {
+                setPendingNavScreen(null);
+                setPendingUnsavedSource(null);
+              }}
             >
               現在の画面に留まる
             </button>
@@ -877,9 +950,20 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
               data-testid="confirm-nav-discard-btn"
               onClick={() => {
                 const target = pendingNavScreen;
+                const source = pendingUnsavedSource;
                 setPendingNavScreen(null);
-                setIsScreen3Dirty(false);
+                setPendingUnsavedSource(null);
+                if (source === "screen2") {
+                  isScreen2DirtyRef.current = false;
+                  setIsScreen2Dirty(false);
+                  setScreen2UnsavedSyncBlocked(false);
+                } else {
+                  setIsScreen3Dirty(false);
+                }
                 setActiveScreen(target);
+                if (target === "screen2" && currentDocument) {
+                  void syncScreen2Data(currentDocument.id, { forceDiscardUnsaved: true });
+                }
               }}
             >
               未保存の変更を破棄して移動
@@ -905,7 +989,7 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
             jobStartError={jobStartError}
             onUploadFile={handleUploadFile}
             onUpdateJobConfig={setJobConfig}
-            onOpenProtectionScreen={() => setActiveScreen("screen2")}
+            onOpenProtectionScreen={() => handleNavigate("screen2")}
             onOpenModelsScreen={() => handleNavigate("screen4")}
             onRefreshModels={handleRefreshModels}
             onBrowseLocalModelFile={handleBrowseLocalModelFile}
@@ -928,6 +1012,12 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
             isParsing={isParsingBlocks}
             saveStatus={protectionSaveStatus}
             saveMessage={protectionSaveMessage}
+            syncStatus={screen2SyncStatus}
+            syncError={screen2SyncError}
+            unsavedSyncBlocked={screen2UnsavedSyncBlocked}
+            onSyncDocumentData={(opts) => syncScreen2Data(currentDocument.id, opts)}
+            onDismissUnsavedSyncWarning={() => setScreen2UnsavedSyncBlocked(false)}
+            onDirtyStateChange={setIsScreen2Dirty}
             onReparseBlocks={handleReparseBlocks}
             onAddProtectionRegion={handleAddProtectionRegion}
             onDeleteProtectionRegion={handleDeleteProtectionRegion}

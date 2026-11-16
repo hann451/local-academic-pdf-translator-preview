@@ -575,10 +575,12 @@ describe("Full Application E2E Workflow (Screen 1 -> Screen 2 -> Screen 3 -> Scr
       expect(screen.getByTestId("preflight-result-card")).toBeInTheDocument();
     });
 
-    // 2. Navigate to Screen 2 (Protection Editor)
+    // 2. Navigate to Screen 2 (Protection Editor) and wait for initial sync
     fireEvent.click(screen.getByTestId("open-screen2-btn"));
     await waitFor(() => {
       expect(screen.getByTestId("screen2-protection-editor")).toBeInTheDocument();
+      expect(screen.getByTestId("screen2-sync-status")).toHaveTextContent("最新同期済み");
+      expect(screen.getByTestId("screen2-start-job-btn")).not.toBeDisabled();
     });
 
     // 3. Start Job from Screen 2 -> automatically transitions to Screen 3
