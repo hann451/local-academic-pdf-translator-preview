@@ -592,3 +592,90 @@ def test_four_stage_verification_lifecycle_and_fail_closed_transitions(tmp_path:
     assert still_missing.verification.verification_stage == "unverified"
     assert still_missing.verification.launch_verified is False
     assert still_missing.verification.translation_verified is False
+
+
+def test_translation_verified_missing_and_restore_behavior(tmp_path: Path) -> None:
+    """Proposal B: verify exact current behavior when restoring identical vs different content after missing."""
+    bytes_2b = build_synthetic_gguf(architecture="plamo3", model_name="plamo-3-translate-2b", extra_padding=b"RESTORE_2B")
+    bytes_2b_alt = build_synthetic_gguf(architecture="plamo3", model_name="plamo-3-translate-2b", extra_padding=b"RESTORE_2B_ALT")
+    bytes_08b = build_synthetic_gguf(architecture="plamo3", model_name="plamo-3-translate-0.8b", extra_padding=b"RESTORE_08B")
+    cat_path = build_temp_catalog(
+        tmp_path,
+        [
+            {"model_id": "plamo-3-translate-2b-q4_k_m", "primary_bytes": bytes_2b, "legacy_bytes": bytes_2b_alt},
+            {"model_id": "plamo-3-translate-0.8b-q4_k_m", "primary_bytes": bytes_08b},
+        ],
+    )
+    mgr = ModelRegistryManager(runtime_dir=tmp_path / "rt_restore", catalog_path=cat_path)
+    p2b = tmp_path / "plamo-3-translate-2b-Q4_K_M.gguf"
+    p2b.write_bytes(bytes_2b)
+
+    reg = mgr.register_local_model(file_path=p2b, license_accepted=True, set_active=True)
+    mgr.mark_runtime_verified(reg.registration_id, launch_verified=True, translation_verified=True)
+    active, _ = mgr.get_active_model()
+    assert active is not None and active.verification.verification_stage == "translation_verified"
+
+    # 1. File goes missing -> unverified & unusable
+    p2b.unlink()
+    missing, _ = mgr.get_active_model()
+    assert missing is not None
+    assert missing.is_usable is False
+    assert missing.verification.file_exists is False
+    assert missing.verification.hash_status == "missing_file"
+    assert missing.verification.verification_stage == "unverified"
+
+    # While missing, runtime promotion stays blocked
+    mgr.mark_runtime_verified(reg.registration_id, launch_verified=True, translation_verified=True)
+    _, snap_while_missing = mgr.get_registry_snapshot(revalidate=False)
+    assert snap_while_missing.models[0].verification.verification_stage == "unverified"
+    assert snap_while_missing.models[0].is_usable is False
+
+    # 2. Restore identical file -> MUST remain unverified/unusable BEFORE revalidation runs
+    p2b.write_bytes(bytes_2b)
+    _, snap_before_reval = mgr.get_registry_snapshot(revalidate=False)
+    assert snap_before_reval.models[0].verification.verification_stage == "unverified"
+    assert snap_before_reval.models[0].is_usable is False
+
+    # 3. After revalidation confirms same path + same SHA-256 + same catalog_model_id -> retains translation_verified
+    restored_same, _ = mgr.get_active_model()
+    assert restored_same is not None
+    assert restored_same.is_usable is True
+    assert restored_same.verification.hash_status == "matched_known"
+    assert restored_same.verification.launch_verified is True
+    assert restored_same.verification.translation_verified is True
+    assert restored_same.verification.verification_stage == "translation_verified"
+
+    # 4a. Missing -> restore DIFFERENT accepted revision hash of same model -> resets runtime history -> file_verified
+    p2b.unlink()
+    missing_again, _ = mgr.get_active_model()
+    assert missing_again is not None and missing_again.verification.verification_stage == "unverified"
+    p2b.write_bytes(bytes_2b_alt)
+    _, snap_alt_before_reval = mgr.get_registry_snapshot(revalidate=False)
+    assert snap_alt_before_reval.models[0].verification.verification_stage == "unverified"
+    restored_alt, _ = mgr.get_active_model()
+    assert restored_alt is not None
+    assert restored_alt.is_usable is True
+    assert restored_alt.verification.launch_verified is False
+    assert restored_alt.verification.translation_verified is False
+    assert restored_alt.verification.verification_stage == "file_verified"
+
+    # 4b. Re-promote to translation_verified, missing -> restore DIFFERENT catalog model (0.8B at 2B path) -> unverified & history cleared
+    mgr.mark_runtime_verified(reg.registration_id, launch_verified=True, translation_verified=True)
+    p2b.unlink()
+    _, _ = mgr.get_active_model()
+    p2b.write_bytes(bytes_08b)
+    restored_wrong_model, _ = mgr.get_active_model()
+    assert restored_wrong_model is not None
+    assert restored_wrong_model.is_usable is False
+    assert restored_wrong_model.verification.launch_verified is False
+    assert restored_wrong_model.verification.translation_verified is False
+    assert restored_wrong_model.verification.verification_stage == "unverified"
+
+    # 4c. Corrupt content also resets history and stays unverified
+    p2b.write_bytes(b"CORRUPTED_BYTES")
+    restored_corrupt, _ = mgr.get_active_model()
+    assert restored_corrupt is not None
+    assert restored_corrupt.is_usable is False
+    assert restored_corrupt.verification.launch_verified is False
+    assert restored_corrupt.verification.translation_verified is False
+    assert restored_corrupt.verification.verification_stage == "unverified"

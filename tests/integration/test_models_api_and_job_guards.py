@@ -616,3 +616,24 @@ def test_four_stage_verification_progression_across_api_and_jobs(
     assert ov_final["active_model"]["verification"]["verification_stage"] == "translation_verified"
     assert ov_final["active_model"]["verification"]["launch_verified"] is True
     assert ov_final["active_model"]["verification"]["translation_verified"] is True
+
+    # 8. Proposal B via HTTP API: missing -> unverified/blocked -> restore identical -> retains translation_verified; replace with 0.8B -> resets to unverified
+    saved_2b_bytes = Path(p2_alt).read_bytes()
+    Path(p2_alt).unlink()
+    ov_missing = client.get("/api/models?probe_llama=false", headers=_auth_headers()).json()
+    assert ov_missing["active_model"]["verification"]["verification_stage"] == "unverified"
+    assert ov_missing["active_model"]["verification"]["hash_status"] == "missing_file"
+
+    Path(p2_alt).write_bytes(saved_2b_bytes)
+    ov_restored = client.get("/api/models?probe_llama=false", headers=_auth_headers()).json()
+    assert ov_restored["active_model"]["verification"]["verification_stage"] == "translation_verified"
+    assert ov_restored["active_model"]["verification"]["launch_verified"] is True
+    assert ov_restored["active_model"]["verification"]["translation_verified"] is True
+
+    Path(p2_alt).unlink()
+    _ = client.get("/api/models?probe_llama=false", headers=_auth_headers())
+    Path(p2_alt).write_bytes(bytes_08b)
+    ov_wrong = client.get("/api/models?probe_llama=false", headers=_auth_headers()).json()
+    assert ov_wrong["active_model"]["verification"]["verification_stage"] == "unverified"
+    assert ov_wrong["active_model"]["verification"]["launch_verified"] is False
+    assert ov_wrong["active_model"]["verification"]["translation_verified"] is False
