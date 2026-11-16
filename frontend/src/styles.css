@@ -235,6 +235,12 @@ body {
   border: 1px solid #93c5fd;
 }
 
+.badge-launch {
+  background-color: #cffafe;
+  color: #155e75;
+  border: 1px solid #67e8f9;
+}
+
 .badge-neutral {
   background-color: #f1f5f9;
   color: #334155;

@@ -2,9 +2,11 @@
  * PaperBridge Local Main Application (Phase 3: Screens 1–4 Integration).
  */
 
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ApiHttpError,
+  browseLocalModelFile,
+  cancelModelDownload,
   cancelTranslationJob,
   createBlockSplit,
   createGlossary,
@@ -12,6 +14,7 @@ import {
   deleteBlockSplit,
   deleteGlossary,
   deleteProtectionRegion,
+  deleteRegisteredModel,
   downloadArtifactFile,
   ensureSessionToken,
   fetchArtifactPdfBytes,
@@ -23,9 +26,14 @@ import {
   fetchJob,
   fetchJobArtifacts,
   fetchJobIssues,
+  fetchModelDownload,
+  fetchModelsOverview,
   fetchProtectionRegions,
   fetchSystemDiagnostics,
   previewBlockSplit,
+  registerLocalModel,
+  selectActiveModel,
+  startModelDownload,
   updateBlockProtection,
   reapplyAutoProtection,
   parseDocumentBlocks,
@@ -53,8 +61,13 @@ import type {
   Glossary,
   GlossaryEntry,
   Job,
+  ModelDownloadJob,
+  ModelsOverviewResponse,
   ProtectionMode,
   ProtectionRegion,
+  RegisterLocalModelRequest,
+  RegisteredModel,
+  StartModelDownloadRequest,
   SystemDiagnostics,
   TranslationJobConfig,
   ValidationIssue,
@@ -91,6 +104,12 @@ export interface AppProps {
 export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
   const [activeScreen, setActiveScreen] = useState<ScreenId>("screen1");
   const [pendingNavScreen, setPendingNavScreen] = useState<ScreenId | null>(null);
+  const [pendingUnsavedSource, setPendingUnsavedSource] = useState<"screen2" | "screen3" | null>(
+    null
+  );
+  const [isScreen2Dirty, setIsScreen2Dirty] = useState<boolean>(false);
+  const isScreen2DirtyRef = useRef<boolean>(false);
+  isScreen2DirtyRef.current = isScreen2Dirty;
   const [isScreen3Dirty, setIsScreen3Dirty] = useState<boolean>(false);
 
   // Shared Domain State
@@ -107,6 +126,10 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
   const [glossaries, setGlossaries] = useState<Glossary[]>([]);
   const [diagnostics, setDiagnostics] = useState<SystemDiagnostics | null>(null);
   const [hasProbedLlama, setHasProbedLlama] = useState<boolean>(false);
+  const [modelsOverview, setModelsOverview] = useState<ModelsOverviewResponse | null>(null);
+  const [activeModelDownload, setActiveModelDownload] = useState<ModelDownloadJob | null>(null);
+  const [isLoadingModels, setIsLoadingModels] = useState<boolean>(false);
+  const [modelsError, setModelsError] = useState<string | null>(null);
 
   // Loading & Error Flags
   const [isUploading, setIsUploading] = useState<boolean>(false);
@@ -114,6 +137,12 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
   const [isStartingJob, setIsStartingJob] = useState<boolean>(false);
   const [jobStartError, setJobStartError] = useState<string | null>(null);
   const [isParsingBlocks, setIsParsingBlocks] = useState<boolean>(false);
+  const [screen2SyncStatus, setScreen2SyncStatus] = useState<"loading" | "synced" | "error">(
+    "synced"
+  );
+  const [screen2SyncError, setScreen2SyncError] = useState<string | null>(null);
+  const [screen2UnsavedSyncBlocked, setScreen2UnsavedSyncBlocked] = useState<boolean>(false);
+  const screen2SyncSeqRef = useRef<number>(0);
   const [protectionSaveStatus, setProtectionSaveStatus] = useState<
     "saved" | "saving" | "error"
   >("saved");
@@ -129,6 +158,46 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
   const [isLoadingDiagnostics, setIsLoadingDiagnostics] = useState<boolean>(false);
   const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
 
+  const syncJobConfigWithOverview = useCallback((overview: ModelsOverviewResponse) => {
+    const active = overview.active_model;
+    if (!active) return;
+    const cat = overview.catalog.find((c) => c.model_id === active.catalog_model_id);
+    setJobConfig((prev) => ({
+      ...prev,
+      model_id: active.catalog_model_id,
+      model_name: active.file_name || active.display_name || prev.model_name,
+      model_sha256: active.measured_sha256 || null,
+      quantization: active.quantization || prev.quantization,
+      context_length: cat?.context_length_default ?? prev.context_length,
+    }));
+  }, []);
+
+  const refreshModelsOverview = useCallback(
+    async (probeLlama: boolean = false) => {
+      setIsLoadingModels(true);
+      setModelsError(null);
+      try {
+        const overview = await fetchModelsOverview(probeLlama);
+        setModelsOverview(overview);
+        syncJobConfigWithOverview(overview);
+        if (probeLlama) {
+          setHasProbedLlama(true);
+        }
+        const runningDl = overview.downloads.find(
+          (dl) => dl.status === "downloading" || dl.status === "verifying"
+        );
+        if (runningDl) {
+          setActiveModelDownload(runningDl);
+        }
+      } catch (err) {
+        setModelsError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setIsLoadingModels(false);
+      }
+    },
+    [syncJobConfigWithOverview]
+  );
+
   const loadInitialSessionAndData = useCallback(async () => {
     try {
       await ensureSessionToken();
@@ -138,14 +207,62 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
       ]);
       setGlossaries(gls);
       setDiagnostics(diag);
+      void refreshModelsOverview(false);
     } catch (err) {
       setDiagnosticsError(err instanceof Error ? err.message : String(err));
     }
-  }, []);
+  }, [refreshModelsOverview]);
 
   useEffect(() => {
     void loadInitialSessionAndData();
   }, [loadInitialSessionAndData]);
+
+  // Poll model download status while downloading or verifying
+  useEffect(() => {
+    if (
+      !activeModelDownload ||
+      (activeModelDownload.status !== "downloading" &&
+        activeModelDownload.status !== "verifying")
+    ) {
+      return;
+    }
+
+    const timer = window.setInterval(async () => {
+      try {
+        const updated = await fetchModelDownload(activeModelDownload.download_id);
+        setActiveModelDownload(updated);
+        if (
+          updated.status === "completed" ||
+          updated.status === "canceled" ||
+          updated.status === "failed"
+        ) {
+          await refreshModelsOverview(false);
+          try {
+            const diag = await fetchSystemDiagnostics(false);
+            setDiagnostics(diag);
+          } catch {
+            // ignore diagnostics refresh failure on background download finish
+          }
+        }
+      } catch {
+        // ignore transient poll error
+      }
+    }, 600);
+
+    return () => window.clearInterval(timer);
+  }, [activeModelDownload?.download_id, activeModelDownload?.status, refreshModelsOverview]);
+
+  const maybeRefreshModelsAfterRealJob = useCallback(
+    (job: Job) => {
+      if (
+        (job.state === "completed" || job.state === "completed_with_warnings") &&
+        !job.is_mock_run
+      ) {
+        void refreshModelsOverview(false);
+      }
+    },
+    [refreshModelsOverview]
+  );
 
   const refreshJobDetails = useCallback(
     async (jobId: string, docId: string) => {
@@ -195,18 +312,70 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
 
     const timer = window.setInterval(async () => {
       try {
-        await refreshJobDetails(currentJob.id, currentDocument.id);
+        const updatedJob = await refreshJobDetails(currentJob.id, currentDocument.id);
+        maybeRefreshModelsAfterRealJob(updatedJob);
       } catch {
         // ignore transient poll error
       }
     }, 600);
 
     return () => window.clearInterval(timer);
-  }, [currentJob?.id, currentJob?.state, currentDocument?.id, refreshJobDetails]);
+  }, [currentJob?.id, currentJob?.state, currentDocument?.id, refreshJobDetails, maybeRefreshModelsAfterRealJob]);
+
+  const syncScreen2Data = useCallback(
+    async (docId: string, options?: { forceDiscardUnsaved?: boolean }) => {
+      if (isScreen2DirtyRef.current && !options?.forceDiscardUnsaved) {
+        setScreen2UnsavedSyncBlocked(true);
+        return;
+      }
+      if (options?.forceDiscardUnsaved) {
+        isScreen2DirtyRef.current = false;
+        setIsScreen2Dirty(false);
+        setScreen2UnsavedSyncBlocked(false);
+      }
+      const reqSeq = ++screen2SyncSeqRef.current;
+      setScreen2SyncStatus("loading");
+      setScreen2SyncError(null);
+      setScreen2UnsavedSyncBlocked(false);
+      try {
+        const [latestDoc, latestBlocks, latestSplits, latestRegs] = await Promise.all([
+          fetchDocument(docId),
+          fetchDocumentBlocks(docId),
+          fetchBlockSplits(docId),
+          fetchProtectionRegions(docId),
+        ]);
+        if (reqSeq !== screen2SyncSeqRef.current) return;
+        setCurrentDocument(latestDoc);
+        setBlocks(latestBlocks);
+        setBlockSplits(latestSplits);
+        setProtectionRegions(latestRegs);
+        setScreen2SyncStatus("synced");
+        setScreen2SyncError(null);
+      } catch (err) {
+        if (reqSeq !== screen2SyncSeqRef.current) return;
+        setScreen2SyncStatus("error");
+        setScreen2SyncError(err instanceof Error ? err.message : String(err));
+      }
+    },
+    []
+  );
 
   const handleNavigate = (targetScreen: ScreenId) => {
     if (activeScreen === "screen3" && isScreen3Dirty && targetScreen !== "screen3") {
+      setPendingUnsavedSource("screen3");
       setPendingNavScreen(targetScreen);
+      return;
+    }
+    if (activeScreen === "screen2" && isScreen2Dirty && targetScreen !== "screen2") {
+      setPendingUnsavedSource("screen2");
+      setPendingNavScreen(targetScreen);
+      return;
+    }
+    if (targetScreen === "screen2") {
+      setActiveScreen("screen2");
+      if (currentDocument) {
+        void syncScreen2Data(currentDocument.id);
+      }
       return;
     }
     setActiveScreen(targetScreen);
@@ -224,6 +393,11 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
       setTranslatedPdfBytes(null);
       setIssues([]);
       setArtifacts([]);
+      setIsScreen2Dirty(false);
+      isScreen2DirtyRef.current = false;
+      setScreen2UnsavedSyncBlocked(false);
+      setScreen2SyncStatus("synced");
+      setScreen2SyncError(null);
 
       // Fetch authenticated PDF bytes & pre-parse blocks if extractable
       const pdfRes = await fetchDocumentPdfBytes(doc.id);
@@ -266,16 +440,26 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
     setRetypesetMessage(null);
     setRetypesetError(null);
     try {
-      const effectiveConfig: TranslationJobConfig = options?.allowPendingSplits
-        ? { ...jobConfig, allow_pending_splits: true }
+      const activeModel = modelsOverview?.active_model;
+      const baseConfig: TranslationJobConfig = activeModel
+        ? {
+            ...jobConfig,
+            model_id: activeModel.catalog_model_id,
+            model_name: activeModel.file_name || activeModel.display_name || jobConfig.model_name,
+            model_sha256: activeModel.measured_sha256 || jobConfig.model_sha256 || null,
+          }
         : jobConfig;
+      const effectiveConfig: TranslationJobConfig = options?.allowPendingSplits
+        ? { ...baseConfig, allow_pending_splits: true }
+        : baseConfig;
       const job = await startTranslationJob(
         currentDocument.id,
         effectiveConfig,
         runJobsInBackground
       );
       setCurrentJob(job);
-      await refreshJobDetails(job.id, currentDocument.id);
+      const refreshedJob = await refreshJobDetails(job.id, currentDocument.id);
+      maybeRefreshModelsAfterRealJob(refreshedJob);
       setActiveScreen("screen3");
     } catch (err) {
       setJobStartError(err instanceof Error ? err.message : String(err));
@@ -489,7 +673,8 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
         runJobsInBackground
       );
       setCurrentJob(resumed);
-      await refreshJobDetails(currentJob.id, currentDocument.id);
+      const refreshedJob = await refreshJobDetails(currentJob.id, currentDocument.id);
+      maybeRefreshModelsAfterRealJob(refreshedJob);
     } finally {
       setIsResumingJob(false);
     }
@@ -523,7 +708,8 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
     try {
       const job = await retranslateSpecificBlocks(currentJob.id, [blockId]);
       setCurrentJob(job);
-      await refreshJobDetails(job.id, currentDocument.id);
+      const refreshedJob = await refreshJobDetails(job.id, currentDocument.id);
+      maybeRefreshModelsAfterRealJob(refreshedJob);
     } finally {
       setIsRetranslatingBlock(false);
     }
@@ -565,7 +751,7 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
     await downloadArtifactFile(currentJob.id, artifactType, fallbackName);
   };
 
-  // --- Screen 4 Handlers ---
+  // --- Screen 4 & Model Management Handlers ---
   const handleRefreshDiagnostics = async (probeLlama: boolean) => {
     setIsLoadingDiagnostics(true);
     setDiagnosticsError(null);
@@ -575,11 +761,69 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
       if (probeLlama) {
         setHasProbedLlama(true);
       }
+      void refreshModelsOverview(probeLlama);
     } catch (err) {
       setDiagnosticsError(err instanceof Error ? err.message : String(err));
     } finally {
       setIsLoadingDiagnostics(false);
     }
+  };
+
+  const handleRefreshModels = async (probeLlama: boolean): Promise<void> => {
+    await refreshModelsOverview(probeLlama);
+    try {
+      const diag = await fetchSystemDiagnostics(probeLlama);
+      setDiagnostics(diag);
+      if (probeLlama) {
+        setHasProbedLlama(true);
+      }
+    } catch (err) {
+      setDiagnosticsError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleBrowseLocalModelFile = async (): Promise<string | null> => {
+    const res = await browseLocalModelFile();
+    return res.canceled ? null : res.file_path;
+  };
+
+  const handleRegisterLocalModel = async (
+    payload: RegisterLocalModelRequest
+  ): Promise<RegisteredModel> => {
+    const reg = await registerLocalModel(payload);
+    await handleRefreshModels(false);
+    return reg;
+  };
+
+  const handleSelectModel = async (registrationId: string): Promise<void> => {
+    await selectActiveModel(registrationId, true);
+    await handleRefreshModels(true);
+  };
+
+  const handleDeleteModel = async (registrationId: string): Promise<void> => {
+    await deleteRegisteredModel(registrationId);
+    await handleRefreshModels(false);
+  };
+
+  const handleStartModelDownload = async (
+    payload: StartModelDownloadRequest
+  ): Promise<ModelDownloadJob> => {
+    const dlJob = await startModelDownload(payload);
+    setActiveModelDownload(dlJob);
+    if (
+      dlJob.status === "completed" ||
+      dlJob.status === "canceled" ||
+      dlJob.status === "failed"
+    ) {
+      await handleRefreshModels(false);
+    }
+    return dlJob;
+  };
+
+  const handleCancelModelDownload = async (downloadId: string): Promise<void> => {
+    const canceled = await cancelModelDownload(downloadId);
+    setActiveModelDownload(canceled);
+    await handleRefreshModels(false);
   };
 
   const handleCreateGlossary = async (
@@ -685,13 +929,18 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
         >
           <div>
             <strong>画面移動の確認:</strong>{" "}
-            手動修正エディタに未保存の変更があります。破棄して画面を切り替えますか？
+            {pendingUnsavedSource === "screen2"
+              ? "画面2（保護領域・分割エディタ）に未確定の分割プレビューまたは入力中のメモがあります。破棄して画面を切り替えますか？"
+              : "手動修正エディタに未保存の変更があります。破棄して画面を切り替えますか？"}
           </div>
           <div style={{ display: "flex", gap: "8px" }}>
             <button
               type="button"
               className="btn btn-secondary"
-              onClick={() => setPendingNavScreen(null)}
+              onClick={() => {
+                setPendingNavScreen(null);
+                setPendingUnsavedSource(null);
+              }}
             >
               現在の画面に留まる
             </button>
@@ -701,9 +950,20 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
               data-testid="confirm-nav-discard-btn"
               onClick={() => {
                 const target = pendingNavScreen;
+                const source = pendingUnsavedSource;
                 setPendingNavScreen(null);
-                setIsScreen3Dirty(false);
+                setPendingUnsavedSource(null);
+                if (source === "screen2") {
+                  isScreen2DirtyRef.current = false;
+                  setIsScreen2Dirty(false);
+                  setScreen2UnsavedSyncBlocked(false);
+                } else {
+                  setIsScreen3Dirty(false);
+                }
                 setActiveScreen(target);
+                if (target === "screen2" && currentDocument) {
+                  void syncScreen2Data(currentDocument.id, { forceDiscardUnsaved: true });
+                }
               }}
             >
               未保存の変更を破棄して移動
@@ -719,13 +979,26 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
             currentDocument={currentDocument}
             jobConfig={jobConfig}
             glossaries={glossaries}
+            llamaServerUrl={diagnostics?.llama_server_url ?? null}
+            modelsOverview={modelsOverview}
+            activeModelDownload={activeModelDownload}
+            isLoadingModels={isLoadingModels}
+            modelsError={modelsError}
             isUploading={isUploading}
             uploadError={uploadError}
             isStartingJob={isStartingJob}
             jobStartError={jobStartError}
             onUploadFile={handleUploadFile}
             onUpdateJobConfig={setJobConfig}
-            onOpenProtectionScreen={() => setActiveScreen("screen2")}
+            onOpenProtectionScreen={() => handleNavigate("screen2")}
+            onOpenModelsScreen={() => handleNavigate("screen4")}
+            onRefreshModels={handleRefreshModels}
+            onBrowseLocalModelFile={handleBrowseLocalModelFile}
+            onRegisterLocalModel={handleRegisterLocalModel}
+            onSelectModel={handleSelectModel}
+            onDeleteModel={handleDeleteModel}
+            onStartModelDownload={handleStartModelDownload}
+            onCancelModelDownload={handleCancelModelDownload}
             onStartTranslationJob={handleStartTranslationJob}
           />
         )}
@@ -740,6 +1013,12 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
             isParsing={isParsingBlocks}
             saveStatus={protectionSaveStatus}
             saveMessage={protectionSaveMessage}
+            syncStatus={screen2SyncStatus}
+            syncError={screen2SyncError}
+            unsavedSyncBlocked={screen2UnsavedSyncBlocked}
+            onSyncDocumentData={(opts) => syncScreen2Data(currentDocument.id, opts)}
+            onDismissUnsavedSyncWarning={() => setScreen2UnsavedSyncBlocked(false)}
+            onDirtyStateChange={setIsScreen2Dirty}
             onReparseBlocks={handleReparseBlocks}
             onAddProtectionRegion={handleAddProtectionRegion}
             onDeleteProtectionRegion={handleDeleteProtectionRegion}
@@ -785,7 +1064,18 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
             hasProbedLlama={hasProbedLlama}
             isLoadingDiagnostics={isLoadingDiagnostics}
             diagnosticsError={diagnosticsError}
+            modelsOverview={modelsOverview}
+            activeModelDownload={activeModelDownload}
+            isLoadingModels={isLoadingModels}
+            modelsError={modelsError}
             onRefreshDiagnostics={handleRefreshDiagnostics}
+            onRefreshModels={handleRefreshModels}
+            onBrowseLocalModelFile={handleBrowseLocalModelFile}
+            onRegisterLocalModel={handleRegisterLocalModel}
+            onSelectModel={handleSelectModel}
+            onDeleteModel={handleDeleteModel}
+            onStartModelDownload={handleStartModelDownload}
+            onCancelModelDownload={handleCancelModelDownload}
             onCreateGlossary={handleCreateGlossary}
             onUpdateGlossary={handleUpdateGlossary}
             onDeleteGlossary={handleDeleteGlossary}

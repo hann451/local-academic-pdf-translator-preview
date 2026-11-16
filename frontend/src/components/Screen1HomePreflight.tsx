@@ -3,13 +3,33 @@
  */
 
 import React, { useRef, useState } from "react";
-import type { Document, Glossary, TranslationJobConfig } from "../types/api";
+import type {
+  Document,
+  Glossary,
+  ModelDownloadJob,
+  ModelsOverviewResponse,
+  RegisteredModel,
+  RegisterLocalModelRequest,
+  StartModelDownloadRequest,
+  TranslationJobConfig,
+} from "../types/api";
 import { validateAndParsePageRange } from "../utils/pageRange";
+import { ModelLicenseNotice, resolveActiveCatalogModel } from "./ModelLicenseNotice";
+import {
+  describeServerMatchStatus,
+  ModelSelectionPanel,
+  verificationStatusLabel,
+} from "./ModelSelectionPanel";
 
 export interface Screen1Props {
   currentDocument: Document | null;
   jobConfig: TranslationJobConfig;
   glossaries: Glossary[];
+  llamaServerUrl?: string | null;
+  modelsOverview?: ModelsOverviewResponse | null;
+  activeModelDownload?: ModelDownloadJob | null;
+  isLoadingModels?: boolean;
+  modelsError?: string | null;
   isUploading: boolean;
   uploadError: string | null;
   isStartingJob: boolean;
@@ -17,6 +37,14 @@ export interface Screen1Props {
   onUploadFile: (file: File) => Promise<void>;
   onUpdateJobConfig: (next: TranslationJobConfig) => void;
   onOpenProtectionScreen: () => void;
+  onOpenModelsScreen?: () => void;
+  onRefreshModels?: (probeLlama: boolean) => Promise<void>;
+  onBrowseLocalModelFile?: () => Promise<string | null>;
+  onRegisterLocalModel?: (payload: RegisterLocalModelRequest) => Promise<RegisteredModel>;
+  onSelectModel?: (registrationId: string) => Promise<void>;
+  onDeleteModel?: (registrationId: string) => Promise<void>;
+  onStartModelDownload?: (payload: StartModelDownloadRequest) => Promise<ModelDownloadJob>;
+  onCancelModelDownload?: (downloadId: string) => Promise<void>;
   onStartTranslationJob: () => Promise<void>;
 }
 
@@ -26,10 +54,25 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
+export function formatLlamaEndpointDisplay(llamaServerUrl?: string | null): string | null {
+  const raw = (llamaServerUrl || "").trim().replace(/\/+$/, "");
+  if (!raw) return null;
+  const httpMatch = raw.match(/^http:\/\/([^/]+)(?:\/v1)?$/i);
+  if (httpMatch) {
+    return httpMatch[1];
+  }
+  return raw.replace(/\/v1$/i, "");
+}
+
 export const Screen1HomePreflight: React.FC<Screen1Props> = ({
   currentDocument,
   jobConfig,
   glossaries,
+  llamaServerUrl = null,
+  modelsOverview = null,
+  activeModelDownload = null,
+  isLoadingModels = false,
+  modelsError = null,
   isUploading,
   uploadError,
   isStartingJob,
@@ -37,11 +80,23 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
   onUploadFile,
   onUpdateJobConfig,
   onOpenProtectionScreen,
+  onOpenModelsScreen,
+  onRefreshModels,
+  onBrowseLocalModelFile,
+  onRegisterLocalModel,
+  onSelectModel,
+  onDeleteModel,
+  onStartModelDownload,
+  onCancelModelDownload,
   onStartTranslationJob,
 }) => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const [lastSelectedFile, setLastSelectedFile] = useState<File | null>(null);
+  const endpointDisplay = formatLlamaEndpointDisplay(llamaServerUrl);
+  const [showModelDrawer, setShowModelDrawer] = useState<boolean>(false);
+  const [quickSwitchError, setQuickSwitchError] = useState<string | null>(null);
+  const [isQuickSwitching, setIsQuickSwitching] = useState<boolean>(false);
   const [rangeMode, setRangeMode] = useState<"all" | "custom">(
     jobConfig.page_range_spec ? "custom" : "all"
   );
@@ -484,113 +539,306 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
             )}
           </div>
 
-          {/* Inference Mode (Real Default vs Explicit Mock) */}
-          <div className="form-group">
-            <label className="form-label" htmlFor="inference-mode-select">
-              推論エンジン（初期値：ローカル実機 llama.cpp + PLaMo 3 Translate 2B）
-            </label>
-            <select
-              id="inference-mode-select"
-              data-testid="inference-mode-select"
-              className="form-input"
-              value={jobConfig.use_mock_translator ? "mock" : "real"}
-              onChange={(ev) =>
-                onUpdateJobConfig({
-                  ...jobConfig,
-                  use_mock_translator: ev.target.value === "mock",
-                })
-              }
-            >
-              <option value="real">
-                実機推論（llama.cpp Vulkan + PLaMo 3 Translate 2B Q4_K_M @ 127.0.0.1:8000）
-              </option>
-              <option value="mock">
-                モック推論（UI・パイプライン検証用の決定論的疑似翻訳）
-              </option>
-            </select>
-            {jobConfig.use_mock_translator ? (
-              <div
-                data-testid="mock-selected-warning"
-                className="alert alert-warning"
-                style={{ marginTop: "8px", fontSize: "13px" }}
-              >
-                <strong>[MOCK 選択中]</strong>{" "}
-                現在はモック推論が明示選択されています。モックはUI・パイプライン確認用の決定論的疑似翻訳であり、実翻訳ではありません。生成される成果物には{" "}
-                <code>is_mock_translation: true</code> が記録され、実機翻訳とは区別されます。
-              </div>
-            ) : (
-              <div
-                data-testid="real-inference-prerequisite-note"
-                className="field-hint"
-                style={{ marginTop: "8px", fontSize: "12px", color: "#334155" }}
-              >
-                実機翻訳には、本アプリ（<code>127.0.0.1:8080</code>）とは別ターミナルで推論サーバ（
-                <code>llama-server</code>、既定 <code>127.0.0.1:8000</code>
-                ）の起動が必要です。推論サーバ未起動のまま開始すると接続エラーで中断（
-                <code>interrupted</code>
-                ）となります。事前確認は画面4の「推論サーバ疎通確認」（翻訳リクエストは送信しません）で行えます。モデル未導入で画面動作のみ確認する場合は「モック推論」（実翻訳ではありません）を選択してください。
-              </div>
-            )}
+          {/* Active Model Quick Card & Selector */}
+          {(() => {
+            const activeModel = modelsOverview?.active_model ?? null;
+            const activeCatalogModel = resolveActiveCatalogModel(modelsOverview);
+            const serverMatch = modelsOverview?.server_match ?? null;
+            const usableRegistered = (modelsOverview?.registered ?? []).filter(
+              (r) => r.verification.file_exists && r.verification.format_valid
+            );
+            const hasModelActions = Boolean(
+              onRefreshModels &&
+                onBrowseLocalModelFile &&
+                onRegisterLocalModel &&
+                onSelectModel &&
+                onDeleteModel &&
+                onStartModelDownload &&
+                onCancelModelDownload
+            );
 
-            <div
-              data-testid="plamo-model-notice-screen1"
-              style={{
-                marginTop: "10px",
-                padding: "10px 12px",
-                backgroundColor: "#f8fafc",
-                border: "1px solid #cbd5e1",
-                borderRadius: "6px",
-                fontSize: "12px",
-                color: "#334155",
-                lineHeight: 1.5,
-              }}
-            >
-              <div>
-                <strong>Built with PLaMo</strong> — 想定モデル：
-                <strong>PLaMo 3 Translate</strong>（<code>pfnet/plamo-3-translate-2b-GGUF</code>）
-              </div>
-              <div style={{ marginTop: "4px" }}>
-                本ツールは Preferred Networks（PFN）の公式製品ではありません。アプリ本体のライセンス（
-                <code>AGPL-3.0-only</code>
-                ）と <strong>PLaMo 3 Translate</strong> のライセンス（PLaMoコミュニティライセンス契約）は別であり、モデル本体と推論サーバ（
-                <code>llama.cpp</code>
-                ）は同梱せず別途取得する構成です。利用者は公式リンク先の契約条件を確認・遵守してください（以下は2026年11月9日改定ライセンスに関してPFNから受領した回答に基づく <strong>PLaMo 3 Translate</strong> の案内であり、公開条文の確認結果や過去のモデル取得時点の条件記録とは区別します）。書籍・論文などの独立した長文公表物に関する場合を除き、通常の翻訳PDFの提供・公表には一律の出自表示や契約コピー・説明ファイルの添付は不要ですが、<strong>ただし書籍・論文などの独立した長文公表物の全部または実質的部分として公表する場合は、PLaMoを翻訳に利用した旨をPDF内に含めて明示する必要があります</strong>（PDF末尾の説明ページでも対応可能です。本ツールは説明ページを自動追加しません。また原著作物の翻訳・配布・公表の許諾まで与えるものではありません）。
-              </div>
-              <div
-                style={{
-                  marginTop: "6px",
-                  display: "flex",
-                  gap: "12px",
-                  flexWrap: "wrap",
-                }}
-              >
-                <a
-                  href="https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  data-testid="screen1-link-plamo-model"
-                >
-                  公式モデル配布元 (Hugging Face)
-                </a>
-                <a
-                  href="https://plamo.preferredai.jp/info/plamo-community-license-ja"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  data-testid="screen1-link-plamo-license-ja"
-                >
-                  公式ライセンス（日本語）
-                </a>
-                <a
-                  href="https://plamo.preferredai.jp/info/plamo-community-license-en"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  data-testid="screen1-link-plamo-license-en"
-                >
-                  Official License (English)
-                </a>
-              </div>
-            </div>
-          </div>
+            return (
+              <>
+                {modelsOverview && (
+                  <div
+                    data-testid="screen1-model-card"
+                    style={{
+                      marginBottom: "14px",
+                      padding: "10px 12px",
+                      border: "1px solid #cbd5e1",
+                      borderRadius: "6px",
+                      backgroundColor: "#f8fafc",
+                    }}
+                  >
+                    <div
+                      style={{
+                        display: "flex",
+                        justifyContent: "space-between",
+                        alignItems: "center",
+                        flexWrap: "wrap",
+                        gap: "8px",
+                        marginBottom: "6px",
+                      }}
+                    >
+                      <div style={{ fontSize: "13px" }}>
+                        <strong>使用中の翻訳モデル:</strong>{" "}
+                        <span data-testid="screen1-active-model-display">
+                          {activeModel
+                            ? `${activeModel.display_name} (${activeModel.quantization})`
+                            : "未登録（画面4または下ボタンからダウンロード・参照登録してください）"}
+                        </span>
+                        {activeModel &&
+                          (() => {
+                            const verInfo = verificationStatusLabel(activeModel);
+                            return (
+                              <span style={{ marginLeft: "8px", fontSize: "12px", color: "#334155" }}>
+                                （この登録モデルの過去の検証実績:{" "}
+                                <span
+                                  data-testid="screen1-active-model-verification-badge"
+                                  data-verification-stage={verInfo.stage}
+                                  title="この登録モデルについての過去の検証実績"
+                                  className={`badge ${verInfo.badgeClass}`}
+                                >
+                                  {verInfo.label}
+                                </span>
+                                ）
+                              </span>
+                            );
+                          })()}
+                      </div>
+                      <div style={{ display: "flex", gap: "6px", flexWrap: "wrap" }}>
+                        {hasModelActions && (
+                          <button
+                            type="button"
+                            className="btn btn-secondary"
+                            data-testid="toggle-screen1-model-drawer-btn"
+                            onClick={() => setShowModelDrawer((prev) => !prev)}
+                          >
+                            {showModelDrawer
+                              ? "▲ モデル選択・導入を閉じる"
+                              : "📦 モデル選択・導入 / 参照登録"}
+                          </button>
+                        )}
+                        {onOpenModelsScreen && (
+                          <button
+                            type="button"
+                            className="btn btn-secondary"
+                            data-testid="open-screen4-models-btn"
+                            onClick={() => onOpenModelsScreen()}
+                          >
+                            画面4で詳細管理
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {activeModel && (
+                      <div style={{ fontSize: "12px", color: "#334155", marginBottom: "6px" }}>
+                        <div>
+                          ファイル: <code>{activeModel.file_path}</code>
+                        </div>
+                        <div
+                          data-testid="screen1-verification-history-note"
+                          style={{ fontSize: "11px", color: "#475569", marginTop: "2px" }}
+                        >
+                          {verificationStatusLabel(activeModel).detailText}
+                        </div>
+                      </div>
+                    )}
+
+                    {(() => {
+                      const matchDisplay = describeServerMatchStatus(serverMatch);
+                      return (
+                        <div
+                          data-testid="screen1-current-server-status"
+                          style={{ fontSize: "12px", color: "#334155", marginBottom: "6px" }}
+                        >
+                          <strong>現在の接続・一致状態:</strong>{" "}
+                          <span
+                            className={`badge ${matchDisplay.badgeClass}`}
+                            style={{ marginRight: "6px" }}
+                          >
+                            {matchDisplay.summaryJa}
+                          </span>
+                          <span style={{ fontSize: "11px", color: "#475569" }}>
+                            {matchDisplay.detailJa}
+                          </span>
+                        </div>
+                      );
+                    })()}
+
+                    {usableRegistered.length > 0 && onSelectModel && (
+                      <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                        <label
+                          htmlFor="screen1-quick-model-select"
+                          style={{ fontSize: "12px", fontWeight: 600 }}
+                        >
+                          登録済みモデル切替:
+                        </label>
+                        <select
+                          id="screen1-quick-model-select"
+                          data-testid="screen1-quick-model-select"
+                          className="form-input"
+                          style={{ width: "auto", minWidth: "240px", padding: "4px 8px" }}
+                          value={modelsOverview.active_model_id || ""}
+                          disabled={
+                            isQuickSwitching || Boolean(modelsOverview.has_active_translation_job)
+                          }
+                          onChange={async (ev) => {
+                            const nextId = ev.target.value;
+                            if (!nextId || nextId === modelsOverview.active_model_id) return;
+                            setQuickSwitchError(null);
+                            setIsQuickSwitching(true);
+                            try {
+                              await onSelectModel(nextId);
+                            } catch (err) {
+                              setQuickSwitchError(err instanceof Error ? err.message : String(err));
+                            } finally {
+                              setIsQuickSwitching(false);
+                            }
+                          }}
+                        >
+                          {usableRegistered.map((reg) => (
+                            <option key={reg.registration_id} value={reg.registration_id}>
+                              {reg.display_name} ({reg.quantization}) - {reg.file_name}
+                            </option>
+                          ))}
+                        </select>
+                        {modelsOverview.has_active_translation_job && (
+                          <span style={{ fontSize: "11px", color: "#b45309" }}>
+                            翻訳ジョブ実行中のため切替不可
+                          </span>
+                        )}
+                      </div>
+                    )}
+
+                    {quickSwitchError && (
+                      <div
+                        role="alert"
+                        data-testid="screen1-quick-switch-error"
+                        className="alert alert-error"
+                        style={{ marginTop: "8px", fontSize: "12px" }}
+                      >
+                        {quickSwitchError}
+                      </div>
+                    )}
+
+                    {serverMatch &&
+                      (serverMatch.match_status === "mismatch" ||
+                        serverMatch.match_status === "selected_model_invalid") && (
+                        <div
+                          role="alert"
+                          data-testid="screen1-model-server-mismatch"
+                          className="alert alert-error"
+                          style={{ marginTop: "8px", fontSize: "12px" }}
+                        >
+                          <strong>モデル不整合・起動切替が必要:</strong> {serverMatch.message_ja}
+                        </div>
+                      )}
+
+                    {showModelDrawer &&
+                      hasModelActions &&
+                      onRefreshModels &&
+                      onBrowseLocalModelFile &&
+                      onRegisterLocalModel &&
+                      onSelectModel &&
+                      onDeleteModel &&
+                      onStartModelDownload &&
+                      onCancelModelDownload && (
+                        <div
+                          data-testid="screen1-model-drawer"
+                          style={{
+                            marginTop: "12px",
+                            paddingTop: "12px",
+                            borderTop: "1px solid #cbd5e1",
+                          }}
+                        >
+                          <ModelSelectionPanel
+                            compact
+                            overview={modelsOverview}
+                            activeDownload={activeModelDownload}
+                            isLoading={isLoadingModels}
+                            error={modelsError}
+                            onRefreshModels={onRefreshModels}
+                            onBrowseLocalFile={onBrowseLocalModelFile}
+                            onRegisterLocalModel={onRegisterLocalModel}
+                            onSelectModel={onSelectModel}
+                            onDeleteModel={onDeleteModel}
+                            onStartDownload={onStartModelDownload}
+                            onCancelDownload={onCancelModelDownload}
+                          />
+                        </div>
+                      )}
+                  </div>
+                )}
+
+                {/* Inference Mode (Real Default vs Explicit Mock) */}
+                <div className="form-group">
+                  <label className="form-label" htmlFor="inference-mode-select">
+                    推論エンジン（選択中：
+                    {activeModel ? activeModel.display_name : "PLaMo 3 Translate 2B"}）
+                  </label>
+                  <select
+                    id="inference-mode-select"
+                    data-testid="inference-mode-select"
+                    className="form-input"
+                    value={jobConfig.use_mock_translator ? "mock" : "real"}
+                    onChange={(ev) =>
+                      onUpdateJobConfig({
+                        ...jobConfig,
+                        use_mock_translator: ev.target.value === "mock",
+                      })
+                    }
+                  >
+                    <option value="real">
+                      実機推論（llama.cpp +{" "}
+                      {activeModel
+                        ? `${activeModel.display_name} ${activeModel.quantization}`
+                        : "PLaMo 3 Translate 2B Q4_K_M"}{" "}
+                      {endpointDisplay ? `@ ${endpointDisplay}` : "/ 設定済みllama-server"}）
+                    </option>
+                    <option value="mock">
+                      モック推論（UI・パイプライン検証用の決定論的疑似翻訳）
+                    </option>
+                  </select>
+                  {jobConfig.use_mock_translator ? (
+                    <div
+                      data-testid="mock-selected-warning"
+                      className="alert alert-warning"
+                      style={{ marginTop: "8px", fontSize: "13px" }}
+                    >
+                      <strong>[MOCK 選択中]</strong>{" "}
+                      現在はモック推論が明示選択されています。モックはUI・パイプライン確認用の決定論的疑似翻訳であり、実翻訳ではありません。生成される成果物には{" "}
+                      <code>is_mock_translation: true</code> が記録され、実機翻訳とは区別されます。
+                    </div>
+                  ) : (
+                    <div
+                      data-testid="real-inference-prerequisite-note"
+                      className="field-hint"
+                      style={{ marginTop: "8px", fontSize: "12px", color: "#334155" }}
+                    >
+                      実機翻訳には、本アプリとは別ターミナルで推論サーバ（選択中の翻訳モデルを指定した{" "}
+                      <code>llama-server</code>、
+                      {endpointDisplay ? (
+                        <>
+                          接続先設定: <code>{endpointDisplay}</code>
+                        </>
+                      ) : (
+                        "設定済み接続先"
+                      )}
+                      ）が応答し、接続できる状態である必要があります。接続できない場合（未起動のほか、ポート・URL設定差異や接続制限の可能性があります）や別モデルが応答する場合は、開始時エラーまたは中断となります。事前確認は画面4の「推論サーバ疎通確認」（翻訳リクエストは送信しません）で行えます。モデル未導入で画面動作のみ確認する場合は「モック推論」（実翻訳ではありません）を選択してください。
+                    </div>
+                  )}
+
+                  <ModelLicenseNotice
+                    variant="screen1"
+                    catalogModel={activeCatalogModel}
+                    activeModel={activeModel}
+                  />
+                </div>
+              </>
+            );
+          })()}
 
           {/* Glossary Selection */}
           <div className="form-group">
@@ -643,6 +891,8 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
                 ? "非翻訳ラウンドトリップ検証を実行"
                 : jobConfig.use_mock_translator
                 ? "モック翻訳ジョブを開始"
+                : modelsOverview?.active_model
+                ? `実機翻訳ジョブを開始 (${modelsOverview.active_model.short_name})`
                 : "実機 PLaMo 翻訳ジョブを開始"}
             </button>
           </div>

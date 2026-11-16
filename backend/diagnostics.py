@@ -386,11 +386,13 @@ def collect_system_diagnostics(
     llama_build: str | None = None
     llama_backend = "unknown"
     llama_pid: int | None = None
+    health_payload: dict[str, Any] | None = None
     if probe_llama:
         llama_backend = "unverified_from_api"
         try:
             adapter = LlamaCppPlamoAdapter(config=cfg, timeout_sec=2.0)
             health = adapter.check_health()
+            health_payload = health if isinstance(health, dict) else None
             llama_status = str(health.get("status", "server_unreachable"))
             loaded_model = (
                 health.get("model_name") if isinstance(health.get("model_name"), str) else None
@@ -409,6 +411,34 @@ def collect_system_diagnostics(
             llama_status = "server_unreachable"
             llama_pid = None
             llama_backend = "unverified_from_api"
+
+    from backend.models.registry import ModelRegistryManager
+
+    reg_mgr = ModelRegistryManager(
+        runtime_dir=cfg.runtime_dir,
+        catalog_path=cfg.model_catalog_path,
+    )
+    match_res = reg_mgr.compare_with_running_server(health_payload)
+    _cat_diag, reg_diag = reg_mgr.get_registry_snapshot(auto_migrate=False, revalidate=False)
+    active_reg = (
+        next((m for m in reg_diag.models if m.registration_id == reg_diag.active_model_id), None)
+        if reg_diag.active_model_id
+        else None
+    )
+    if active_reg is None:
+        active_status = "none"
+    elif active_reg.is_usable:
+        active_status = "usable"
+    elif not active_reg.verification.file_exists:
+        active_status = "missing_file"
+    else:
+        active_status = "invalid"
+
+    match_status_out = match_res.match_status if probe_llama or active_status != "usable" else "not_probed"
+    is_mismatch = (
+        (probe_llama and match_res.match_status == "mismatch")
+        or match_res.match_status == "selected_model_invalid"
+    )
 
     ram_mb = _query_windows_ram_mb()
     gpu_name, gpu_vram_mb, gpu_driver = _query_windows_gpu_info()
@@ -438,4 +468,13 @@ def collect_system_diagnostics(
         llama_compute_backend=llama_backend,
         llama_server_pid=llama_pid,
         loopback_only_enforced=not cfg.allow_external_translation_host,
+        active_registration_id=active_reg.registration_id if active_reg else None,
+        active_catalog_model_id=active_reg.catalog_model_id if active_reg else None,
+        active_model_display_name=active_reg.display_name if active_reg else None,
+        active_model_file_path=active_reg.file_path if active_reg else None,
+        active_model_status=active_status,
+        running_server_model_path=match_res.running_model_path,
+        model_server_match_status=match_status_out,
+        model_server_match_message=match_res.message_ja if (probe_llama or active_status != "usable") else None,
+        model_server_mismatch=is_mismatch,
     )

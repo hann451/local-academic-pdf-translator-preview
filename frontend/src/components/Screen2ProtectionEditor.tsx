@@ -73,6 +73,12 @@ export interface Screen2Props {
     override: "force_translate" | "force_protect" | null
   ) => Promise<void>;
   onReapplyAutoProtection?: () => Promise<void>;
+  syncStatus?: "loading" | "synced" | "error";
+  syncError?: string | null;
+  unsavedSyncBlocked?: boolean;
+  onSyncDocumentData?: (options?: { forceDiscardUnsaved?: boolean }) => Promise<void>;
+  onDismissUnsavedSyncWarning?: () => void;
+  onDirtyStateChange?: (isDirty: boolean) => void;
 }
 
 interface BlockVisualStyle {
@@ -224,6 +230,12 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
   onDeleteBlockSplit,
   onProceedToStartJob,
   jobStartError = null,
+  syncStatus = "synced",
+  syncError = null,
+  unsavedSyncBlocked = false,
+  onSyncDocumentData,
+  onDismissUnsavedSyncWarning,
+  onDirtyStateChange,
 }) => {
   const [displayPage, setDisplayPage] = useState<number>(1);
   const [scale, setScale] = useState<number>(1.0);
@@ -243,6 +255,36 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
   const [dragNotice, setDragNotice] = useState<string | null>(null);
   const [allowPendingSplitsStart, setAllowPendingSplitsStart] = useState<boolean>(false);
+  const [localUnsavedSyncPrompt, setLocalUnsavedSyncPrompt] = useState<boolean>(false);
+  const [dragStart, setDragStart] = useState<[number, number] | null>(null);
+  const [dragCurrent, setDragCurrent] = useState<[number, number] | null>(null);
+
+  const hasUnsavedEdits = Boolean(
+    splitPreview !== null ||
+      splitNote.trim().length > 0 ||
+      newRegionNote.trim().length > 0 ||
+      dragStart !== null
+  );
+
+  useEffect(() => {
+    onDirtyStateChange?.(hasUnsavedEdits);
+  }, [hasUnsavedEdits, onDirtyStateChange]);
+
+  const handleRequestSync = async (forceDiscardUnsaved: boolean = false) => {
+    if (!forceDiscardUnsaved && hasUnsavedEdits) {
+      setLocalUnsavedSyncPrompt(true);
+      await onSyncDocumentData?.({ forceDiscardUnsaved: false });
+      return;
+    }
+    if (forceDiscardUnsaved) {
+      setSplitPreview(null);
+      setSplitNote("");
+      setNewRegionNote("");
+      setSplitActionError(null);
+      setLocalUnsavedSyncPrompt(false);
+    }
+    await onSyncDocumentData?.({ forceDiscardUnsaved });
+  };
 
   const pendingSplits = blockSplits.filter((sp) =>
     sp.applied_status.startsWith("pending_")
@@ -254,9 +296,6 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
   useEffect(() => {
     setAllowPendingSplitsStart(false);
   }, [pendingSplitSignature]);
-
-  const [dragStart, setDragStart] = useState<[number, number] | null>(null);
-  const [dragCurrent, setDragCurrent] = useState<[number, number] | null>(null);
 
   const totalPages = Math.max(1, document.page_count);
   const safeDisplayPage = Math.max(1, Math.min(totalPages, displayPage));
@@ -443,6 +482,7 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
       mode: newRegionMode,
       note: newRegionNote.trim() || null,
     });
+    setNewRegionNote("");
   };
 
   const activeDragRect: BBox4 | null =
@@ -533,14 +573,32 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
           </div>
 
           {/* Save Status & Actions */}
-          <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+            <span
+              data-testid="screen2-sync-status"
+              className={`badge ${
+                syncStatus === "error"
+                  ? "badge-error"
+                  : syncStatus === "loading"
+                  ? "badge-info"
+                  : "badge-success"
+              }`}
+            >
+              {syncStatus === "loading"
+                ? "最新状態を取得中..."
+                : syncStatus === "error"
+                ? "同期失敗（古い状態の可能性）"
+                : "最新同期済み"}
+            </span>
             <span
               data-testid="protection-save-status"
               className={`badge ${
                 saveStatus === "error"
                   ? "badge-error"
-                  : saveStatus === "saving"
+                  : saveStatus === "saving" || syncStatus === "error"
                   ? "badge-warning"
+                  : syncStatus === "loading"
+                  ? "badge-neutral"
                   : "badge-success"
               }`}
             >
@@ -548,13 +606,28 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
                 ? "保存・反映中..."
                 : saveStatus === "error"
                 ? "保存エラー"
+                : syncStatus === "error"
+                ? `前回取得状態 (rev ${document.protection_revision} / 要再同期)`
+                : syncStatus === "loading"
+                ? `同期確認中 (rev ${document.protection_revision})`
                 : `保存済み (rev ${document.protection_revision})`}
             </span>
+            {onSyncDocumentData && (
+              <button
+                type="button"
+                className="btn btn-secondary"
+                data-testid="screen2-refresh-sync-btn"
+                disabled={syncStatus === "loading" || isParsing || saveStatus === "saving"}
+                onClick={() => void handleRequestSync(false)}
+              >
+                {syncStatus === "loading" ? "取得中..." : "🔄 最新状態を再取得"}
+              </button>
+            )}
             <button
               type="button"
               className="btn btn-secondary"
               data-testid="reparse-blocks-btn"
-              disabled={isParsing}
+              disabled={isParsing || syncStatus === "loading"}
               onClick={() => void onReparseBlocks()}
             >
               {isParsing ? "解析中..." : "保護領域を反映してブロック再解析"}
@@ -564,7 +637,7 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
                 type="button"
                 className="btn btn-secondary"
                 data-testid="reapply-auto-protection-btn"
-                disabled={isParsing}
+                disabled={isParsing || syncStatus === "loading"}
                 onClick={() => void onReapplyAutoProtection()}
               >
                 初期非翻訳判定を再適用
@@ -574,7 +647,11 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
               type="button"
               className="btn btn-primary"
               data-testid="screen2-start-job-btn"
-              disabled={pendingSplits.length > 0 && !allowPendingSplitsStart}
+              disabled={
+                syncStatus === "loading" ||
+                syncStatus === "error" ||
+                (pendingSplits.length > 0 && !allowPendingSplitsStart)
+              }
               onClick={() =>
                 void onProceedToStartJob(
                   allowPendingSplitsStart ? { allowPendingSplits: true } : undefined
@@ -585,6 +662,92 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
             </button>
           </div>
         </div>
+
+        {syncStatus === "loading" && (
+          <div
+            data-testid="screen2-sync-loading-banner"
+            className="alert alert-info"
+            style={{ marginTop: "10px", fontSize: "13px" }}
+          >
+            選択中文書の最新のブロック一覧およびブロック分割指定を取得しています...
+          </div>
+        )}
+
+        {syncStatus === "error" && (
+          <div
+            role="alert"
+            data-testid="screen2-sync-error-banner"
+            className="alert alert-error"
+            style={{
+              marginTop: "10px",
+              fontSize: "13px",
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              flexWrap: "wrap",
+              gap: "8px",
+            }}
+          >
+            <div>
+              <strong>最新状態の取得に失敗しました:</strong>{" "}
+              {syncError ? `${syncError} — ` : ""}
+              下の表示内容（rev {document.protection_revision}）は前回取得時の古い状態である可能性があり、最新状態ではありません。操作や翻訳開始の前に再取得してください。
+            </div>
+            {onSyncDocumentData && (
+              <button
+                type="button"
+                className="btn btn-secondary"
+                data-testid="screen2-retry-sync-btn"
+                onClick={() => void handleRequestSync(false)}
+              >
+                🔄 再取得
+              </button>
+            )}
+          </div>
+        )}
+
+        {(unsavedSyncBlocked || localUnsavedSyncPrompt) && (
+          <div
+            role="alert"
+            data-testid="screen2-unsaved-sync-warning"
+            className="alert alert-warning"
+            style={{
+              marginTop: "10px",
+              fontSize: "13px",
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              flexWrap: "wrap",
+              gap: "8px",
+            }}
+          >
+            <div>
+              <strong>未保存の編集を保護しました:</strong>{" "}
+              未確定の分割プレビューまたは入力中のメモがあるため、最新状態による無断上書きを行っていません。
+            </div>
+            <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                data-testid="screen2-keep-unsaved-btn"
+                onClick={() => {
+                  setLocalUnsavedSyncPrompt(false);
+                  onDismissUnsavedSyncWarning?.();
+                }}
+              >
+                このまま編集を続ける
+              </button>
+              <button
+                type="button"
+                className="btn btn-danger-sm"
+                data-testid="screen2-discard-and-sync-btn"
+                onClick={() => void handleRequestSync(true)}
+              >
+                未保存の編集を破棄して最新状態を取得
+              </button>
+            </div>
+          </div>
+        )}
 
         {pendingSplits.length > 0 && (
           <div
@@ -1326,6 +1489,11 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
 
           <h4 style={{ margin: "0 0 8px 0", fontSize: "14px" }}>
             このページの分割指定 ({pageSplits.length}件)
+            {syncStatus === "error" && (
+              <span className="badge badge-error" style={{ marginLeft: "6px" }}>
+                古い表示の可能性
+              </span>
+            )}
           </h4>
           {pageSplits.length === 0 ? (
             <div style={{ fontSize: "12px", color: "#64748b", marginBottom: "12px" }}>
@@ -1486,6 +1654,11 @@ export const Screen2ProtectionEditor: React.FC<Screen2Props> = ({
 
           <h4 style={{ margin: "0 0 8px 0", fontSize: "14px" }}>
             検出ブロック一覧 (Page {safeDisplayPage}: {pageBlocks.length}件)
+            {syncStatus === "error" && (
+              <span className="badge badge-error" style={{ marginLeft: "6px" }}>
+                古い表示の可能性
+              </span>
+            )}
           </h4>
           <div style={{ maxHeight: "260px", overflowY: "auto" }}>
             {pageBlocks.map((b) => {

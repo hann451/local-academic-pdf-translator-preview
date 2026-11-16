@@ -17,6 +17,18 @@ Windows向けのローカル学術論文PDF翻訳アプリ（**Windows向け・�
     - 一方で、縦積み分数、数式の途中で複数ブロックに分割され深く重複している段落（`TRANSLATED_BLOCK_OVERLAP_FALLBACK`）、最小フォントサイズ（`8.0pt`）でも元の枠に収まらない狭小・高密度段落（`TYPESETTING_OVERFLOW_FALLBACK`）、同一ブロック内で同一変数表記に上付き・下付き・通常表記等の競合や分割曖昧性がある段落（`AMBIGUOUS_INLINE_MATH_FALLBACK`）、独立した数式ブロックや式番号周辺の一部（`PROTECTED_SKIP` / `PROTECTED_REGION_OVERLAP_FALLBACK`）、および複雑な多段数式や環境依存の特殊グリフは日本語へ再組版できず、元の英語表記を安全に保持（原文フォールバック＋警告記録）するか翻訳対象外となります。すべての数式表現やレイアウトが維持されるわけではありません。
   - 記録された従来の手動検証例（Windows 11 x64、CPython 3.13.13、uv 0.11.15、Node.js 22.20.0 / npm 10.9.3、AMD Radeon RX 7600、llama.cpp Vulkan版）も 1 つの実機確認例であり、最低ハードウェア要件の確定は未検証です（Python許容範囲は `pyproject.toml` 上 `>=3.12,<3.14`）。詳細は[Windowsセットアップガイド](docs/SETUP_WINDOWS.md)、[公開向け制約](docs/PUBLIC_LIMITATIONS.md)、[公開向け検証状況](docs/VERIFICATION.md)を参照してください。
 
+## モデル選択・導入機能（変更概要）
+
+翻訳モデルを選んで導入できるようになりました（ブランチ `feat/model-selection-setup`）。
+
+- カタログ（PLaMo 3 Translate 0.8B / 2B / 8B、Q4_K_M）からの選択、ライセンス確認・同意を伴うダウンロード、ダウンロード済み GGUF のファイル参照登録（再ダウンロード不要）、SHA-256・GGUF 形式・互換性の検証、使用モデルの選択。
+- 選択モデルと稼働中の `llama-server` が一致しない場合は、翻訳開始を拒否します。
+- **2B が既定・推奨**です。0.8B は軽量な選択肢で、訳語や文脈依存の誤訳が残ります。**8B はカタログに収録されていますが、実機では未検証**です。
+- Web UI でモデルを選んでも、起動済みの `llama-server` が自動で切り替わったり再起動したりするわけではありません。同一ランチャーによるモデル切替・再起動の一連の操作は未検証です。
+- 行末ハイフンの正規化と、高確信度の単文字数式変数の保護（補助警告つき）も追加しています。保護できない変数があるなど、制約があります。
+
+詳細は [モデル選択・導入機能の概要](docs/MODEL_SELECTION.md)、検証記録は [公開向け検証状況](docs/VERIFICATION.md)、制約は [公開向け制約](docs/PUBLIC_LIMITATIONS.md) を参照してください。
+
 ## 初回自動セットアップについて
 
 本機能は、Windows x64向けの試験導入機能です。
@@ -42,8 +54,8 @@ ZIP内から直接実行せず、必ず展開してから使用してくださ�
 - 対象はWindows x64です。すべてのWindows・CPU・GPU構成での
   動作を保証するものではありません。
 - 初回セットアップにはインターネット接続が必要です。
-- モデルを新規取得する場合、通信量の目安は合計約2.1～2.2GBです。
-  パッケージ更新や再試行などにより変動します。
+- 既定の 2B モデルを新規取得する場合、通信量の目安は合計約2.1～2.2GBです。
+  選択モデル（0.8B 約0.57GB / 2B 約1.81GB / 8B 約5.28GB）や既存GGUFの参照登録、パッケージ更新や再試行などにより変動します。
 - 空き容量は5GB以上を目安にしてください。
   利用するPDFや成果物に応じて追加容量が必要です。
 - GPUが利用できない場合に備えてCPUモードを用意しています。
@@ -138,7 +150,7 @@ Pop-Location
 
 ### 4. 推論サーバーとモデルの起動（実機翻訳を行う場合）
 
-実機翻訳を行うには、本アプリとは別プロセスで `llama-server.exe`（既定 `127.0.0.1:8000`）と `plamo-3-translate-2b-Q4_K_M.gguf` を起動しておく必要があります。取得元・配置パス・GPU/CPU別の起動コマンドは[Windowsセットアップガイドの「7. 実機モデルと推論サーバー」節](docs/SETUP_WINDOWS.md)を参照し、**推論サーバー用ターミナル（ターミナル1）** で起動したままにしてください（実行ファイルとモデル本体はGitに含めないでください）。
+実機翻訳を行うには、本アプリとは別プロセスで `llama-server.exe`（既定 `127.0.0.1:8000`）と、選択したモデルの GGUF（既定・推奨は `plamo-3-translate-2b-Q4_K_M.gguf`）を起動しておく必要があります。モデルの選択・導入・既存 GGUF の登録は[モデル選択・導入機能の概要](docs/MODEL_SELECTION.md)を参照してください（Web UI のモデル選択は、起動済みの `llama-server` を切り替えません）。取得元・配置パス・GPU/CPU別の起動コマンドは[Windowsセットアップガイドの「7. 実機モデルと推論サーバー」節](docs/SETUP_WINDOWS.md)を参照し、**推論サーバー用ターミナル（ターミナル1）** で起動したままにしてください（実行ファイルとモデル本体はGitに含めないでください）。
 
 ### 5. アプリ本体の起動とブラウザー接続
 
@@ -164,7 +176,7 @@ uv run uvicorn backend.api.app:app --host 127.0.0.1 --port 8080
 
 ## ライセンスとモデル利用条件（Built with PLaMo）
 
-- **Built with PLaMo / 想定モデル:** 本ツールは翻訳モデルとして **PLaMo 3 Translate**（公式配布元: [pfnet/plamo-3-translate-2b-GGUF](https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF)）の使用を想定して設計されています（**Built with PLaMo**）。本ツールは Preferred Networks（PFN）の公式製品ではありません。
+- **Built with PLaMo / 想定モデル:** 本ツールは翻訳モデルとして **PLaMo 3 Translate**（既定・推奨の 2B の公式配布元: [pfnet/plamo-3-translate-2b-GGUF](https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF)。0.8B・8B もカタログに収録）の使用を想定して設計されています（**Built with PLaMo**）。本ツールは Preferred Networks（PFN）の公式製品ではありません。
 - **ソースコードと直接依存:** アプリ本体の自作部分は [GNU AGPL version 3](LICENSE)（SPDX: `AGPL-3.0-only`）でライセンスします。適用範囲と著作権表示は [COPYRIGHT.md](COPYRIGHT.md)、直接依存パッケージの通知は [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) を参照してください。
 - **モデルの非同梱・独立したライセンスと契約条件の遵守（PLaMo 3 Translate）:** 本リポジトリは **PLaMo 3 Translate** モデル本体・派生モデル・翻訳生成物を同梱・再配布しません。ツール本体（`AGPL-3.0-only`）とモデルのライセンスは別であり、**PLaMo 3 Translate** にはPreferred Networks（PFN）が定める **PLaMoコミュニティライセンス契約**（公式条文URL: [日本語版](https://plamo.preferredai.jp/info/plamo-community-license-ja) / [英語版](https://plamo.preferredai.jp/info/plamo-community-license-en)）が別途適用されます。モデル非同梱であっても、利用者は公式リンク等で案内されるモデルの契約条件を確認・遵守する必要があります（`Built with PLaMo` の表示場所については、READMEやUIへの記載で足りる旨の回答に基づき、本READMEおよびアプリ画面1・画面4に記載しています。リンクは利用者がクリックしたときのみ開き、起動時に自動通信しません）。なお、以下は **PLaMo 3 Translate** に関して2026年11月9日改定のPLaMoコミュニティライセンス契約に基づきPFNから受領した回答要旨を反映した案内であり、公開条文ページの再照合記録や、過去のモデル取得時点（2026-11-06、revision `232fbd7916519edecddfdae0beae7e76fe70453f`）および改定前（2026-11-07 / 2026-11-08）の条文確認記録とは区別します（利用者は自身のモデル取得・利用時点における公式条文を確認してください）。
 - **PLaMo 3 Translate による翻訳PDFの提供・公表に関する条件と注意事項（PFN回答に基づく案内）:**
@@ -174,6 +186,7 @@ uv run uvicorn backend.api.app:app --host 127.0.0.1 --port 8080
 ## ドキュメント
 
 - [Windows環境セットアップ手順](docs/SETUP_WINDOWS.md)
+- [モデル選択・導入機能の概要](docs/MODEL_SELECTION.md)
 - [全体仕様書](docs/SPEC.md)
 - [アーキテクチャ設計](docs/ARCHITECTURE.md)
 - [API契約・座標・認証仕様書](docs/API_CONTRACT.md)

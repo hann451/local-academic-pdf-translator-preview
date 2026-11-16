@@ -365,7 +365,14 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
                 data-testid="job-engine-mode-badge"
                 className={`badge ${job.is_mock_run ? "badge-warning" : "badge-success"}`}
               >
-                {job.is_mock_run ? "[MOCK 疑似翻訳]" : "[実機 PLaMo 3 Translate 2B]"}
+                {job.is_mock_run
+                  ? "[MOCK 疑似翻訳]"
+                  : `[実機 ${
+                      job.execution_provenance?.model_display_name ||
+                      (job.config.model_name === "plamo-3-translate-2b-Q4_K_M"
+                        ? "PLaMo 3 Translate 2B"
+                        : job.config.model_name)
+                    }]`}
               </span>
 
               {job.outputs_stale && (
@@ -406,9 +413,18 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
                 <div>
                   実行経路: {job.execution_provenance.adapter_name ?? "不明"}（
                   {job.execution_provenance.engine_process ?? "-"}） / モデル:{" "}
-                  {job.execution_provenance.model_file ??
-                    job.execution_provenance.model_name ??
-                    "不明"}{" "}
+                  {job.execution_provenance.model_display_name
+                    ? `${job.execution_provenance.model_display_name} (${
+                        job.execution_provenance.model_file ??
+                        job.execution_provenance.model_name ??
+                        "不明"
+                      })`
+                    : job.execution_provenance.model_file ??
+                      job.execution_provenance.model_name ??
+                      "不明"}
+                  {job.execution_provenance.model_sha256
+                    ? ` [SHA:${job.execution_provenance.model_sha256.slice(0, 12)}]`
+                    : ""}{" "}
                   / 計算: {job.execution_provenance.compute_backend ?? "不明"}
                   {job.execution_provenance.is_mock ? "（疑似翻訳）" : ""}
                 </div>
@@ -494,7 +510,7 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
               </div>
               {isConnectionError ? (
                 <div data-testid="job-error-recovery-guide" style={{ marginTop: "4px", fontSize: "12px" }}>
-                  対処方法：別ターミナルで PLaMo モデルを指定して <code>llama-server</code>{" "}
+                  対処方法：別ターミナルで選択中の翻訳モデルを指定して <code>llama-server</code>{" "}
                   を起動し、画面4の「推論サーバ疎通確認」（翻訳リクエストは送信しません）で接続を確認してください。
                   {canResume && (
                     <>

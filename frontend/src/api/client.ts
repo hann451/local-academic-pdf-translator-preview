@@ -15,14 +15,21 @@ import type {
   BlockSplitMutationResponse,
   BlockSplitPreviewResult,
   BlockSplitSpec,
+  BrowseLocalModelResponse,
   Document,
   ExportArtifact,
   Glossary,
   GlossaryEntry,
   Job,
+  ModelDownloadJob,
+  ModelSelectResponse,
+  ModelsOverviewResponse,
   ProtectionMode,
   ProtectionRegion,
+  RegisteredModel,
+  RegisterLocalModelRequest,
   RetypesetJobResponse,
+  StartModelDownloadRequest,
   SystemDiagnostics,
   TranslationJobConfig,
   ValidationIssue,
@@ -616,6 +623,86 @@ export async function purgeRuntimeTempData(): Promise<{
     "/api/runtime/temp-data",
     {
       method: "DELETE",
+    }
+  );
+}
+
+// --- Model Selection, Download & Local Registry ---
+export async function fetchModelsOverview(
+  probeLlama: boolean = false
+): Promise<ModelsOverviewResponse> {
+  return apiRequest<ModelsOverviewResponse>(
+    `/api/models?probe_llama=${probeLlama ? "true" : "false"}`
+  );
+}
+
+export async function browseLocalModelFile(): Promise<BrowseLocalModelResponse> {
+  return apiRequest<BrowseLocalModelResponse>("/api/models/browse-local-file", {
+    method: "POST",
+  });
+}
+
+export async function registerLocalModel(
+  payload: RegisterLocalModelRequest
+): Promise<RegisteredModel> {
+  return apiRequest<RegisteredModel>("/api/models/register-local", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function selectActiveModel(
+  registrationId: string,
+  probeLlama: boolean = true
+): Promise<ModelSelectResponse> {
+  return apiRequest<ModelSelectResponse>(
+    `/api/models/${encodeURIComponent(registrationId)}/select?probe_llama=${
+      probeLlama ? "true" : "false"
+    }`,
+    {
+      method: "POST",
+    }
+  );
+}
+
+export async function deleteRegisteredModel(registrationId: string): Promise<{
+  deleted: boolean;
+  registration_id: string;
+  active_model_id: string | null;
+}> {
+  return apiRequest<{
+    deleted: boolean;
+    registration_id: string;
+    active_model_id: string | null;
+  }>(`/api/models/${encodeURIComponent(registrationId)}`, {
+    method: "DELETE",
+  });
+}
+
+export async function startModelDownload(
+  payload: StartModelDownloadRequest
+): Promise<ModelDownloadJob> {
+  return apiRequest<ModelDownloadJob>("/api/models/downloads", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function fetchModelDownload(
+  downloadId: string
+): Promise<ModelDownloadJob> {
+  return apiRequest<ModelDownloadJob>(
+    `/api/models/downloads/${encodeURIComponent(downloadId)}`
+  );
+}
+
+export async function cancelModelDownload(
+  downloadId: string
+): Promise<ModelDownloadJob> {
+  return apiRequest<ModelDownloadJob>(
+    `/api/models/downloads/${encodeURIComponent(downloadId)}/cancel`,
+    {
+      method: "POST",
     }
   );
 }

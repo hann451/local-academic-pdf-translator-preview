@@ -443,6 +443,122 @@ describe("Full Application E2E Workflow (Screen 1 -> Screen 2 -> Screen 3 -> Scr
         );
       }
 
+      if (method === "GET" && url.startsWith("/api/models")) {
+        const isProbe = url.includes("probe_llama=true");
+        const activeReg = {
+          registration_id: "reg-plamo-3-translate-2b-q4_k_m-e2e",
+          catalog_model_id: "plamo-3-translate-2b-q4_k_m",
+          display_name: "PLaMo 3 Translate 2B (Q4_K_M)",
+          short_name: "PLaMo 3 Translate 2B",
+          provider: "Preferred Networks, Inc.",
+          parameter_size: "2B",
+          quantization: "Q4_K_M",
+          source_type: "migrated_legacy",
+          file_path: "C:\\models\\plamo-3-translate-2b-Q4_K_M.gguf",
+          file_name: "plamo-3-translate-2b-Q4_K_M.gguf",
+          file_size_bytes: 1807203040,
+          file_mtime_ns: 1,
+          measured_sha256: "1ffd9073afcc70e35ccc942428aa2b73d7aa2b9ea779bf504b775369e0276c13",
+          gguf_architecture: "plamo3",
+          gguf_model_name: "plamo-3-translate-2b",
+          verification: {
+            file_exists: true,
+            format_valid: true,
+            hash_status: "matched_known",
+            backend_compatible: true,
+            launch_verified: true,
+            translation_verified: true,
+            matched_revision: "4f672106b847200bfdc0f6af6c321cd94eba1aed",
+            matched_label: "official-2026-11-09",
+            validation_error: null,
+            validated_at: "2026-11-15T12:00:00Z",
+          },
+          license_accepted: true,
+          license_accepted_at: "2026-11-15T12:00:00Z",
+          created_at: "2026-11-15T12:00:00Z",
+          updated_at: "2026-11-15T12:00:00Z",
+        };
+        return new Response(
+          JSON.stringify({
+            catalog: [
+              {
+                model_id: "plamo-3-translate-2b-q4_k_m",
+                display_name: "PLaMo 3 Translate 2B (Q4_K_M)",
+                short_name: "PLaMo 3 Translate 2B",
+                provider: "Preferred Networks, Inc.",
+                family: "plamo-3-translate",
+                parameter_size: "2B",
+                quantization: "Q4_K_M",
+                is_default: true,
+                source_repo: "pfnet/plamo-3-translate-2b-GGUF",
+                source_repo_type: "huggingface",
+                pinned_revision: "4f672106b847200bfdc0f6af6c321cd94eba1aed",
+                filename: "plamo-3-translate-2b-Q4_K_M.gguf",
+                relative_subdir: "plamo-3-translate-2b-GGUF",
+                download_url: "https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF/resolve/4f672106b847200bfdc0f6af6c321cd94eba1aed/plamo-3-translate-2b-Q4_K_M.gguf",
+                model_card_url: "https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF",
+                known_size_bytes: 1807203040,
+                known_sha256: "1ffd9073afcc70e35ccc942428aa2b73d7aa2b9ea779bf504b775369e0276c13",
+                accepted_artifacts: [],
+                supported_backends: ["llama.cpp"],
+                expected_gguf_architecture: "plamo3",
+                expected_gguf_name_prefix: "plamo-3-translate-2b",
+                prompt_format: "pfml3",
+                prompt_version: "pfml3-v1",
+                stop_tokens: [],
+                context_length_default: 8192,
+                context_length_max: 32768,
+                launch_settings: {
+                  alias: "plamo-3-translate-2b-q4_k_m",
+                  context_length: 8192,
+                  parallel_slots: 1,
+                  gpu_layers_auto: 99,
+                  extra_args: [],
+                },
+                catalog_verification_status: "verified_runtime",
+                hardware_note_ja: "標準推奨",
+                license: {
+                  id: "plamo-community-license",
+                  name: "PLaMoコミュニティライセンス契約",
+                  tagline: "Built with PLaMo",
+                  url_ja: "https://plamo.preferredai.jp/info/plamo-community-license-ja",
+                  url_en: "https://plamo.preferredai.jp/info/plamo-community-license-en",
+                  model_card_url: "https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF",
+                  summary_ja: "PLaMoライセンス案内",
+                  disclosure_note_ja: "Built with PLaMo",
+                  requires_agreement: true,
+                },
+              },
+            ],
+            unsupported_policies: {},
+            registered: [activeReg],
+            active_model_id: activeReg.registration_id,
+            active_model: activeReg,
+            has_active_translation_job: false,
+            managed_models_dir: "C:\\runtime\\models",
+            downloads: [],
+            server_match: isProbe
+              ? {
+                  match_status: "matched",
+                  is_matched: true,
+                  active_registration_id: activeReg.registration_id,
+                  active_catalog_model_id: activeReg.catalog_model_id,
+                  active_display_name: activeReg.display_name,
+                  active_file_path: activeReg.file_path,
+                  active_sha256_prefix: activeReg.measured_sha256.slice(0, 12),
+                  running_loaded_alias: "plamo-3-translate",
+                  running_model_path: activeReg.file_path,
+                  running_model_file: activeReg.file_name,
+                  running_identified_model_id: activeReg.catalog_model_id,
+                  running_identified_display_name: activeReg.display_name,
+                  message_ja: "一致",
+                }
+              : null,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+
       throw new Error(`Unhandled fetch in E2E test: ${method} ${url}`);
     });
 
@@ -458,11 +574,16 @@ describe("Full Application E2E Workflow (Screen 1 -> Screen 2 -> Screen 3 -> Scr
     await waitFor(() => {
       expect(screen.getByTestId("preflight-result-card")).toBeInTheDocument();
     });
+    const modeSelect = screen.getByTestId("inference-mode-select");
+    expect(modeSelect).toHaveTextContent("@ 127.0.0.1:8089");
+    expect(modeSelect).not.toHaveTextContent("127.0.0.1:8000");
 
-    // 2. Navigate to Screen 2 (Protection Editor)
+    // 2. Navigate to Screen 2 (Protection Editor) and wait for initial sync
     fireEvent.click(screen.getByTestId("open-screen2-btn"));
     await waitFor(() => {
       expect(screen.getByTestId("screen2-protection-editor")).toBeInTheDocument();
+      expect(screen.getByTestId("screen2-sync-status")).toHaveTextContent("最新同期済み");
+      expect(screen.getByTestId("screen2-start-job-btn")).not.toBeDisabled();
     });
 
     // 3. Start Job from Screen 2 -> automatically transitions to Screen 3

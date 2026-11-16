@@ -3,7 +3,10 @@ param(
     [switch]$AcceptAgreements = $false,
     [ValidateSet("", "Download", "Local", "Skip")]
     [string]$ModelMode = "",
+    [string]$ModelId = "",
     [string]$PreselectedModelPath = "",
+    [ValidateSet("Reference", "Copy")]
+    [string]$LocalRegisterMode = "Reference",
     [switch]$SkipShortcut = $false,
     [switch]$ForceReinstallTools = $false,
     [string]$UserDataDir = "",
@@ -18,6 +21,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptDir
+. (Join-Path $ScriptDir "model_registry_common.ps1")
 $FrontendDir = Join-Path $ProjectRoot "frontend"
 $RuntimeToolsDir = Join-Path $ProjectRoot ".runtime_tools"
 $RuntimeProfilePath = Join-Path $RuntimeToolsDir "runtime_profile.json"
@@ -59,8 +63,9 @@ if ([string]::IsNullOrWhiteSpace($ShortcutName)) {
 
 $LogsDir = Join-Path $UserDataDir "logs"
 $SetupLogPath = Join-Path $LogsDir "setup.log"
-$UserModelDir = Join-Path $UserDataDir "models\plamo-3-translate-2b-GGUF"
-$ProjectModelDir = Join-Path $ProjectRoot "models\plamo-3-translate-2b-GGUF"
+
+$Catalog = Get-PaperBridgeModelCatalog -ProjectRoot $ProjectRoot
+$InitialCatalogModel = Get-CatalogModelById -Catalog $Catalog -ModelId $ModelId
 
 # Pinned Tool Specifications (Matches docs/SETUP_WINDOWS.md and verified upstream digests)
 $PINNED_TOOLS = @{
@@ -101,13 +106,6 @@ $PINNED_TOOLS = @{
         ExeName     = "llama-server.exe"
     }
 }
-
-$MODEL_FILE_NAME = "plamo-3-translate-2b-Q4_K_M.gguf"
-$MODEL_SIZE = 1807199392L
-$MODEL_SHA256 = "f36d0813dd95573a852ab5d76e374c543632d9e292929e922bcdbf7e53b494e0"
-$MODEL_URL = "https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF/resolve/232fbd7916519edecddfdae0beae7e76fe70453f/plamo-3-translate-2b-Q4_K_M.gguf"
-$PLAMO_LICENSE_JA = "https://plamo.preferredai.jp/info/plamo-community-license-ja"
-$PLAMO_LICENSE_EN = "https://plamo.preferredai.jp/info/plamo-community-license-en"
 
 $script:IsInteractive = (-not $AcceptAgreements)
 $script:CancelRequested = $false
@@ -455,7 +453,7 @@ function Invoke-LoggedExternalCommand {
 }
 
 function Check-DiskSpace {
-    param([bool]$NeedsModelSpace)
+    param([int64]$AdditionalModelBytes = 0L)
     $projRootStr = [System.IO.Path]::GetPathRoot($ProjectRoot)
     $dataRootStr = [System.IO.Path]::GetPathRoot($UserDataDir)
     if ($projRootStr -notmatch '^[A-Za-z]:\\') {
@@ -464,18 +462,20 @@ function Check-DiskSpace {
     }
     $projDrive = [System.IO.DriveInfo]::new($projRootStr)
     $sameDrive = ($projRootStr.ToUpperInvariant() -eq $dataRootStr.ToUpperInvariant())
-    $reqProjBytes = if ($NeedsModelSpace -and $sameDrive) { 4500L * 1MB } else { 2500L * 1MB }
+    $headroom = if ($AdditionalModelBytes -gt 0L) { 300L * 1MB } else { 0L }
+    $reqProjBytes = if ($sameDrive) { (2500L * 1MB) + $AdditionalModelBytes + $headroom } else { 2500L * 1MB }
     if ($projDrive.AvailableFreeSpace -lt $reqProjBytes) {
         $availGb = [math]::Round($projDrive.AvailableFreeSpace / 1GB, 2)
         $reqGb = [math]::Round($reqProjBytes / 1GB, 2)
         throw "ドライブ $($projRootStr) の空き容量が不足しています (必要目安: $reqGb GB以上 / 現在: $availGb GB)。"
     }
-    if ($NeedsModelSpace -and -not $sameDrive -and ($dataRootStr -match '^[A-Za-z]:\\')) {
+    if ($AdditionalModelBytes -gt 0L -and -not $sameDrive -and ($dataRootStr -match '^[A-Za-z]:\\')) {
         $dataDrive = [System.IO.DriveInfo]::new($dataRootStr)
-        $reqDataBytes = 2000L * 1MB
+        $reqDataBytes = $AdditionalModelBytes + (300L * 1MB)
         if ($dataDrive.AvailableFreeSpace -lt $reqDataBytes) {
             $availGb = [math]::Round($dataDrive.AvailableFreeSpace / 1GB, 2)
-            throw "モデル保存先ドライブ $($dataRootStr) の空き容量が不足しています (必要目安: 2.0 GB以上 / 現在: $availGb GB)。"
+            $reqDataGb = [math]::Round($reqDataBytes / 1GB, 2)
+            throw "モデル保存先ドライブ $($dataRootStr) の空き容量が不足しています (必要目安: $reqDataGb GB以上 / 現在: $availGb GB)。"
         }
     }
 }
@@ -483,7 +483,7 @@ function Check-DiskSpace {
 function Show-ConsentDialog {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "PaperBridge Local - 初回自動セットアップ"
-    $form.Size = New-Object System.Drawing.Size(680, 710)
+    $form.Size = New-Object System.Drawing.Size(685, 740)
     $form.StartPosition = "CenterScreen"
     $form.FormBorderStyle = "FixedDialog"
     $form.MaximizeBox = $false
@@ -491,129 +491,141 @@ function Show-ConsentDialog {
     $form.Font = New-Object System.Drawing.Font("Yu Gothic UI", 9.5)
 
     $lblHead = New-Object System.Windows.Forms.Label
-    $lblHead.Location = New-Object System.Drawing.Point(20, 14)
-    $lblHead.Size = New-Object System.Drawing.Size(625, 28)
-    $lblHead.Text = "初回セットアップの確認 (外部ツールの取得と環境構築)"
+    $lblHead.Location = New-Object System.Drawing.Point(20, 12)
+    $lblHead.Size = New-Object System.Drawing.Size(630, 26)
+    $lblHead.Text = "初回セットアップの確認 (外部ツールの取得と翻訳モデル選択)"
     $lblHead.Font = New-Object System.Drawing.Font("Yu Gothic UI", 12, [System.Drawing.FontStyle]::Bold)
     $form.Controls.Add($lblHead)
 
     $txtInfo = New-Object System.Windows.Forms.TextBox
-    $txtInfo.Location = New-Object System.Drawing.Point(20, 48)
-    $txtInfo.Size = New-Object System.Drawing.Size(625, 215)
+    $txtInfo.Location = New-Object System.Drawing.Point(20, 42)
+    $txtInfo.Size = New-Object System.Drawing.Size(630, 182)
     $txtInfo.Multiline = $true
     $txtInfo.ReadOnly = $true
     $txtInfo.ScrollBars = "Vertical"
     $txtInfo.BackColor = [System.Drawing.Color]::WhiteSmoke
-    $txtInfo.Text = @"
-このセットアップはコマンド手入力なしで PaperBridge Local を動作可能にします。
-既存のシステム Python / Node.js / 環境変数 PATH / 管理者権限は変更せず、展開先フォルダー内および下で指定するデータ保存先フォルダーのみに構築します。
-
-【自動取得する外部ツール・依存物 (SHA-256 検証付き)】
-1. uv 0.11.15 (MIT / Apache-2.0): Python 実行環境・uv.lock 厳密同期
-2. Python 3.13 (PSF License): uv 管理下の分離ランタイムとして導入
-3. Node.js v22.20.0 (MIT License): フロントエンド (frontend/dist) ビルド用
-4. llama.cpp b12167 (MIT License): 推論エンジン (Vulkan GPU版 + CPU専用版)
-5. Python・npm パッケージ群 (PyMuPDF 等 AGPL-3.0 / MIT / Apache 依存を含む)
-
-【必要な通信先・通信量・空き容量・対応範囲】
-- 通信先: github.com / nodejs.org / pypi.org / python-build-standalone / huggingface.co
-- 通信量目安: ツール一式 約 300 MB ＋ 翻訳モデル 約 1.81 GB (計 約 2.1〜2.2 GB)
-- 空き容量目安: 一時展開領域を含め 5 GB 以上を推奨
-- 自動対応外: オフライン環境、企業TLS検査/プロキシ遮断環境、GPUドライバー更新、Windows Defender SmartScreen 解除、Microsoft Edge 以外の特殊ブラウザ構成は自動解決できません。
-
-【翻訳モデル (PLaMo 3 Translate 2B Q4_K_M) について (Built with PLaMo)】
-- Preferred Networks (PFN) の PLaMo コミュニティライセンス契約が適用されます。
-- 非商用・学術研究は無償（事前登録不要）。商用利用には事前登録・売上条件等があります。
-- 長文公表物として翻訳PDFを公表する場合は PDF 内への明示等の義務があります。
-"@
     $form.Controls.Add($txtInfo)
 
     $lnkJa = New-Object System.Windows.Forms.LinkLabel
-    $lnkJa.Location = New-Object System.Drawing.Point(20, 270)
+    $lnkJa.Location = New-Object System.Drawing.Point(20, 229)
     $lnkJa.Size = New-Object System.Drawing.Size(270, 20)
-    $lnkJa.Text = "PLaMoコミュニティライセンス契約 (日本語)"
-    $lnkJa.Add_LinkClicked({ Start-Process $PLAMO_LICENSE_JA })
     $form.Controls.Add($lnkJa)
 
     $lnkEn = New-Object System.Windows.Forms.LinkLabel
-    $lnkEn.Location = New-Object System.Drawing.Point(300, 270)
+    $lnkEn.Location = New-Object System.Drawing.Point(300, 229)
     $lnkEn.Size = New-Object System.Drawing.Size(270, 20)
-    $lnkEn.Text = "PLaMo Community License (English)"
-    $lnkEn.Add_LinkClicked({ Start-Process $PLAMO_LICENSE_EN })
     $form.Controls.Add($lnkEn)
 
+    $script:ConsentUrlJa = ""
+    $script:ConsentUrlEn = ""
+    $lnkJa.Add_LinkClicked({ if ($script:ConsentUrlJa) { Start-Process $script:ConsentUrlJa } })
+    $lnkEn.Add_LinkClicked({ if ($script:ConsentUrlEn) { Start-Process $script:ConsentUrlEn } })
+
     $grpModel = New-Object System.Windows.Forms.GroupBox
-    $grpModel.Location = New-Object System.Drawing.Point(20, 296)
-    $grpModel.Size = New-Object System.Drawing.Size(625, 130)
-    $grpModel.Text = "翻訳モデル (plamo-3-translate-2b-Q4_K_M.gguf) の準備方法"
+    $grpModel.Location = New-Object System.Drawing.Point(20, 254)
+    $grpModel.Size = New-Object System.Drawing.Size(630, 198)
+    $grpModel.Text = "翻訳モデルの選択と準備方法"
     $form.Controls.Add($grpModel)
 
+    $lblSelectModel = New-Object System.Windows.Forms.Label
+    $lblSelectModel.Location = New-Object System.Drawing.Point(15, 24)
+    $lblSelectModel.Size = New-Object System.Drawing.Size(115, 22)
+    $lblSelectModel.Text = "導入するモデル:"
+    $grpModel.Controls.Add($lblSelectModel)
+
+    $cmbModelChoice = New-Object System.Windows.Forms.ComboBox
+    $cmbModelChoice.Location = New-Object System.Drawing.Point(132, 21)
+    $cmbModelChoice.Size = New-Object System.Drawing.Size(480, 26)
+    $cmbModelChoice.DropDownStyle = "DropDownList"
+    $grpModel.Controls.Add($cmbModelChoice)
+
+    $catalogModels = @($Catalog.models)
+    $defaultCatIdx = 0
+    for ($i = 0; $i -lt $catalogModels.Count; $i++) {
+        $cm = $catalogModels[$i]
+        $sz = Format-ModelSizeText -Bytes ([int64]$cm.known_size_bytes)
+        $tag = if ($cm.is_default -eq $true) { "推奨・実機検証済" } else { "候補・カタログ検証済" }
+        $cmbModelChoice.Items.Add("$($cm.display_name)  [$tag / $sz]") | Out-Null
+        if ($InitialCatalogModel -and $cm.model_id -eq $InitialCatalogModel.model_id) {
+            $defaultCatIdx = $i
+        }
+    }
+
     $rdoDownload = New-Object System.Windows.Forms.RadioButton
-    $rdoDownload.Location = New-Object System.Drawing.Point(15, 24)
-    $rdoDownload.Size = New-Object System.Drawing.Size(590, 22)
-    $rdoDownload.Text = "公式 Hugging Face からダウンロードする (約 1.81 GB / PLaMoライセンス同意)"
+    $rdoDownload.Location = New-Object System.Drawing.Point(15, 55)
+    $rdoDownload.Size = New-Object System.Drawing.Size(600, 22)
     $rdoDownload.Checked = $true
     $grpModel.Controls.Add($rdoDownload)
 
     $rdoLocal = New-Object System.Windows.Forms.RadioButton
-    $rdoLocal.Location = New-Object System.Drawing.Point(15, 52)
-    $rdoLocal.Size = New-Object System.Drawing.Size(590, 22)
-    $rdoLocal.Text = "手元にある既存 GGUF ファイルを SHA-256 検証して配置する"
+    $rdoLocal.Location = New-Object System.Drawing.Point(15, 83)
+    $rdoLocal.Size = New-Object System.Drawing.Size(600, 22)
+    $rdoLocal.Text = "手元のダウンロード済み GGUF ファイルを SHA-256 検証して利用する（既定: 参照登録）"
     $grpModel.Controls.Add($rdoLocal)
 
     $txtLocalPath = New-Object System.Windows.Forms.TextBox
-    $txtLocalPath.Location = New-Object System.Drawing.Point(35, 76)
-    $txtLocalPath.Size = New-Object System.Drawing.Size(470, 24)
+    $txtLocalPath.Location = New-Object System.Drawing.Point(35, 108)
+    $txtLocalPath.Size = New-Object System.Drawing.Size(475, 24)
     $txtLocalPath.Enabled = $false
     $grpModel.Controls.Add($txtLocalPath)
 
     $btnBrowse = New-Object System.Windows.Forms.Button
-    $btnBrowse.Location = New-Object System.Drawing.Point(512, 75)
+    $btnBrowse.Location = New-Object System.Drawing.Point(517, 107)
     $btnBrowse.Size = New-Object System.Drawing.Size(95, 26)
     $btnBrowse.Text = "参照..."
     $btnBrowse.Enabled = $false
     $grpModel.Controls.Add($btnBrowse)
 
+    $chkCopyLocal = New-Object System.Windows.Forms.CheckBox
+    $chkCopyLocal.Location = New-Object System.Drawing.Point(35, 138)
+    $chkCopyLocal.Size = New-Object System.Drawing.Size(578, 22)
+    $chkCopyLocal.Text = "手元のファイルを管理フォルダーへコピーして配置する（OFF時は元ファイルをコピー/移動せず参照登録）"
+    $chkCopyLocal.Enabled = $false
+    $chkCopyLocal.Checked = ($LocalRegisterMode -eq "Copy")
+    $grpModel.Controls.Add($chkCopyLocal)
+
     $rdoSkip = New-Object System.Windows.Forms.RadioButton
-    $rdoSkip.Location = New-Object System.Drawing.Point(15, 102)
-    $rdoSkip.Size = New-Object System.Drawing.Size(590, 22)
+    $rdoSkip.Location = New-Object System.Drawing.Point(15, 166)
+    $rdoSkip.Size = New-Object System.Drawing.Size(600, 22)
     $rdoSkip.Text = "モデル設定はスキップしてアプリ実行環境のみ構築する (初回起動時に設定可能)"
     $grpModel.Controls.Add($rdoSkip)
 
     $rdoLocal.Add_CheckedChanged({
         $txtLocalPath.Enabled = $rdoLocal.Checked
         $btnBrowse.Enabled = $rdoLocal.Checked
+        $chkCopyLocal.Enabled = $rdoLocal.Checked
     })
 
     $btnBrowse.Add_Click({
+        $cmSel = $catalogModels[$cmbModelChoice.SelectedIndex]
         $ofd = New-Object System.Windows.Forms.OpenFileDialog
         $ofd.Filter = "GGUF モデルファイル (*.gguf)|*.gguf|すべてのファイル (*.*)|*.*"
-        $ofd.Title = "$MODEL_FILE_NAME を選択してください"
+        $ofd.Title = "$($cmSel.filename) を選択してください"
         if ($ofd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
             $txtLocalPath.Text = $ofd.FileName
         }
     })
 
     $grpProfile = New-Object System.Windows.Forms.GroupBox
-    $grpProfile.Location = New-Object System.Drawing.Point(20, 434)
-    $grpProfile.Size = New-Object System.Drawing.Size(625, 96)
+    $grpProfile.Location = New-Object System.Drawing.Point(20, 458)
+    $grpProfile.Size = New-Object System.Drawing.Size(630, 94)
     $grpProfile.Text = "保存先・デスクトップアイコン設定 (通常は既定のままで構いません / 既存環境分離用)"
     $form.Controls.Add($grpProfile)
 
     $lblDataDir = New-Object System.Windows.Forms.Label
-    $lblDataDir.Location = New-Object System.Drawing.Point(15, 26)
+    $lblDataDir.Location = New-Object System.Drawing.Point(15, 25)
     $lblDataDir.Size = New-Object System.Drawing.Size(150, 22)
     $lblDataDir.Text = "データ保存先フォルダー:"
     $grpProfile.Controls.Add($lblDataDir)
 
     $txtUserDataDir = New-Object System.Windows.Forms.TextBox
-    $txtUserDataDir.Location = New-Object System.Drawing.Point(170, 24)
-    $txtUserDataDir.Size = New-Object System.Drawing.Size(342, 24)
+    $txtUserDataDir.Location = New-Object System.Drawing.Point(170, 23)
+    $txtUserDataDir.Size = New-Object System.Drawing.Size(347, 24)
     $txtUserDataDir.Text = $UserDataDir
     $grpProfile.Controls.Add($txtUserDataDir)
 
     $btnBrowseDataDir = New-Object System.Windows.Forms.Button
-    $btnBrowseDataDir.Location = New-Object System.Drawing.Point(520, 23)
+    $btnBrowseDataDir.Location = New-Object System.Drawing.Point(525, 22)
     $btnBrowseDataDir.Size = New-Object System.Drawing.Size(90, 26)
     $btnBrowseDataDir.Text = "変更..."
     $grpProfile.Controls.Add($btnBrowseDataDir)
@@ -631,28 +643,28 @@ function Show-ConsentDialog {
     })
 
     $lblShortcut = New-Object System.Windows.Forms.Label
-    $lblShortcut.Location = New-Object System.Drawing.Point(15, 60)
+    $lblShortcut.Location = New-Object System.Drawing.Point(15, 59)
     $lblShortcut.Size = New-Object System.Drawing.Size(150, 22)
     $lblShortcut.Text = "デスクトップアイコン名:"
     $grpProfile.Controls.Add($lblShortcut)
 
     $txtShortcutName = New-Object System.Windows.Forms.TextBox
-    $txtShortcutName.Location = New-Object System.Drawing.Point(170, 58)
+    $txtShortcutName.Location = New-Object System.Drawing.Point(170, 57)
     $txtShortcutName.Size = New-Object System.Drawing.Size(250, 24)
     $txtShortcutName.Text = $ShortcutName
     $txtShortcutName.Enabled = (-not $SkipShortcut)
     $grpProfile.Controls.Add($txtShortcutName)
 
     $lblShortcutHint = New-Object System.Windows.Forms.Label
-    $lblShortcutHint.Location = New-Object System.Drawing.Point(426, 61)
-    $lblShortcutHint.Size = New-Object System.Drawing.Size(190, 20)
+    $lblShortcutHint.Location = New-Object System.Drawing.Point(426, 60)
+    $lblShortcutHint.Size = New-Object System.Drawing.Size(192, 20)
     $lblShortcutHint.Text = "(.lnk / 試験分離時は別名可)"
     $lblShortcutHint.ForeColor = [System.Drawing.Color]::DimGray
     $grpProfile.Controls.Add($lblShortcutHint)
 
     $chkShortcut = New-Object System.Windows.Forms.CheckBox
-    $chkShortcut.Location = New-Object System.Drawing.Point(20, 538)
-    $chkShortcut.Size = New-Object System.Drawing.Size(625, 24)
+    $chkShortcut.Location = New-Object System.Drawing.Point(20, 558)
+    $chkShortcut.Size = New-Object System.Drawing.Size(630, 22)
     $chkShortcut.Text = "セットアップ完了後、デスクトップに上記名前の起動アイコンを作成する"
     $chkShortcut.Checked = (-not $SkipShortcut)
     $chkShortcut.Add_CheckedChanged({
@@ -661,23 +673,55 @@ function Show-ConsentDialog {
     $form.Controls.Add($chkShortcut)
 
     $chkAgree = New-Object System.Windows.Forms.CheckBox
-    $chkAgree.Location = New-Object System.Drawing.Point(20, 568)
-    $chkAgree.Size = New-Object System.Drawing.Size(625, 38)
-    $chkAgree.Text = "上記の外部ツール取得・通信量・空き容量・注意事項（およびモデル選択時は PLaMo コミュニティライセンス契約）を確認し、同意のうえセットアップを開始します。"
+    $chkAgree.Location = New-Object System.Drawing.Point(20, 586)
+    $chkAgree.Size = New-Object System.Drawing.Size(630, 38)
     $form.Controls.Add($chkAgree)
 
     $btnStart = New-Object System.Windows.Forms.Button
-    $btnStart.Location = New-Object System.Drawing.Point(375, 616)
+    $btnStart.Location = New-Object System.Drawing.Point(380, 632)
     $btnStart.Size = New-Object System.Drawing.Size(145, 38)
     $btnStart.Text = "同意して開始"
     $btnStart.Enabled = $false
     $form.Controls.Add($btnStart)
 
     $btnQuit = New-Object System.Windows.Forms.Button
-    $btnQuit.Location = New-Object System.Drawing.Point(530, 616)
+    $btnQuit.Location = New-Object System.Drawing.Point(535, 632)
     $btnQuit.Size = New-Object System.Drawing.Size(115, 38)
     $btnQuit.Text = "キャンセル"
     $form.Controls.Add($btnQuit)
+
+    $updateConsentModelText = {
+        $cm = $catalogModels[$cmbModelChoice.SelectedIndex]
+        $sz = Format-ModelSizeText -Bytes ([int64]$cm.known_size_bytes)
+        $tagline = if ($cm.license.tagline) { " ($($cm.license.tagline))" } else { "" }
+        $disclosure = if ($cm.license.disclosure_note_ja) { "`r`n- $($cm.license.disclosure_note_ja)" } else { "" }
+
+        $txtInfo.Text = @"
+このセットアップはコマンド手入力なしで PaperBridge Local を動作可能にします。
+既存のシステム Python / Node.js / 環境変数 PATH / 管理者権限は変更せず、展開先フォルダー内および下で指定するデータ保存先フォルダーのみに構築します。
+
+【自動取得する外部ツール・依存物 (SHA-256 検証付き)】
+1. uv 0.11.15 / Python 3.13 (uv管理下) / Node.js v22.20.0 / llama.cpp b12167 (Vulkan GPU + CPU版)
+
+【選択中の翻訳モデル: $($cm.display_name)$tagline】
+- 取得元: $($cm.source_repo) / サイズ: $sz / $($cm.hardware_note_ja)
+- 適用ライセンス: $($cm.license.name)
+- $($cm.license.summary_ja)$disclosure
+- 自動対応外: オフライン環境、企業TLS検査/プロキシ遮断環境、GPUドライバー更新等は自動解決できません。
+"@
+        $script:ConsentUrlJa = [string]$cm.license.url_ja
+        $script:ConsentUrlEn = [string]$cm.license.url_en
+        $lnkJa.Text = "$($cm.license.name) (日本語)"
+        $lnkJa.Visible = -not [string]::IsNullOrWhiteSpace($script:ConsentUrlJa)
+        $lnkEn.Text = "License Terms (English)"
+        $lnkEn.Visible = -not [string]::IsNullOrWhiteSpace($script:ConsentUrlEn)
+        $rdoDownload.Text = "公式 Hugging Face からダウンロードする ($($cm.short_name) / $sz / $($cm.license.name) 同意)"
+        $chkAgree.Text = "上記の外部ツール取得・注意事項および選択モデル（$($cm.display_name) / $($cm.license.name)）の利用条件を確認し、同意のうえ開始します。"
+    }
+
+    $cmbModelChoice.Add_SelectedIndexChanged($updateConsentModelText)
+    $cmbModelChoice.SelectedIndex = $defaultCatIdx
+    & $updateConsentModelText
 
     $chkAgree.Add_CheckedChanged({
         $btnStart.Enabled = $chkAgree.Checked
@@ -712,13 +756,16 @@ function Show-ConsentDialog {
                 return
             }
         }
+        $cmSelected = $catalogModels[$cmbModelChoice.SelectedIndex]
         $mode = if ($rdoDownload.Checked) { "Download" } elseif ($rdoLocal.Checked) { "Local" } else { "Skip" }
         $script:DialogSelection = @{
-            ModelMode      = $mode
-            LocalPath      = $txtLocalPath.Text
-            CreateShortcut = $chkShortcut.Checked
-            UserDataDir    = $chosenDataDir
-            ShortcutName   = $chosenShortcut
+            ModelMode         = $mode
+            CatalogModelId    = [string]$cmSelected.model_id
+            LocalPath         = $txtLocalPath.Text
+            LocalRegisterMode = if ($chkCopyLocal.Checked) { "Copy" } else { "Reference" }
+            CreateShortcut    = $chkShortcut.Checked
+            UserDataDir       = $chosenDataDir
+            ShortcutName      = $chosenShortcut
         }
         $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
         $form.Close()
@@ -798,7 +845,10 @@ function Show-ProgressWindow {
 
 # --- Main Setup Flow ---
 $selectedMode = if ([string]::IsNullOrWhiteSpace($ModelMode)) { "Skip" } else { $ModelMode }
+$selectedCatalogModelId = if ($InitialCatalogModel) { [string]$InitialCatalogModel.model_id } else { "" }
+$explicitCatalogModelId = $ModelId
 $selectedLocalModel = $PreselectedModelPath
+$selectedLocalRegisterMode = $LocalRegisterMode
 $shouldCreateShortcut = (-not $SkipShortcut)
 $selectedShortcutName = $ShortcutName
 
@@ -809,20 +859,24 @@ if ($script:IsInteractive) {
         exit 1
     }
     $selectedMode = $choice.ModelMode
+    $selectedCatalogModelId = $choice.CatalogModelId
+    $explicitCatalogModelId = $choice.CatalogModelId
     $selectedLocalModel = $choice.LocalPath
+    $selectedLocalRegisterMode = $choice.LocalRegisterMode
     $shouldCreateShortcut = $choice.CreateShortcut
     $UserDataDir = $choice.UserDataDir
     $selectedShortcutName = $choice.ShortcutName
 }
+
+$selectedCatalogModel = Get-CatalogModelById -Catalog $Catalog -ModelId $selectedCatalogModelId
 
 if ($UserDataDir.Length -gt 3) {
     $UserDataDir = $UserDataDir.TrimEnd('\', '/')
 }
 $LogsDir = Join-Path $UserDataDir "logs"
 $SetupLogPath = Join-Path $LogsDir "setup.log"
-$UserModelDir = Join-Path $UserDataDir "models\plamo-3-translate-2b-GGUF"
 
-foreach ($dirPath in @($LogsDir, $RuntimeToolsDir, $CacheDownloadDir, $StampsDir, $ToolsDir, $LlamaBaseDir, $UserModelDir)) {
+foreach ($dirPath in @($LogsDir, $RuntimeToolsDir, $CacheDownloadDir, $StampsDir, $ToolsDir, $LlamaBaseDir)) {
     if (-not (Test-Path -LiteralPath $dirPath)) {
         New-Item -ItemType Directory -Path $dirPath -Force | Out-Null
     }
@@ -844,7 +898,7 @@ if ($UserDataDir -ne $DefaultUserDataDir -or $selectedShortcutName -ne $DefaultS
 if ($script:IsInteractive) {
     Show-ProgressWindow
 } else {
-    Write-SetupLog "自動承認モードでセットアップを開始します (ModelMode=$selectedMode, UserDataDir=$UserDataDir, ShortcutName=$selectedShortcutName)"
+    Write-SetupLog "自動承認モードでセットアップを開始します (ModelMode=$selectedMode, ModelId=$selectedCatalogModelId, RegisterMode=$selectedLocalRegisterMode, UserDataDir=$UserDataDir, ShortcutName=$selectedShortcutName)"
 }
 
 $savedEnv = @{
@@ -868,7 +922,11 @@ try {
 
     # 1. Disk Space Preflight
     Update-SetupUiProgress -Percent 2 -StatusText "空きディスク容量を確認中..."
-    Check-DiskSpace -NeedsModelSpace ($selectedMode -eq "Download" -or $selectedMode -eq "Local")
+    $addModelBytes = 0L
+    if ($selectedCatalogModel -and ($selectedMode -eq "Download" -or ($selectedMode -eq "Local" -and $selectedLocalRegisterMode -eq "Copy"))) {
+        $addModelBytes = [int64]$selectedCatalogModel.known_size_bytes
+    }
+    Check-DiskSpace -AdditionalModelBytes $addModelBytes
 
     # 2. Install uv 0.11.15
     Update-SetupUiProgress -Percent 5 -StatusText "uv 0.11.15 を準備中..."
@@ -959,32 +1017,87 @@ try {
     Update-SetupUiProgress -Percent 80 -StatusText "llama.cpp b12167 (CPU専用フォールバック版) を導入中..."
     Install-PinnedZipTool -Spec $PINNED_TOOLS.llama_cpu -BaseProgress 80 -SpanProgress 6
 
-    # 6. Translation Model Provisioning
-    $projModelFile = Join-Path $ProjectModelDir $MODEL_FILE_NAME
-    $userModelFile = Join-Path $UserModelDir $MODEL_FILE_NAME
+    # 6. Translation Model Provisioning & Registry Registration
+    $syncBeforeModel = Sync-ModelsRegistryWithLegacy -UserDataDir $UserDataDir -ProjectRoot $ProjectRoot -Catalog $Catalog
     if ($selectedMode -eq "Download") {
-        if ((Test-VerifiedFile -FilePath $projModelFile -ExpectedSize $MODEL_SIZE -ExpectedSha256 $MODEL_SHA256 -RequireGguf) -or
-            (Test-VerifiedFile -FilePath $userModelFile -ExpectedSize $MODEL_SIZE -ExpectedSha256 $MODEL_SHA256 -RequireGguf)) {
-            Write-SetupLog "翻訳モデルは既に検証済みで配置されています。"
+        if (-not $selectedCatalogModel) {
+            throw "ダウンロード対象のカタログモデルが見つかりません: $selectedCatalogModelId"
+        }
+        $projModelFile = Join-Path (Join-Path (Join-Path $ProjectRoot "models") ([string]$selectedCatalogModel.relative_subdir)) ([string]$selectedCatalogModel.filename)
+        $userModelFile = Join-Path (Join-Path (Join-Path $UserDataDir "models") ([string]$selectedCatalogModel.relative_subdir)) ([string]$selectedCatalogModel.filename)
+
+        $reusablePath = $null
+        foreach ($candPath in @($userModelFile, $projModelFile)) {
+            if (Test-Path -LiteralPath $candPath -PathType Leaf) {
+                $candInsp = Inspect-GgufFile -FilePath $candPath -ComputeHash
+                try {
+                    $null = Test-ModelMatchesCatalog -Catalog $Catalog -Inspection $candInsp -ExpectedCatalogModelId ([string]$selectedCatalogModel.model_id)
+                    $reusablePath = $candPath
+                    break
+                } catch {}
+            }
+        }
+
+        if ($reusablePath) {
+            Write-SetupLog "既存の検証済みモデルを再利用登録します ($($selectedCatalogModel.display_name)): $reusablePath"
+            $null = Register-PaperBridgeLocalModel `
+                -UserDataDir $UserDataDir `
+                -ProjectRoot $ProjectRoot `
+                -FilePath $reusablePath `
+                -ExpectedCatalogModelId ([string]$selectedCatalogModel.model_id) `
+                -RegisterMode "reference" `
+                -LicenseAccepted:$true `
+                -SetActive:$true `
+                -SourceTypeOverride "downloaded"
         } else {
             Test-CancelRequested
-            Invoke-VerifiedDownload -Label "PLaMo 3 Translate 2B (Q4_K_M)" -Url $MODEL_URL -DestPath $userModelFile -ExpectedSize $MODEL_SIZE -ExpectedSha256 $MODEL_SHA256 -BaseProgress 86 -SpanProgress 10 -RequireGguf
+            Update-SetupUiProgress -Percent 86 -StatusText "$($selectedCatalogModel.display_name) をダウンロード中..."
+            $dlProgressCb = {
+                param($done, $tot, $pct)
+                $pctOverall = [int](86 + (9.0 * $pct / 100.0))
+                $mbDone = [math]::Round($done / 1MB, 1)
+                $mbTot = [math]::Round($tot / 1MB, 1)
+                Update-SetupUiProgress -Percent $pctOverall -StatusText "$($selectedCatalogModel.short_name) をダウンロード中... ($mbDone MB / $mbTot MB)"
+            }
+            $dlCancelCb = {
+                Test-CancelRequested
+                return $false
+            }
+            $savedPath = Invoke-PaperBridgeModelDownload `
+                -Catalog $Catalog `
+                -CatalogModel $selectedCatalogModel `
+                -DestPath $userModelFile `
+                -ProgressCallback $dlProgressCb `
+                -CancelCheck $dlCancelCb
+            Update-SetupUiProgress -Percent 96 -StatusText "モデルレジストリへ登録中..."
+            $regOut = Register-PaperBridgeLocalModel `
+                -UserDataDir $UserDataDir `
+                -ProjectRoot $ProjectRoot `
+                -FilePath $savedPath `
+                -ExpectedCatalogModelId ([string]$selectedCatalogModel.model_id) `
+                -RegisterMode "reference" `
+                -LicenseAccepted:$true `
+                -SetActive:$true `
+                -SourceTypeOverride "downloaded"
+            Write-SetupLog "モデルのダウンロードと登録を完了しました: $($regOut.Registration.display_name) -> $($regOut.Registration.file_path)"
         }
     } elseif ($selectedMode -eq "Local") {
         if ([string]::IsNullOrWhiteSpace($selectedLocalModel)) {
             throw "-ModelMode Local が指定されましたが、ファイルパスが指定されていません。"
         }
-        Update-SetupUiProgress -Percent 88 -StatusText "既存の翻訳モデル (SHA-256) を検証して配置中..."
-        Write-SetupLog "既存モデルを検証しています: $selectedLocalModel"
-        if (-not (Test-VerifiedFile -FilePath $selectedLocalModel -ExpectedSize $MODEL_SIZE -ExpectedSha256 $MODEL_SHA256 -RequireGguf)) {
-            throw "選択されたファイルは正しい $MODEL_FILE_NAME (サイズ/GGUF/SHA-256) と一致しません。"
-        }
-        $tmpCopy = "$userModelFile.copying"
-        Copy-Item -LiteralPath $selectedLocalModel -Destination $tmpCopy -Force
-        Move-Item -LiteralPath $tmpCopy -Destination $userModelFile -Force
-        Write-SetupLog "既存モデルを配置しました: $userModelFile"
+        Update-SetupUiProgress -Percent 88 -StatusText "既存の翻訳モデル (GGUF/SHA-256) を検証して登録中..."
+        Write-SetupLog "既存モデルを検証しています ($selectedLocalRegisterMode): $selectedLocalModel"
+        $regOut = Register-PaperBridgeLocalModel `
+            -UserDataDir $UserDataDir `
+            -ProjectRoot $ProjectRoot `
+            -FilePath $selectedLocalModel `
+            -ExpectedCatalogModelId $explicitCatalogModelId `
+            -RegisterMode ($selectedLocalRegisterMode.ToLowerInvariant()) `
+            -LicenseAccepted:$true `
+            -SetActive:$true
+        Write-SetupLog "既存モデルを登録しました ($($regOut.Registration.source_type)): $($regOut.Registration.display_name) -> $($regOut.Registration.file_path)"
     } else {
-        Write-SetupLog "モデル配置はスキップされました。初回起動時（または models フォルダ配置時）に設定できます。"
+        Write-SetupLog "モデル配置はスキップされました。初回起動時（または UI/モデル設定画面）から選択・登録できます。"
     }
 
     # 7. Desktop Shortcut Creation

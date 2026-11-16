@@ -1,5 +1,24 @@
 # Development status
 
+## Model selection and related improvements (branch `feat/model-selection-setup`)
+
+This section describes the current state of the branch. The sections below it are dated historical records and are kept as written. Accepted code HEAD: `2ef63f4bc8f2ec6030ca3307739eee6eda7a63b7` (base `3457912`). Commits that only add documentation follow it and do not change code. User-facing overview: [MODEL_SELECTION.md](MODEL_SELECTION.md). Verification record: the 2026-11-16 section of [VERIFICATION.md](VERIFICATION.md).
+
+Implemented on this branch:
+
+- Catalog-based model selection, license-gated download, reference/copy registration of an existing GGUF, SHA-256/GGUF/compatibility validation, and a guard that refuses to start a job when the selected model does not match the running `llama-server` (`61bc515`, `6d5c8c7`, `aae504e`, `3a6351e`).
+- Four-stage verification history shown separately from the current connection state (`e427f71`, `42bda89`); documented and tested missing/restore behavior (`e847b71`).
+- Screen 2 latest-state sync with stale-failure and unsaved-edit protection (`b9ebfcd`).
+- Inference endpoint display derived from the configured value instead of a fixed `:8000` (`4d7cf4d`).
+- Line-break hyphen normalization of LLM input (`73c2110`).
+- Conservative protection of high-confidence isolated single-letter math variables and a non-blocking `MATH_VARIABLE_MISSING` warning (`2ef63f4`).
+
+Model status: 2B is the default and recommended model and has been verified on real hardware. 0.8B is a lightweight option whose real download, launch, and translation were verified; word choice and context-dependent mistranslations remain. 8B is listed in the catalog but has **not** been verified on real hardware in this work; this document does not claim that it works or that it does not.
+
+Not verified: a complete model switch/restart driven from the same launcher. The real-hardware checks connected to separately running 0.8B and 2B servers.
+
+Accepted record (2026-11-16): the maintainer confirmed the final 0.8B and 2B output PDFs and reported no particular problems. This covers those outputs only; it is not a full-text academic proofread or a quality guarantee for other documents. Details and limits: [PUBLIC_LIMITATIONS.md](PUBLIC_LIMITATIONS.md).
+
 ## Formula protection and continuation context
 
 The branch `work/formula-protection-continuation`, at saved verification base

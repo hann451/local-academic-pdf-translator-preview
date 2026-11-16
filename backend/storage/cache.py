@@ -19,12 +19,14 @@ import hashlib
 import json
 
 from backend.domain.models import GlossaryEntry, ProtectedItem
+from backend.pdf.inline_math_vars import INLINE_MASK_VERSION_LEGACY
 from backend.translation.prompts.pfml3 import HistoryPair, filter_active_glossary
 
 
 def compute_translation_cache_key(
     masked_source_text: str,
     model_name: str,
+    model_id: str = "",
     model_hash: str = "",
     quantization: str = "Q4_K_M",
     temperature: float = 0.0,
@@ -38,6 +40,8 @@ def compute_translation_cache_key(
     protected_items: list[ProtectedItem] | None = None,
     adapter_version: str = "1.0.0",
     is_mock: bool = False,
+    preprocessing_version: str = "raw-v0",
+    masking_version: str = INLINE_MASK_VERSION_LEGACY,
 ) -> str:
     """Compute a deterministic SHA-256 hex key that invalidates whenever any relevant factor changes."""
     active_glossary = filter_active_glossary(masked_source_text, glossary_entries)
@@ -56,6 +60,7 @@ def compute_translation_cache_key(
 
     key_payload = {
         "masked_source_text": masked_source_text.strip(),
+        "model_id": model_id,
         "model_name": model_name,
         "model_hash": model_hash,
         "quantization": quantization,
@@ -70,6 +75,8 @@ def compute_translation_cache_key(
         "protected_items": protected_canonical,
         "adapter_version": adapter_version,
         "is_mock": bool(is_mock),
+        "preprocessing_version": preprocessing_version,
+        "masking_version": masking_version,
     }
     serialized = json.dumps(key_payload, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()

@@ -152,6 +152,17 @@ PDF 原生座標系、内部正規化座標系、フロントエンド Canvas/SV
 - TSV / JSON インポート（取り込み前プレビュー、行番号付きエラー一覧、上書き/マージ選択）およびエクスポート。
 - `/api/diagnostics?probe_llama=true` から動的取得した OS・CPU・RAM・GPU・VRAM・日本語フォント・`llama-server` 接続状態・セッション認証トークン更新 UI。
 
+### 7.5 4段階モデル検証ステータスと欠損・復元時の現行仕様 (`backend/models/registry.py`)
+- **4段階ステータス（`verification_stage`: `unverified` / `file_verified` / `launch_verified` / `translation_verified`）の意味**:
+  - いずれも当該登録モデルに関する**過去の検証実績（履歴）**を表し、現在この瞬間の `llama-server` 接続可否やロード一致状態（`server_match`: `not_probed`＝未確認 / `server_unreachable`＝接続できない 等）とは別項目として表示・管理する。
+  - `translation_verified`（「実翻訳確認済み」）は実機推論が 1 ブロック以上完了した実績を示し、人間による訳文品質の承認を意味しない。
+- **ファイル欠損・再配置（復元）時の現行挙動（厳格クリア・設定追加なし）**:
+  1. **欠損中の扱い**: 登録済みパスのファイルが存在しないことが再検証（`revalidate=True`）で検出されると、`file_exists=False` / `hash_status="missing_file"` / `backend_compatible=False` が記録され、`verification_stage` は `"unverified"`、`is_usable` は `False` となり利用不可を維持する（`mark_runtime_verified` やジョブ開始前検査もすべて拒否する）。この時点では `models_registry.json` 上の `launch_verified` / `translation_verified` 履歴ブール値は内部的に保持されるが、`verification_stage` / `is_usable` が `"unverified"` / `False` を返すため一切有効化されない。
+  2. **復元時・再検証前の扱い**: 欠損状態からファイルが元パスへ戻されても、再検証（`get_registry_snapshot(revalidate=True)` / `get_active_model()` / `compare_with_running_server()` / `register_local_model()`）が完了する前（`revalidate=False` 時点）は `file_exists=False` のまま `"unverified"`・利用不可を維持し、実績を有効化しない。
+  3. **再検証後の保持・リセット条件**:
+     - **同一内容の復元（保持）**: 再検証により GGUF 形式・バックエンド互換性と、登録済み**同一パス・同一 SHA-256・同一カタログ ID** の一致が確認された場合のみ、欠損前の `launch_verified` / `translation_verified` 実績を保持して復元する。
+     - **別内容・破損ファイルの配置（リセット）**: 再検証で同一カタログ ID の別ハッシュ/別リビジョンに差し替わった場合は `launch_verified=False` / `translation_verified=False` にリセットして `file_verified` へ戻し、別モデル・未知 SHA-256・破損ファイル等（`ModelValidationError`）の場合は同様に履歴を `False` にリセットして `unverified`（利用不可）とする。
+
 ---
 
 ## 8. セキュリティ・プライバシー境界 (`backend/config.py`, `backend/api/app.py`)

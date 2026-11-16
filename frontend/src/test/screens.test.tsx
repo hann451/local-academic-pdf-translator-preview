@@ -1114,11 +1114,39 @@ describe("Screen 4: Glossary CRUD, TSV Import Preview & Dynamic Diagnostics (Sec
     );
 
     expect(screen.getByTestId("diag-llama-status")).toHaveTextContent(
-      "推論サーバ未接続 (server_unreachable)"
+      "接続できない (server_unreachable)"
     );
     const guide = screen.getByTestId("diag-llama-disconnected-guide");
+    expect(guide).toHaveTextContent("接続できません");
     expect(guide).toHaveTextContent("llama-server");
     expect(guide).toHaveTextContent("翻訳リクエストは送信しません");
     expect(guide).toHaveTextContent("モックは決定論的な疑似翻訳であり実翻訳ではありません");
+  });
+
+  it("shows 未確認 for not_probed diagnostics without probing", () => {
+    render(
+      <Screen4GlossaryDiagnostics
+        glossaries={[]}
+        diagnostics={{
+          ...sampleDiag,
+          llama_connection_status: "not_probed",
+          loaded_model_name: null,
+          model_server_match_status: "not_probed",
+          model_server_match_message: null,
+        }}
+        hasProbedLlama={false}
+        isLoadingDiagnostics={false}
+        diagnosticsError={null}
+        onRefreshDiagnostics={vi.fn()}
+        onCreateGlossary={vi.fn()}
+        onUpdateGlossary={vi.fn()}
+        onDeleteGlossary={vi.fn()}
+        onPurgeTempData={vi.fn().mockResolvedValue("C:/runtime/working")}
+        onRotateToken={vi.fn().mockResolvedValue(undefined)}
+      />
+    );
+
+    expect(screen.getByTestId("diag-llama-status")).toHaveTextContent("未確認 (not_probed");
+    expect(screen.getByTestId("diag-model-server-match")).toHaveTextContent("未確認 (not_probed)");
   });
 });

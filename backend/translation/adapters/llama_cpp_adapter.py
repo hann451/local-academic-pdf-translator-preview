@@ -38,6 +38,8 @@ class LlamaCppPlamoAdapter(TranslationAdapter):
         base_url: str | None = None,
         model_alias: str | None = None,
         quantization: str = "Q4_K_M",
+        prompt_version: str | None = None,
+        stop_tokens: list[str] | None = None,
         timeout_sec: float = 120.0,
         http_client: httpx.Client | None = None,
     ) -> None:
@@ -45,6 +47,9 @@ class LlamaCppPlamoAdapter(TranslationAdapter):
         self.base_url = (base_url or self.config.llama_base_url).rstrip("/")
         self.model_alias = model_alias or self.config.llama_model_alias
         self.quantization = quantization
+        if prompt_version:
+            self.prompt_version = prompt_version
+        self.stop_tokens = list(stop_tokens) if stop_tokens else list(PLAMO_STOP_TOKENS)
         self.timeout_sec = timeout_sec
         self._client = http_client
 
@@ -103,7 +108,11 @@ class LlamaCppPlamoAdapter(TranslationAdapter):
                     "detail": "llama-server にモデルが登録されていません（モデル未検出）。",
                 }
             first_model_id = str(models[0].get("id", self.model_alias))
+            model_meta = models[0].get("meta") if isinstance(models[0], dict) else None
             model_path_name: str | None = None
+            model_path_full: str | None = None
+            model_alias_props: str | None = None
+            server_n_ctx: int | None = None
             build_info: str | None = None
             try:
                 root_url = self.base_url.removesuffix("/v1")
@@ -115,10 +124,17 @@ class LlamaCppPlamoAdapter(TranslationAdapter):
                         if isinstance(raw_mp, str) and raw_mp.strip():
                             from pathlib import Path as _P
 
-                            model_path_name = _P(raw_mp).name
+                            model_path_full = raw_mp.strip()
+                            model_path_name = _P(model_path_full).name
+                        raw_ma = pdata.get("model_alias")
+                        if isinstance(raw_ma, str) and raw_ma.strip():
+                            model_alias_props = raw_ma.strip()
                         raw_bi = pdata.get("build_info")
                         if isinstance(raw_bi, str) and raw_bi.strip():
                             build_info = raw_bi.strip()
+                        dgs = pdata.get("default_generation_settings")
+                        if isinstance(dgs, dict) and isinstance(dgs.get("n_ctx"), int):
+                            server_n_ctx = int(dgs["n_ctx"])
             except Exception:
                 pass
             return {
@@ -126,6 +142,10 @@ class LlamaCppPlamoAdapter(TranslationAdapter):
                 "is_mock": False,
                 "model_name": first_model_id,
                 "model_file": model_path_name,
+                "model_path_full": model_path_full,
+                "model_alias_props": model_alias_props,
+                "server_n_ctx": server_n_ctx,
+                "model_meta": model_meta,
                 "build_info": build_info,
                 "quantization": self.quantization,
                 "detail": f"llama-server 接続成功（モデル: {first_model_id}）",
@@ -175,7 +195,7 @@ class LlamaCppPlamoAdapter(TranslationAdapter):
             "prompt": budget_plan.prompt,
             "temperature": 0.0,
             "max_tokens": budget_plan.reserved_output_tokens,
-            "stop": PLAMO_STOP_TOKENS,
+            "stop": self.stop_tokens,
         }
 
         client = self._get_client()
