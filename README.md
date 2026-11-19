@@ -10,12 +10,20 @@ Windows向けのローカル学術論文PDF翻訳アプリ（**Windows向け・�
 
 ### 1. 機能紹介・翻訳＆モデル切替デモ（50秒）
 
+
+
+https://github.com/user-attachments/assets/11fecb7e-01bb-4ee3-b181-aebaf1fbe570
+
 - ワンクリック起動 → PDF プリフライト → **画面2「ドラッグ操作での数式ブロック分割」＆「ブロック単位での翻訳／非翻訳切替」** → **見開き対訳 PDF（数式・レイアウト保持）** → **Web UI からの推論モデル（2B ⇔ 0.8B）自動再起動切替** までの一連の流れを紹介しています。
 
 <!-- DROP_ZONE_WALKTHROUGH: GitHub Web編集画面で paperbridge_local_walkthrough_github_under10mb.mp4 をここへドラッグ＆ドロップ -->
 _[ここに機能紹介デモ動画（paperbridge_local_walkthrough_github_under10mb.mp4）をドラッグ＆ドロップして掲載]_
 
 ### 2. GitHub からの ZIP ダウンロード 〜 初回自動セットアップ手順（40秒）
+
+
+Uploading paperbridge_local_setup_github_under10mb.mp4…
+
 
 - GitHub の **`<> Code` → `Download ZIP`** からの取得 → ZIP 展開 → **`初回セットアップ.bat`** 実行 → 初回自動セットアップ確認画面（モデル選択・ライセンス同意） → ツール＆モデル自動構築完了 → デスクトップからの起動までの手順を解説しています。
 
