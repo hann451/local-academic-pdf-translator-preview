@@ -6,13 +6,9 @@ Windows向けのローカル学術論文PDF翻訳アプリ（**Windows向け・�
 
 ## デモ動画（機能紹介・初回セットアップ手順）
 
-> **GitHub Web UI での動画埋め込み手順:** `README.md` を GitHub 上で開いて編集画面（✏️ Edit this file）に入り、下記 2 箇所の案内行をそれぞれ選択して 10 MB 以下の MP4 ファイル（`paperbridge_local_walkthrough_github_under10mb.mp4` / `paperbridge_local_setup_github_under10mb.mp4`）をドラッグ＆ドロップすると、インライン再生可能な動画プレイヤーとして公開できます（`Download ZIP` の肥大化を防ぐため、動画ファイル自体はリポジトリへ同梱していません）。
-
 ### 1. 機能紹介・翻訳＆モデル切替デモ（50秒）
 
 - ワンクリック起動 → PDF プリフライト → **画面2「ドラッグ操作での数式ブロック分割」＆「ブロック単位での翻訳／非翻訳切替」** → **見開き対訳 PDF（数式・レイアウト保持）** → **Web UI からの推論モデル（2B ⇔ 0.8B）自動再起動切替** までの一連の流れを紹介しています。
-
-<!-- DROP_ZONE_WALKTHROUGH: GitHub Web編集画面で paperbridge_local_walkthrough_github_under10mb.mp4 をここへドラッグ＆ドロップ -->
 
 https://github.com/user-attachments/assets/d06d75cf-016e-472b-b1c4-cb4d64351581
 
@@ -20,8 +16,6 @@ https://github.com/user-attachments/assets/d06d75cf-016e-472b-b1c4-cb4d64351581
 ### 2. GitHub からの ZIP ダウンロード 〜 初回自動セットアップ手順（40秒）
 
 - GitHub の **`<> Code` → `Download ZIP`** からの取得 → ZIP 展開 → **`初回セットアップ.bat`** 実行 → 初回自動セットアップ確認画面（モデル選択・ライセンス同意） → ツール＆モデル自動構築完了 → デスクトップからの起動までの手順を解説しています。
-
-<!-- DROP_ZONE_SETUP: GitHub Web編集画面で paperbridge_local_setup_github_under10mb.mp4 をここへドラッグ＆ドロップ -->
 
 https://github.com/user-attachments/assets/d4449f91-663c-42a6-985a-7f4fa6f71555
 
