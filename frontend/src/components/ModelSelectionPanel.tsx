@@ -9,6 +9,7 @@ import type {
   CatalogModel,
   ModelDownloadJob,
   ModelServerMatchResult,
+  ModelServerRestartResponse,
   ModelsOverviewResponse,
   RegisteredModel,
   RegisterLocalModelRequest,
@@ -21,6 +22,7 @@ export interface ModelSelectionPanelProps {
   overview: ModelsOverviewResponse | null;
   activeDownload: ModelDownloadJob | null;
   isLoading: boolean;
+  isSwitchingServer?: boolean;
   error: string | null;
   compact?: boolean;
   onRefreshModels: (probeLlama: boolean) => Promise<void>;
@@ -30,6 +32,7 @@ export interface ModelSelectionPanelProps {
   onDeleteModel: (registrationId: string) => Promise<void>;
   onStartDownload: (payload: StartModelDownloadRequest) => Promise<ModelDownloadJob>;
   onCancelDownload: (downloadId: string) => Promise<void>;
+  onRestartLlamaServer?: (registrationId?: string | null) => Promise<ModelServerRestartResponse | void>;
 }
 
 const SOURCE_TYPE_LABELS: Record<RegisteredModel["source_type"], string> = {
@@ -227,6 +230,7 @@ export const ModelSelectionPanel: React.FC<ModelSelectionPanelProps> = ({
   overview,
   activeDownload,
   isLoading,
+  isSwitchingServer = false,
   error,
   compact = false,
   onRefreshModels,
@@ -236,6 +240,7 @@ export const ModelSelectionPanel: React.FC<ModelSelectionPanelProps> = ({
   onDeleteModel,
   onStartDownload,
   onCancelDownload,
+  onRestartLlamaServer,
 }) => {
   const catalog = overview?.catalog ?? [];
   const defaultCatalogId =
@@ -363,6 +368,25 @@ export const ModelSelectionPanel: React.FC<ModelSelectionPanelProps> = ({
     }
   };
 
+  const handleRestartServer = async () => {
+    if (!onRestartLlamaServer) return;
+    setActionError(null);
+    setActionMessage(null);
+    setActionBusy(true);
+    try {
+      const res = await onRestartLlamaServer(overview?.active_model_id ?? null);
+      if (res && typeof res === "object" && "message_ja" in res && res.message_ja) {
+        setActionMessage(res.message_ja);
+      } else {
+        setActionMessage("選択モデルで推論サーバーを再起動し、接続・一致状態を確認しました。");
+      }
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
   const handleDelete = async (reg: RegisteredModel) => {
     setActionError(null);
     setActionMessage(null);
@@ -447,7 +471,7 @@ export const ModelSelectionPanel: React.FC<ModelSelectionPanelProps> = ({
           type="button"
           className="btn btn-secondary btn-sm"
           data-testid="refresh-models-btn"
-          disabled={isLoading || actionBusy}
+          disabled={isLoading || actionBusy || isSwitchingServer}
           onClick={() => void onRefreshModels(true)}
         >
           {isLoading ? "確認中..." : "🔄 登録状態・サーバ一致を再確認"}
@@ -504,14 +528,31 @@ export const ModelSelectionPanel: React.FC<ModelSelectionPanelProps> = ({
             {matchDisplay.detailJa}
             {serverMatch.match_status === "mismatch" && (
               <div style={{ marginTop: "4px" }}>
-                選択中: <code>{serverMatch.active_display_name ?? "-"}</code>（
-                <code>{serverMatch.active_file_path ?? "-"}</code>） / サーバー応答側:{" "}
-                <code>
-                  {serverMatch.running_identified_display_name ??
-                    serverMatch.running_loaded_alias ??
-                    "不明"}
-                </code>
-                （<code>{serverMatch.running_model_path ?? serverMatch.running_model_file ?? "-"}</code>）
+                <div>
+                  選択中: <code>{serverMatch.active_display_name ?? "-"}</code>（
+                  <code>{serverMatch.active_file_path ?? "-"}</code>） / サーバー応答側:{" "}
+                  <code>
+                    {serverMatch.running_identified_display_name ??
+                      serverMatch.running_loaded_alias ??
+                      "不明"}
+                  </code>
+                  （<code>{serverMatch.running_model_path ?? serverMatch.running_model_file ?? "-"}</code>）
+                </div>
+                {onRestartLlamaServer && (
+                  <div style={{ marginTop: "8px", display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      className="btn btn-primary btn-sm"
+                      data-testid="restart-llama-server-btn"
+                      disabled={isSwitchingServer || actionBusy || hasActiveJob}
+                      onClick={() => void handleRestartServer()}
+                    >
+                      {isSwitchingServer
+                        ? "推論サーバーを再起動・モデルをロード中..."
+                        : "このモデルで推論サーバーを再起動して切り替える"}
+                    </button>
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -624,7 +665,7 @@ export const ModelSelectionPanel: React.FC<ModelSelectionPanelProps> = ({
                         type="button"
                         className="btn btn-primary btn-sm"
                         data-testid={`select-model-btn-${reg.registration_id}`}
-                        disabled={isActive || !isUsable || hasActiveJob || actionBusy}
+                        disabled={isActive || !isUsable || hasActiveJob || actionBusy || isSwitchingServer}
                         onClick={() => void handleSelect(reg.registration_id)}
                       >
                         {isActive ? "選択中" : "使用モデルに切替"}

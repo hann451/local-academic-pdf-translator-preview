@@ -564,6 +564,28 @@ export interface ModelSelectResponse {
   server_match?: ModelServerMatchResult | null;
 }
 
+export interface ModelServerRestartRequest {
+  registration_id?: string | null;
+  use_cpu?: boolean | null;
+}
+
+export interface ModelServerRestartResponse {
+  status: "restarted";
+  pid: number;
+  model_path: string;
+  model_alias: string;
+  registration_id: string;
+  catalog_model_id: string;
+  display_name: string;
+  endpoint_url: string;
+  compute_mode: "vulkan" | "cpu";
+  executable_path: string;
+  connection_status: string;
+  server_match: ModelServerMatchResult;
+  stopped_pids: number[];
+  message_ja: string;
+}
+
 export interface BrowseLocalModelResponse {
   canceled: boolean;
   file_path: string | null;

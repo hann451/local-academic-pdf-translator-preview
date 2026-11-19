@@ -637,3 +637,155 @@ def test_four_stage_verification_progression_across_api_and_jobs(
     assert ov_wrong["active_model"]["verification"]["verification_stage"] == "unverified"
     assert ov_wrong["active_model"]["verification"]["launch_verified"] is False
     assert ov_wrong["active_model"]["verification"]["translation_verified"] is False
+
+
+def test_server_restart_and_switch_endpoints_and_guards(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from backend.models.server_process import (
+        LlamaServerConflictError,
+        LlamaServerLaunchError,
+        LlamaServerRestartResult,
+        LlamaServerSafetyError,
+    )
+
+    bytes_08b = build_synthetic_gguf(architecture="plamo3", model_name="plamo-3-translate-0.8b", extra_padding=b"SW_08B")
+    bytes_2b = build_synthetic_gguf(architecture="plamo3", model_name="plamo-3-translate-2b", extra_padding=b"SW_2B")
+    cat_path = build_temp_catalog(
+        tmp_path,
+        [
+            {"model_id": "plamo-3-translate-0.8b-q4_k_m", "primary_bytes": bytes_08b},
+            {"model_id": "plamo-3-translate-2b-q4_k_m", "primary_bytes": bytes_2b},
+        ],
+    )
+    cfg = AppConfig(runtime_dir=tmp_path / "rt_switch", model_catalog_path=cat_path)
+    cfg.ensure_directories()
+    app = create_app(config=cfg, session_token="test-tok")
+    mgr: JobManager = app.state.job_manager
+    srv_mgr = app.state.llama_server_manager
+    client = TestClient(app)
+
+    f08 = tmp_path / "plamo-3-translate-0.8b-Q4_K_M.gguf"
+    f08.write_bytes(bytes_08b)
+    f2 = tmp_path / "plamo-3-translate-2b-Q4_K_M.gguf"
+    f2.write_bytes(bytes_2b)
+
+    reg2 = mgr.model_registry.register_local_model(file_path=f2, license_accepted=True, set_active=True)
+    reg08 = mgr.model_registry.register_local_model(file_path=f08, license_accepted=True, set_active=False)
+
+    # 1. Active translation job rejects /server/restart and /server/switch with 409 Conflict
+    with mgr._active_lock:
+        mgr._active_jobs.add("job-active-switch-guard")
+    try:
+        r_conflict = client.post("/api/models/server/restart", headers=_auth_headers(), json={})
+        assert r_conflict.status_code == 409
+        assert "ModelSwitchConflict" in r_conflict.json()["detail"]
+
+        s_conflict = client.post("/api/models/server/switch", headers=_auth_headers(), json={})
+        assert s_conflict.status_code == 409
+    finally:
+        with mgr._active_lock:
+            mgr._active_jobs.discard("job-active-switch-guard")
+
+    # 2. Successful switch via /server/restart & /server/switch -> returns PID, model_path, connection_status & matched
+    running_state = {"model": reg2, "pid": 50001}
+
+    def fake_restart(
+        *,
+        registration_id: str | None = None,
+        use_cpu: bool | None = None,
+        has_active_job: Any = False,
+    ) -> LlamaServerRestartResult:
+        if callable(has_active_job) and has_active_job():
+            raise LlamaServerConflictError("ModelSwitchConflict")
+        if registration_id:
+            target = mgr.model_registry.select_active_model(registration_id, has_active_job=False)
+        else:
+            target, _ = mgr.model_registry.get_active_model()
+            assert target is not None
+        running_state["model"] = target
+        running_state["pid"] = int(running_state["pid"]) + 1
+        mgr.model_registry.mark_runtime_verified(target.registration_id, launch_verified=True)
+        match_res = mgr.model_registry.compare_with_running_server(
+            {
+                "status": "connected",
+                "model_name": target.catalog_model_id,
+                "model_path_full": target.file_path,
+                "model_file": target.file_name,
+            }
+        )
+        return LlamaServerRestartResult(
+            status="restarted",
+            pid=int(running_state["pid"]),
+            model_path=target.file_path,
+            model_alias=target.catalog_model_id,
+            registration_id=target.registration_id,
+            catalog_model_id=target.catalog_model_id,
+            display_name=target.display_name,
+            endpoint_url=cfg.llama_base_url,
+            compute_mode="cpu" if use_cpu else "vulkan",
+            executable_path=r"C:\tools\llama-server.exe",
+            connection_status="connected",
+            server_match=match_res,
+            stopped_pids=[int(running_state["pid"]) - 1],
+            message_ja=f"{target.display_name} へ切り替えました。",
+        )
+
+    monkeypatch.setattr(srv_mgr, "restart_for_active_model", fake_restart)
+    monkeypatch.setattr(
+        "backend.api.app.LlamaCppPlamoAdapter.check_health",
+        lambda self: {
+            "status": "connected",
+            "model_name": running_state["model"].catalog_model_id,
+            "model_path_full": running_state["model"].file_path,
+            "model_file": running_state["model"].file_name,
+        },
+    )
+
+    # Select 0.8B in UI -> probe reports mismatch while 2B is still running
+    sel08 = client.post(f"/api/models/{reg08.registration_id}/select?probe_llama=true", headers=_auth_headers())
+    assert sel08.status_code == 200
+    assert sel08.json()["server_match"]["match_status"] == "mismatch"
+
+    # Restart server via /api/models/server/restart -> switched to 0.8B with new PID
+    restarted_08 = client.post("/api/models/server/restart", headers=_auth_headers(), json={})
+    assert restarted_08.status_code == 200
+    body_08 = restarted_08.json()
+    assert body_08["pid"] == 50002
+    assert Path(body_08["model_path"]) == f08
+    assert body_08["connection_status"] == "connected"
+    assert body_08["server_match"]["match_status"] == "matched"
+
+    ov_after_08 = client.get("/api/models?probe_llama=true", headers=_auth_headers()).json()
+    assert ov_after_08["server_match"]["match_status"] == "matched"
+    assert ov_after_08["server_match"]["is_matched"] is True
+
+    # Switch back to 2B via /api/models/server/switch with registration_id
+    switched_2b = client.post(
+        "/api/models/server/switch",
+        headers=_auth_headers(),
+        json={"registration_id": reg2.registration_id},
+    )
+    assert switched_2b.status_code == 200
+    body_2b = switched_2b.json()
+    assert body_2b["pid"] == 50003
+    assert Path(body_2b["model_path"]) == f2
+    assert body_2b["server_match"]["match_status"] == "matched"
+
+    # 3. Map SafetyError -> 409, LaunchError -> 500
+    monkeypatch.setattr(
+        srv_mgr,
+        "restart_for_active_model",
+        lambda **kw: (_ for _ in ()).throw(LlamaServerSafetyError("安全性保護エラー")),
+    )
+    safety_res = client.post("/api/models/server/restart", headers=_auth_headers())
+    assert safety_res.status_code == 409
+
+    monkeypatch.setattr(
+        srv_mgr,
+        "restart_for_active_model",
+        lambda **kw: (_ for _ in ()).throw(LlamaServerLaunchError("起動失敗エラー")),
+    )
+    launch_res = client.post("/api/models/server/restart", headers=_auth_headers())
+    assert launch_res.status_code == 500

@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { App } from "../App";
+import { setInMemorySessionTokenForTest } from "../api/client";
 import { Screen1HomePreflight } from "../components/Screen1HomePreflight";
 import { Screen4GlossaryDiagnostics } from "../components/Screen4GlossaryDiagnostics";
 import { ModelLicenseNotice } from "../components/ModelLicenseNotice";
@@ -1243,5 +1245,370 @@ describe("Model Selection, Download, Local Registry & Consistency UI", () => {
     expect(screen.getByTestId("real-inference-prerequisite-note")).not.toHaveTextContent(
       "127.0.0.1:8000"
     );
+  });
+
+  it("renders server restart button in mismatch banners on Screen 1 & Screen 4 with loading state", async () => {
+    const reg08 = makeRegistered({
+      registration_id: "reg-08-mismatch",
+      catalog_model_id: "plamo-3-translate-0.8b-q4_k_m",
+      display_name: "PLaMo 3 Translate 0.8B (Q4_K_M)",
+      short_name: "PLaMo 3 Translate 0.8B",
+      parameter_size: "0.8B",
+      file_path: "C:\\models\\plamo-3-translate-0.8b-Q4_K_M.gguf",
+      file_name: "plamo-3-translate-0.8b-Q4_K_M.gguf",
+    });
+    const mismatchOverview: ModelsOverviewResponse = {
+      catalog: makeCatalog(),
+      unsupported_policies: {},
+      registered: [reg08],
+      active_model_id: reg08.registration_id,
+      active_model: reg08,
+      has_active_translation_job: false,
+      managed_models_dir: "C:\\runtime\\models",
+      downloads: [],
+      server_match: {
+        match_status: "mismatch",
+        is_matched: false,
+        active_registration_id: reg08.registration_id,
+        active_catalog_model_id: reg08.catalog_model_id,
+        active_display_name: reg08.display_name,
+        active_file_path: reg08.file_path,
+        running_identified_display_name: "PLaMo 3 Translate 2B (Q4_K_M)",
+        running_model_path: "C:\\models\\plamo-3-translate-2b-Q4_K_M.gguf",
+        message_ja: "モデル不一致警告: UIは0.8B、サーバーは2Bです。",
+      },
+    };
+    const cfg: TranslationJobConfig = {
+      page_range_spec: null,
+      source_lang: "en",
+      target_lang: "ja",
+      form: "plain",
+      model_name: "plamo-3-translate-0.8b-Q4_K_M",
+      model_id: "plamo-3-translate-0.8b-q4_k_m",
+      quantization: "Q4_K_M",
+      context_length: 8192,
+      translate_captions: true,
+      translate_tables: false,
+      translate_references: false,
+      translate_figures: false,
+      min_font_size_pt: 8,
+      glossary_id: null,
+      output_mono_pdf: true,
+      output_dual_pdf: true,
+      only_roundtrip_preservation: false,
+      pause_for_review: false,
+      use_mock_translator: false,
+    };
+
+    const onRestartServer = vi.fn().mockResolvedValue(undefined);
+    const { rerender } = render(
+      <Screen1HomePreflight
+        currentDocument={null}
+        jobConfig={cfg}
+        glossaries={[]}
+        llamaServerUrl="http://127.0.0.1:8000/v1"
+        modelsOverview={mismatchOverview}
+        isSwitchingServer={false}
+        isUploading={false}
+        uploadError={null}
+        isStartingJob={false}
+        jobStartError={null}
+        onUploadFile={vi.fn()}
+        onUpdateJobConfig={vi.fn()}
+        onOpenProtectionScreen={vi.fn()}
+        onRestartLlamaServer={onRestartServer}
+        onStartTranslationJob={vi.fn()}
+      />
+    );
+
+    const s1Btn = screen.getByTestId("screen1-restart-llama-server-btn");
+    expect(s1Btn).toHaveTextContent("このモデルで推論サーバーを再起動して切り替える");
+    expect(s1Btn).not.toBeDisabled();
+    fireEvent.click(s1Btn);
+    await waitFor(() => {
+      expect(onRestartServer).toHaveBeenCalledWith(reg08.registration_id);
+    });
+
+    // While switching: disabled + loading label
+    rerender(
+      <Screen1HomePreflight
+        currentDocument={null}
+        jobConfig={cfg}
+        glossaries={[]}
+        llamaServerUrl="http://127.0.0.1:8000/v1"
+        modelsOverview={mismatchOverview}
+        isSwitchingServer={true}
+        isUploading={false}
+        uploadError={null}
+        isStartingJob={false}
+        jobStartError={null}
+        onUploadFile={vi.fn()}
+        onUpdateJobConfig={vi.fn()}
+        onOpenProtectionScreen={vi.fn()}
+        onRestartLlamaServer={onRestartServer}
+        onStartTranslationJob={vi.fn()}
+      />
+    );
+    const s1BtnLoading = screen.getByTestId("screen1-restart-llama-server-btn");
+    expect(s1BtnLoading).toHaveTextContent("推論サーバーを再起動・モデルをロード中...");
+    expect(s1BtnLoading).toBeDisabled();
+
+    // Screen 4 ModelSelectionPanel & Diagnostics mismatch banners also render the button
+    const onRestartS4 = vi.fn().mockResolvedValue(undefined);
+    const { rerender: rerenderS4 } = render(
+      <Screen4GlossaryDiagnostics
+        glossaries={[]}
+        diagnostics={makeDiagnostics()}
+        hasProbedLlama={true}
+        isLoadingDiagnostics={false}
+        diagnosticsError={null}
+        modelsOverview={mismatchOverview}
+        isSwitchingServer={false}
+        onRefreshDiagnostics={vi.fn()}
+        onRefreshModels={vi.fn()}
+        onBrowseLocalModelFile={vi.fn()}
+        onRegisterLocalModel={vi.fn()}
+        onSelectModel={vi.fn()}
+        onDeleteModel={vi.fn()}
+        onStartModelDownload={vi.fn()}
+        onCancelModelDownload={vi.fn()}
+        onRestartLlamaServer={onRestartS4}
+        onCreateGlossary={vi.fn()}
+        onUpdateGlossary={vi.fn()}
+        onDeleteGlossary={vi.fn()}
+        onPurgeTempData={vi.fn()}
+        onRotateToken={vi.fn()}
+      />
+    );
+
+    const panelBtn = screen.getByTestId("restart-llama-server-btn");
+    const diagBtn = screen.getByTestId("diag-restart-llama-server-btn");
+    expect(panelBtn).toHaveTextContent("このモデルで推論サーバーを再起動して切り替える");
+    expect(diagBtn).toHaveTextContent("このモデルで推論サーバーを再起動して切り替える");
+
+    fireEvent.click(panelBtn);
+    await waitFor(() => {
+      expect(onRestartS4).toHaveBeenCalledWith(reg08.registration_id);
+    });
+
+    rerenderS4(
+      <Screen4GlossaryDiagnostics
+        glossaries={[]}
+        diagnostics={makeDiagnostics()}
+        hasProbedLlama={true}
+        isLoadingDiagnostics={false}
+        diagnosticsError={null}
+        modelsOverview={{
+          ...mismatchOverview,
+          server_match: {
+            match_status: "matched",
+            is_matched: true,
+            active_registration_id: reg08.registration_id,
+            active_catalog_model_id: reg08.catalog_model_id,
+            active_display_name: reg08.display_name,
+            active_file_path: reg08.file_path,
+            message_ja: "一致しました。",
+          },
+        }}
+        isSwitchingServer={false}
+        onRefreshDiagnostics={vi.fn()}
+        onRefreshModels={vi.fn()}
+        onBrowseLocalModelFile={vi.fn()}
+        onRegisterLocalModel={vi.fn()}
+        onSelectModel={vi.fn()}
+        onDeleteModel={vi.fn()}
+        onStartModelDownload={vi.fn()}
+        onCancelModelDownload={vi.fn()}
+        onRestartLlamaServer={onRestartS4}
+        onCreateGlossary={vi.fn()}
+        onUpdateGlossary={vi.fn()}
+        onDeleteGlossary={vi.fn()}
+        onPurgeTempData={vi.fn()}
+        onRotateToken={vi.fn()}
+      />
+    );
+    expect(screen.getByTestId("model-server-match-banner")).toHaveTextContent("接続可・一致 (matched)");
+    expect(screen.queryByTestId("restart-llama-server-btn")).not.toBeInTheDocument();
+  });
+
+  it("App end-to-end server switch restarts backend, shows loading state, and re-probes to matched", async () => {
+    setInMemorySessionTokenForTest(null);
+    const reg2 = makeRegistered({
+      registration_id: "reg-2b-app",
+      catalog_model_id: "plamo-3-translate-2b-q4_k_m",
+      display_name: "PLaMo 3 Translate 2B (Q4_K_M)",
+    });
+    const reg08 = makeRegistered({
+      registration_id: "reg-08-app",
+      catalog_model_id: "plamo-3-translate-0.8b-q4_k_m",
+      display_name: "PLaMo 3 Translate 0.8B (Q4_K_M)",
+      short_name: "PLaMo 3 Translate 0.8B",
+      parameter_size: "0.8B",
+      file_path: "C:\\models\\plamo-3-translate-0.8b-Q4_K_M.gguf",
+      file_name: "plamo-3-translate-0.8b-Q4_K_M.gguf",
+    });
+
+    let activeModel = reg2;
+    let serverRunningModel = reg2;
+    let resolveRestart: (() => void) | null = null;
+    const requestedUrls: string[] = [];
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const method = (init?.method || "GET").toUpperCase();
+      requestedUrls.push(`${method} ${url}`);
+
+      if (url.includes("/api/auth/session")) {
+        return new Response(
+          JSON.stringify({ token: "app-switch-tok", header_name: "X-PaperBridge-Token", loopback_only: true }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      if (url.endsWith("/api/glossaries")) {
+        return new Response(JSON.stringify([]), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (url.includes("/api/diagnostics")) {
+        const isMatched = activeModel.registration_id === serverRunningModel.registration_id;
+        return new Response(
+          JSON.stringify(
+            makeDiagnostics({
+              llama_model_path: serverRunningModel.file_path,
+              active_registration_id: activeModel.registration_id,
+              active_catalog_model_id: activeModel.catalog_model_id,
+              active_model_display_name: activeModel.display_name,
+              active_model_file_path: activeModel.file_path,
+              running_server_model_path: serverRunningModel.file_path,
+              model_server_match_status: isMatched ? "matched" : "mismatch",
+              model_server_match_message: isMatched ? "一致しました" : "不一致です",
+              model_server_mismatch: !isMatched,
+            })
+          ),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      if (url.includes("/select") && method === "POST") {
+        activeModel = reg08;
+        return new Response(
+          JSON.stringify({
+            active_model_id: activeModel.registration_id,
+            selected_model: activeModel,
+            server_match: {
+              match_status: "mismatch",
+              is_matched: false,
+              active_registration_id: activeModel.registration_id,
+              active_catalog_model_id: activeModel.catalog_model_id,
+              active_display_name: activeModel.display_name,
+              active_file_path: activeModel.file_path,
+              running_identified_display_name: serverRunningModel.display_name,
+              running_model_path: serverRunningModel.file_path,
+              message_ja: "モデル不一致警告: 0.8B へ切り替えが必要です。",
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      if (url.endsWith("/api/models/server/restart") && method === "POST") {
+        await new Promise<void>((resolve) => {
+          resolveRestart = () => {
+            serverRunningModel = reg08;
+            resolve();
+          };
+        });
+        return new Response(
+          JSON.stringify({
+            status: "restarted",
+            pid: 77777,
+            model_path: reg08.file_path,
+            model_alias: reg08.catalog_model_id,
+            registration_id: reg08.registration_id,
+            catalog_model_id: reg08.catalog_model_id,
+            display_name: reg08.display_name,
+            endpoint_url: "http://127.0.0.1:8000/v1",
+            compute_mode: "vulkan",
+            executable_path: "C:\\tools\\llama-server.exe",
+            connection_status: "connected",
+            server_match: {
+              match_status: "matched",
+              is_matched: true,
+              active_registration_id: reg08.registration_id,
+              active_catalog_model_id: reg08.catalog_model_id,
+              active_display_name: reg08.display_name,
+              active_file_path: reg08.file_path,
+              message_ja: "一致しました。",
+            },
+            stopped_pids: [77776],
+            message_ja: "0.8B で推論サーバーを再起動しました (PID=77777)。",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      if (url.includes("/api/models")) {
+        const probe = url.includes("probe_llama=true");
+        const isMatched = activeModel.registration_id === serverRunningModel.registration_id;
+        return new Response(
+          JSON.stringify({
+            catalog: makeCatalog(),
+            unsupported_policies: {},
+            registered: [reg2, reg08],
+            active_model_id: activeModel.registration_id,
+            active_model: activeModel,
+            has_active_translation_job: false,
+            managed_models_dir: "C:\\runtime\\models",
+            downloads: [],
+            server_match: probe
+              ? {
+                  match_status: isMatched ? "matched" : "mismatch",
+                  is_matched: isMatched,
+                  active_registration_id: activeModel.registration_id,
+                  active_catalog_model_id: activeModel.catalog_model_id,
+                  active_display_name: activeModel.display_name,
+                  active_file_path: activeModel.file_path,
+                  running_identified_display_name: serverRunningModel.display_name,
+                  running_model_path: serverRunningModel.file_path,
+                  message_ja: isMatched ? "一致しています。" : "不一致です。",
+                }
+              : null,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      throw new Error(`Unexpected fetch: ${method} ${url}`);
+    });
+
+    try {
+      render(<App />);
+      await waitFor(() => {
+        expect(screen.getByTestId("screen1-quick-model-select")).toBeInTheDocument();
+      });
+
+      fireEvent.change(screen.getByTestId("screen1-quick-model-select"), {
+        target: { value: reg08.registration_id },
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId("screen1-restart-llama-server-btn")).toBeInTheDocument();
+      });
+
+      fireEvent.click(screen.getByTestId("screen1-restart-llama-server-btn"));
+      await waitFor(() => {
+        const btn = screen.getByTestId("screen1-restart-llama-server-btn");
+        expect(btn).toBeDisabled();
+        expect(btn).toHaveTextContent("推論サーバーを再起動・モデルをロード中...");
+      });
+
+      expect(resolveRestart).not.toBeNull();
+      resolveRestart!();
+
+      await waitFor(() => {
+        expect(screen.getByTestId("screen1-current-server-status")).toHaveTextContent(
+          "接続可・一致 (matched)"
+        );
+      });
+      expect(requestedUrls).toContain("POST /api/models/server/restart");
+      expect(requestedUrls).toContain("GET /api/models?probe_llama=true");
+    } finally {
+      fetchSpy.mockRestore();
+      setInMemorySessionTokenForTest(null);
+    }
   });
 });

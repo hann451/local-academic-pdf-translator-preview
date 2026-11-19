@@ -55,6 +55,13 @@ from backend.models.registry import (
     ModelValidationError,
     RegisteredModel,
 )
+from backend.models.server_process import (
+    LlamaServerConflictError,
+    LlamaServerLaunchError,
+    LlamaServerProcessManager,
+    LlamaServerRestartResult,
+    LlamaServerSafetyError,
+)
 from backend.translation.adapters.llama_cpp_adapter import LlamaCppPlamoAdapter
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
@@ -159,6 +166,15 @@ class ModelSelectResponse(BaseModel):
     active_model_id: str
     selected_model: RegisteredModel
     server_match: ModelServerMatchResult | None = None
+
+
+class ModelServerRestartRequest(BaseModel):
+    registration_id: str | None = None
+    use_cpu: bool | None = None
+
+
+class ModelServerRestartResponse(LlamaServerRestartResult):
+    pass
 
 
 class ModelsOverviewResponse(BaseModel):
@@ -292,11 +308,16 @@ def create_app(
     session_token: str | None = None,
     frontend_dist_dir: Path | None = None,
     model_download_manager: ModelDownloadManager | None = None,
+    llama_server_manager: LlamaServerProcessManager | None = None,
 ) -> FastAPI:
     cfg = config or AppConfig()
     cfg.ensure_directories()
     mgr = job_manager or JobManager(config=cfg)
     dl_mgr = model_download_manager or ModelDownloadManager(registry=mgr.model_registry)
+    srv_mgr = llama_server_manager or LlamaServerProcessManager(
+        config=cfg,
+        registry=mgr.model_registry,
+    )
     active_token = session_token or secrets.token_urlsafe(32)
 
     app = FastAPI(
@@ -307,6 +328,7 @@ def create_app(
     app.state.config = cfg
     app.state.job_manager = mgr
     app.state.model_download_manager = dl_mgr
+    app.state.llama_server_manager = srv_mgr
     app.state.session_token = active_token
 
     # Section 4 & 16: Never allow wildcard '*' CORS
@@ -518,6 +540,49 @@ def create_app(
             selected_model=selected,
             server_match=server_match,
         )
+
+    async def _restart_llama_server_impl(
+        req: ModelServerRestartRequest | None,
+    ) -> ModelServerRestartResponse:
+        payload = req or ModelServerRestartRequest()
+        if payload.registration_id:
+            _validate_safe_id(payload.registration_id, "registration_id")
+        if mgr.has_any_active_job():
+            raise HTTPException(
+                status_code=409,
+                detail="ModelSwitchConflict: 翻訳ジョブ実行中は推論サーバーの再起動・モデル切替を行えません。",
+            )
+        try:
+            res = await anyio.to_thread.run_sync(
+                lambda: srv_mgr.restart_for_active_model(
+                    registration_id=payload.registration_id,
+                    use_cpu=payload.use_cpu,
+                    has_active_job=mgr.has_any_active_job,
+                )
+            )
+            return ModelServerRestartResponse(**res.model_dump())
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (ModelValidationError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except (LlamaServerConflictError, LlamaServerSafetyError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except LlamaServerLaunchError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.post("/api/models/server/restart", response_model=ModelServerRestartResponse)
+    async def restart_llama_server_endpoint(
+        req: ModelServerRestartRequest | None = None,
+        _sec: None = Depends(verify_security_headers),
+    ) -> ModelServerRestartResponse:
+        return await _restart_llama_server_impl(req)
+
+    @app.post("/api/models/server/switch", response_model=ModelServerRestartResponse)
+    async def switch_llama_server_endpoint(
+        req: ModelServerRestartRequest | None = None,
+        _sec: None = Depends(verify_security_headers),
+    ) -> ModelServerRestartResponse:
+        return await _restart_llama_server_impl(req)
 
     @app.delete("/api/models/{registration_id}")
     def delete_registered_model_endpoint(

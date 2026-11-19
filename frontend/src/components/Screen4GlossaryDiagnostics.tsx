@@ -7,6 +7,7 @@ import type {
   Glossary,
   GlossaryEntry,
   ModelDownloadJob,
+  ModelServerRestartResponse,
   ModelsOverviewResponse,
   RegisteredModel,
   RegisterLocalModelRequest,
@@ -30,6 +31,7 @@ export interface Screen4Props {
   modelsOverview?: ModelsOverviewResponse | null;
   activeModelDownload?: ModelDownloadJob | null;
   isLoadingModels?: boolean;
+  isSwitchingServer?: boolean;
   modelsError?: string | null;
   onRefreshDiagnostics: (probeLlama: boolean) => Promise<void>;
   onRefreshModels?: (probeLlama: boolean) => Promise<void>;
@@ -39,6 +41,7 @@ export interface Screen4Props {
   onDeleteModel?: (registrationId: string) => Promise<void>;
   onStartModelDownload?: (payload: StartModelDownloadRequest) => Promise<ModelDownloadJob>;
   onCancelModelDownload?: (downloadId: string) => Promise<void>;
+  onRestartLlamaServer?: (registrationId?: string | null) => Promise<ModelServerRestartResponse | void>;
   onCreateGlossary: (name: string, entries: GlossaryEntry[]) => Promise<Glossary>;
   onUpdateGlossary: (
     glossaryId: string,
@@ -59,6 +62,7 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
   modelsOverview = null,
   activeModelDownload = null,
   isLoadingModels = false,
+  isSwitchingServer = false,
   modelsError = null,
   onRefreshDiagnostics,
   onRefreshModels,
@@ -68,6 +72,7 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
   onDeleteModel,
   onStartModelDownload,
   onCancelModelDownload,
+  onRestartLlamaServer,
   onCreateGlossary,
   onUpdateGlossary,
   onDeleteGlossary,
@@ -96,6 +101,7 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
   const [glossaryError, setGlossaryError] = useState<string | null>(null);
   const [isSavingGlossary, setIsSavingGlossary] = useState<boolean>(false);
   const [systemActionFeedback, setSystemActionFeedback] = useState<string | null>(null);
+  const [diagSwitchError, setDiagSwitchError] = useState<string | null>(null);
 
   const selectGlossary = (g: Glossary | null) => {
     if (!g) {
@@ -277,6 +283,7 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
               overview={modelsOverview}
               activeDownload={activeModelDownload}
               isLoading={isLoadingModels}
+              isSwitchingServer={isSwitchingServer}
               error={modelsError}
               onRefreshModels={onRefreshModels}
               onBrowseLocalFile={onBrowseLocalModelFile}
@@ -285,6 +292,7 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
               onDeleteModel={onDeleteModel}
               onStartDownload={onStartModelDownload}
               onCancelDownload={onCancelModelDownload}
+              onRestartLlamaServer={onRestartLlamaServer}
             />
           </section>
         )}
@@ -782,9 +790,52 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
                       className="alert alert-error"
                       style={{ marginTop: "8px", fontSize: "12px" }}
                     >
-                      <strong>選択モデルと応答中 llama-server が一致していません:</strong>{" "}
-                      {diagnostics.model_server_match_message ||
-                        "選択したモデルの再起動または実機切替が必要です。"}
+                      <div>
+                        <strong>選択モデルと応答中 llama-server が一致していません:</strong>{" "}
+                        {diagnostics.model_server_match_message ||
+                          "選択したモデルの再起動または実機切替が必要です。"}
+                      </div>
+                      {diagnostics.model_server_match_status === "mismatch" &&
+                        onRestartLlamaServer && (
+                          <div style={{ marginTop: "8px" }}>
+                            <button
+                              type="button"
+                              className="btn btn-primary btn-sm"
+                              data-testid="diag-restart-llama-server-btn"
+                              disabled={
+                                isSwitchingServer ||
+                                Boolean(modelsOverview?.has_active_translation_job)
+                              }
+                              onClick={async () => {
+                                setDiagSwitchError(null);
+                                try {
+                                  await onRestartLlamaServer(
+                                    modelsOverview?.active_model_id ??
+                                      diagnostics.active_registration_id ??
+                                      null
+                                  );
+                                } catch (err) {
+                                  setDiagSwitchError(
+                                    err instanceof Error ? err.message : String(err)
+                                  );
+                                }
+                              }}
+                            >
+                              {isSwitchingServer
+                                ? "推論サーバーを再起動・モデルをロード中..."
+                                : "このモデルで推論サーバーを再起動して切り替える"}
+                            </button>
+                            {diagSwitchError && (
+                              <div
+                                role="alert"
+                                data-testid="diag-restart-llama-server-error"
+                                style={{ marginTop: "6px", color: "#b91c1c" }}
+                              >
+                                {diagSwitchError}
+                              </div>
+                            )}
+                          </div>
+                        )}
                     </div>
                   )}
                   {diagnostics.llama_connection_status !== "connected" && (

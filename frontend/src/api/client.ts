@@ -23,6 +23,8 @@ import type {
   Job,
   ModelDownloadJob,
   ModelSelectResponse,
+  ModelServerRestartRequest,
+  ModelServerRestartResponse,
   ModelsOverviewResponse,
   ProtectionMode,
   ProtectionRegion,
@@ -705,4 +707,13 @@ export async function cancelModelDownload(
       method: "POST",
     }
   );
+}
+
+export async function restartLlamaServerForActiveModel(
+  payload: ModelServerRestartRequest = {}
+): Promise<ModelServerRestartResponse> {
+  return apiRequest<ModelServerRestartResponse>("/api/models/server/restart", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
 }
