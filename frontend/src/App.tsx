@@ -32,6 +32,7 @@ import {
   fetchSystemDiagnostics,
   previewBlockSplit,
   registerLocalModel,
+  restartLlamaServerForActiveModel,
   selectActiveModel,
   startModelDownload,
   updateBlockProtection,
@@ -62,6 +63,7 @@ import type {
   GlossaryEntry,
   Job,
   ModelDownloadJob,
+  ModelServerRestartResponse,
   ModelsOverviewResponse,
   ProtectionMode,
   ProtectionRegion,
@@ -129,6 +131,7 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
   const [modelsOverview, setModelsOverview] = useState<ModelsOverviewResponse | null>(null);
   const [activeModelDownload, setActiveModelDownload] = useState<ModelDownloadJob | null>(null);
   const [isLoadingModels, setIsLoadingModels] = useState<boolean>(false);
+  const [isSwitchingServer, setIsSwitchingServer] = useState<boolean>(false);
   const [modelsError, setModelsError] = useState<string | null>(null);
 
   // Loading & Error Flags
@@ -826,6 +829,29 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
     await handleRefreshModels(false);
   };
 
+  const handleRestartLlamaServer = async (
+    registrationId?: string | null
+  ): Promise<ModelServerRestartResponse> => {
+    setIsSwitchingServer(true);
+    setModelsError(null);
+    try {
+      const res = await restartLlamaServerForActiveModel(
+        registrationId ? { registration_id: registrationId } : {}
+      );
+      await handleRefreshModels(true);
+      return res;
+    } catch (err) {
+      try {
+        await handleRefreshModels(true);
+      } catch {
+        // preserve original server restart error
+      }
+      throw err;
+    } finally {
+      setIsSwitchingServer(false);
+    }
+  };
+
   const handleCreateGlossary = async (
     name: string,
     entries: GlossaryEntry[]
@@ -983,6 +1009,7 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
             modelsOverview={modelsOverview}
             activeModelDownload={activeModelDownload}
             isLoadingModels={isLoadingModels}
+            isSwitchingServer={isSwitchingServer}
             modelsError={modelsError}
             isUploading={isUploading}
             uploadError={uploadError}
@@ -999,6 +1026,7 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
             onDeleteModel={handleDeleteModel}
             onStartModelDownload={handleStartModelDownload}
             onCancelModelDownload={handleCancelModelDownload}
+            onRestartLlamaServer={handleRestartLlamaServer}
             onStartTranslationJob={handleStartTranslationJob}
           />
         )}
@@ -1067,6 +1095,7 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
             modelsOverview={modelsOverview}
             activeModelDownload={activeModelDownload}
             isLoadingModels={isLoadingModels}
+            isSwitchingServer={isSwitchingServer}
             modelsError={modelsError}
             onRefreshDiagnostics={handleRefreshDiagnostics}
             onRefreshModels={handleRefreshModels}
@@ -1076,6 +1105,7 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
             onDeleteModel={handleDeleteModel}
             onStartModelDownload={handleStartModelDownload}
             onCancelModelDownload={handleCancelModelDownload}
+            onRestartLlamaServer={handleRestartLlamaServer}
             onCreateGlossary={handleCreateGlossary}
             onUpdateGlossary={handleUpdateGlossary}
             onDeleteGlossary={handleDeleteGlossary}

@@ -255,6 +255,87 @@ function Start-TrackedServer {
     }
 }
 
+$LlamaStatePath = Join-Path $UserDataDir "llama_server_state.json"
+
+function Write-LlamaStateFile {
+    param(
+        [hashtable]$ServerInfo,
+        [int]$Port,
+        [string]$ModelPath,
+        [string]$ModelAlias,
+        [string]$RegistrationId,
+        [string]$ComputeMode
+    )
+    if (-not $ServerInfo) { return }
+    $obj = [ordered]@{
+        pid             = [int]$ServerInfo.Pid
+        port            = [int]$Port
+        executable_path = [string]$ServerInfo.ExePath
+        model_path      = [string]$ModelPath
+        model_alias     = [string]$ModelAlias
+        registration_id = [string]$RegistrationId
+        compute_mode    = [string]$ComputeMode
+        updated_at      = ([DateTime]::UtcNow.ToString("o"))
+    }
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $tmp = "$LlamaStatePath." + ([guid]::NewGuid().ToString("N").Substring(0, 8)) + ".tmp"
+    [System.IO.File]::WriteAllText($tmp, ($obj | ConvertTo-Json -Depth 4), $utf8NoBom)
+    Move-Item -LiteralPath $tmp -Destination $LlamaStatePath -Force
+}
+
+function Sync-TrackedLlamaFromStateFile {
+    param(
+        [hashtable]$CurrentServer,
+        [int]$Port,
+        [string]$OutLog,
+        [string]$ErrLog
+    )
+    if ($CurrentServer -and $CurrentServer.Process -and (-not $CurrentServer.Process.HasExited)) {
+        return $CurrentServer
+    }
+    if (-not (Test-Path -LiteralPath $LlamaStatePath)) {
+        return $CurrentServer
+    }
+    try {
+        $st = [System.IO.File]::ReadAllText($LlamaStatePath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+        if (-not $st -or ([int]$st.port -ne $Port) -or (-not $st.pid)) {
+            return $CurrentServer
+        }
+        $newPid = [int]$st.pid
+        if ($CurrentServer -and ([int]$CurrentServer.Pid -eq $newPid)) {
+            return $CurrentServer
+        }
+        $proc = [System.Diagnostics.Process]::GetProcessById($newPid)
+        if ($proc.HasExited) {
+            return $CurrentServer
+        }
+        if ($proc.ProcessName -ine "llama-server") {
+            return $CurrentServer
+        }
+        $actualExe = ""
+        try { $actualExe = $proc.MainModule.FileName } catch {}
+        if ([string]::IsNullOrWhiteSpace($actualExe)) {
+            $actualExe = [string]$st.executable_path
+        }
+        if ([string]::IsNullOrWhiteSpace($actualExe) -or ([System.IO.Path]::GetFileName($actualExe) -ine "llama-server.exe")) {
+            return $CurrentServer
+        }
+        $normExe = [System.IO.Path]::GetFullPath($actualExe).ToLowerInvariant()
+        Write-LaunchLog "推論サーバー切替を検出しました: PID=$newPid ($normExe)"
+        return @{
+            Label     = "llama-server (WebUI切替)"
+            Pid       = $newPid
+            StartTime = $proc.StartTime
+            ExePath   = $normExe
+            Process   = $proc
+            ErrLog    = $ErrLog
+            OutLog    = $OutLog
+        }
+    } catch {
+        return $CurrentServer
+    }
+}
+
 function Stop-TrackedServer {
     param([hashtable]$ServerInfo, [int]$GracefulTimeoutMs = 5000)
     if (-not $ServerInfo) { return }
@@ -471,12 +552,14 @@ if (-not $createdNew) {
 $llamaServer = $null
 $backendServer = $null
 $savedEnv = @{
-    PAPERBRIDGE_RUNTIME_DIR   = $env:PAPERBRIDGE_RUNTIME_DIR
-    PAPERBRIDGE_HOST          = $env:PAPERBRIDGE_HOST
-    PAPERBRIDGE_PORT          = $env:PAPERBRIDGE_PORT
-    PAPERBRIDGE_LLAMA_BASE_URL= $env:PAPERBRIDGE_LLAMA_BASE_URL
-    PYTHONUTF8                = $env:PYTHONUTF8
-    PYTHONIOENCODING          = $env:PYTHONIOENCODING
+    PAPERBRIDGE_RUNTIME_DIR        = $env:PAPERBRIDGE_RUNTIME_DIR
+    PAPERBRIDGE_HOST               = $env:PAPERBRIDGE_HOST
+    PAPERBRIDGE_PORT               = $env:PAPERBRIDGE_PORT
+    PAPERBRIDGE_LLAMA_BASE_URL     = $env:PAPERBRIDGE_LLAMA_BASE_URL
+    PAPERBRIDGE_LLAMA_SERVER_EXE   = $env:PAPERBRIDGE_LLAMA_SERVER_EXE
+    PAPERBRIDGE_LLAMA_CPU_SERVER_EXE = $env:PAPERBRIDGE_LLAMA_CPU_SERVER_EXE
+    PYTHONUTF8                     = $env:PYTHONUTF8
+    PYTHONIOENCODING               = $env:PYTHONIOENCODING
 }
 
 try {
@@ -586,6 +669,13 @@ try {
     }
     Write-LaunchLog "推論サーバー準備完了: $activeModeLabel"
     try {
+        $aliasForState = if ($resolvedCatalogModel -and $resolvedCatalogModel.launch_settings -and $resolvedCatalogModel.launch_settings.alias) { [string]$resolvedCatalogModel.launch_settings.alias } else { "plamo-3-translate" }
+        $modeForState = if ($activeModeLabel -like "CPU*") { "cpu" } else { "vulkan" }
+        Write-LlamaStateFile -ServerInfo $llamaServer -Port $LlamaPort -ModelPath $resolvedModelPath -ModelAlias $aliasForState -RegistrationId ([string]$launchModel.Entry.registration_id) -ComputeMode $modeForState
+    } catch {
+        Write-LaunchLog "llama_server_state.json の保存に失敗しました（非致命的）: $($_.Exception.Message)" "WARN"
+    }
+    try {
         $null = Set-PaperBridgeModelLaunchVerified -UserDataDir $UserDataDir -RegistrationId ([string]$launchModel.Entry.registration_id)
     } catch {
         Write-LaunchLog "launch_verified 状態の保存に失敗しました（非致命的）: $($_.Exception.Message)" "WARN"
@@ -596,6 +686,12 @@ try {
     $env:PAPERBRIDGE_HOST = "127.0.0.1"
     $env:PAPERBRIDGE_PORT = "$BackendPort"
     $env:PAPERBRIDGE_LLAMA_BASE_URL = "http://127.0.0.1:$LlamaPort/v1"
+    if (Test-Path -LiteralPath $VulkanServerExe) {
+        $env:PAPERBRIDGE_LLAMA_SERVER_EXE = $VulkanServerExe
+    }
+    if (Test-Path -LiteralPath $CpuServerExe) {
+        $env:PAPERBRIDGE_LLAMA_CPU_SERVER_EXE = $CpuServerExe
+    }
     $env:PYTHONUTF8 = "1"
     $env:PYTHONIOENCODING = "utf-8"
 
@@ -621,9 +717,25 @@ try {
         if (-not [string]::IsNullOrWhiteSpace($ShutdownSignalFile)) {
             Write-LaunchLog "停止シグナルファイルを監視中: $ShutdownSignalFile"
             while (-not (Test-Path -LiteralPath $ShutdownSignalFile)) {
-                if ($backendServer.Process.HasExited -or $llamaServer.Process.HasExited) {
-                    Write-LaunchLog "バックエンドまたは推論サーバーが予期せず終了しました。" "WARN"
+                if ($backendServer.Process.HasExited) {
+                    Write-LaunchLog "バックエンドサーバーが予期せず終了しました。" "WARN"
                     break
+                }
+                if ($llamaServer.Process.HasExited) {
+                    $syncedLlama = Sync-TrackedLlamaFromStateFile -CurrentServer $llamaServer -Port $LlamaPort -OutLog $llamaOut -ErrLog $llamaErr
+                    if ($syncedLlama -and (-not $syncedLlama.Process.HasExited)) {
+                        $llamaServer = $syncedLlama
+                    } else {
+                        # Give brief grace in case Web UI restart is mid-flight
+                        Start-Sleep -Milliseconds 1200
+                        $syncedLlama = Sync-TrackedLlamaFromStateFile -CurrentServer $llamaServer -Port $LlamaPort -OutLog $llamaOut -ErrLog $llamaErr
+                        if ($syncedLlama -and (-not $syncedLlama.Process.HasExited)) {
+                            $llamaServer = $syncedLlama
+                        } else {
+                            Write-LaunchLog "推論サーバーが予期せず終了しました。" "WARN"
+                            break
+                        }
+                    }
                 }
                 Start-Sleep -Milliseconds 250
             }
@@ -672,7 +784,12 @@ try {
 } finally {
     Write-LaunchLog "終了処理を開始します..."
     try { Stop-TrackedServer -ServerInfo $backendServer -GracefulTimeoutMs 6000 } catch { Write-LaunchLog "バックエンド終了中に例外: $($_.Exception.Message)" "WARN" }
-    try { Stop-TrackedServer -ServerInfo $llamaServer -GracefulTimeoutMs 6000 } catch { Write-LaunchLog "推論サーバー終了中に例外: $($_.Exception.Message)" "WARN" }
+    try {
+        $llamaServer = Sync-TrackedLlamaFromStateFile -CurrentServer $llamaServer -Port $LlamaPort -OutLog $llamaOut -ErrLog $llamaErr
+        Stop-TrackedServer -ServerInfo $llamaServer -GracefulTimeoutMs 6000
+    } catch {
+        Write-LaunchLog "推論サーバー終了中に例外: $($_.Exception.Message)" "WARN"
+    }
 
     foreach ($kv in $savedEnv.GetEnumerator()) {
         if ($null -eq $kv.Value) {

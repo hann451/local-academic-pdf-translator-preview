@@ -7,6 +7,7 @@ import type {
   Document,
   Glossary,
   ModelDownloadJob,
+  ModelServerRestartResponse,
   ModelsOverviewResponse,
   RegisteredModel,
   RegisterLocalModelRequest,
@@ -29,6 +30,7 @@ export interface Screen1Props {
   modelsOverview?: ModelsOverviewResponse | null;
   activeModelDownload?: ModelDownloadJob | null;
   isLoadingModels?: boolean;
+  isSwitchingServer?: boolean;
   modelsError?: string | null;
   isUploading: boolean;
   uploadError: string | null;
@@ -45,6 +47,7 @@ export interface Screen1Props {
   onDeleteModel?: (registrationId: string) => Promise<void>;
   onStartModelDownload?: (payload: StartModelDownloadRequest) => Promise<ModelDownloadJob>;
   onCancelModelDownload?: (downloadId: string) => Promise<void>;
+  onRestartLlamaServer?: (registrationId?: string | null) => Promise<ModelServerRestartResponse | void>;
   onStartTranslationJob: () => Promise<void>;
 }
 
@@ -72,6 +75,7 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
   modelsOverview = null,
   activeModelDownload = null,
   isLoadingModels = false,
+  isSwitchingServer = false,
   modelsError = null,
   isUploading,
   uploadError,
@@ -88,6 +92,7 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
   onDeleteModel,
   onStartModelDownload,
   onCancelModelDownload,
+  onRestartLlamaServer,
   onStartTranslationJob,
 }) => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -96,6 +101,7 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
   const endpointDisplay = formatLlamaEndpointDisplay(llamaServerUrl);
   const [showModelDrawer, setShowModelDrawer] = useState<boolean>(false);
   const [quickSwitchError, setQuickSwitchError] = useState<string | null>(null);
+  const [quickSwitchMessage, setQuickSwitchMessage] = useState<string | null>(null);
   const [isQuickSwitching, setIsQuickSwitching] = useState<boolean>(false);
   const [rangeMode, setRangeMode] = useState<"all" | "custom">(
     jobConfig.page_range_spec ? "custom" : "all"
@@ -682,12 +688,15 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
                           style={{ width: "auto", minWidth: "240px", padding: "4px 8px" }}
                           value={modelsOverview.active_model_id || ""}
                           disabled={
-                            isQuickSwitching || Boolean(modelsOverview.has_active_translation_job)
+                            isQuickSwitching ||
+                            isSwitchingServer ||
+                            Boolean(modelsOverview.has_active_translation_job)
                           }
                           onChange={async (ev) => {
                             const nextId = ev.target.value;
                             if (!nextId || nextId === modelsOverview.active_model_id) return;
                             setQuickSwitchError(null);
+                            setQuickSwitchMessage(null);
                             setIsQuickSwitching(true);
                             try {
                               await onSelectModel(nextId);
@@ -723,6 +732,16 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
                       </div>
                     )}
 
+                    {quickSwitchMessage && (
+                      <div
+                        data-testid="screen1-quick-switch-feedback"
+                        className="alert alert-success"
+                        style={{ marginTop: "8px", fontSize: "12px" }}
+                      >
+                        {quickSwitchMessage}
+                      </div>
+                    )}
+
                     {serverMatch &&
                       (serverMatch.match_status === "mismatch" ||
                         serverMatch.match_status === "selected_model_invalid") && (
@@ -732,7 +751,48 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
                           className="alert alert-error"
                           style={{ marginTop: "8px", fontSize: "12px" }}
                         >
-                          <strong>モデル不整合・起動切替が必要:</strong> {serverMatch.message_ja}
+                          <div>
+                            <strong>モデル不整合・起動切替が必要:</strong> {serverMatch.message_ja}
+                          </div>
+                          {serverMatch.match_status === "mismatch" && onRestartLlamaServer && (
+                            <div style={{ marginTop: "8px" }}>
+                              <button
+                                type="button"
+                                className="btn btn-primary btn-sm"
+                                data-testid="screen1-restart-llama-server-btn"
+                                disabled={
+                                  isSwitchingServer ||
+                                  isQuickSwitching ||
+                                  Boolean(modelsOverview.has_active_translation_job)
+                                }
+                                onClick={async () => {
+                                  setQuickSwitchError(null);
+                                  setQuickSwitchMessage(null);
+                                  try {
+                                    const res = await onRestartLlamaServer(
+                                      modelsOverview.active_model_id ?? null
+                                    );
+                                    if (
+                                      res &&
+                                      typeof res === "object" &&
+                                      "message_ja" in res &&
+                                      res.message_ja
+                                    ) {
+                                      setQuickSwitchMessage(res.message_ja);
+                                    }
+                                  } catch (err) {
+                                    setQuickSwitchError(
+                                      err instanceof Error ? err.message : String(err)
+                                    );
+                                  }
+                                }}
+                              >
+                                {isSwitchingServer
+                                  ? "推論サーバーを再起動・モデルをロード中..."
+                                  : "このモデルで推論サーバーを再起動して切り替える"}
+                              </button>
+                            </div>
+                          )}
                         </div>
                       )}
 
@@ -758,6 +818,7 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
                             overview={modelsOverview}
                             activeDownload={activeModelDownload}
                             isLoading={isLoadingModels}
+                            isSwitchingServer={isSwitchingServer}
                             error={modelsError}
                             onRefreshModels={onRefreshModels}
                             onBrowseLocalFile={onBrowseLocalModelFile}
@@ -766,6 +827,7 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
                             onDeleteModel={onDeleteModel}
                             onStartDownload={onStartModelDownload}
                             onCancelDownload={onCancelModelDownload}
+                            onRestartLlamaServer={onRestartLlamaServer}
                           />
                         </div>
                       )}

@@ -90,6 +90,20 @@ class AppConfig:
             "PAPERBRIDGE_LLAMA_MODEL_ALIAS", "plamo-3-translate"
         )
     )
+    llama_server_exe: Path | None = field(
+        default_factory=lambda: (
+            Path(p)
+            if (p := os.environ.get("PAPERBRIDGE_LLAMA_SERVER_EXE", "").strip())
+            else None
+        )
+    )
+    llama_cpu_server_exe: Path | None = field(
+        default_factory=lambda: (
+            Path(p)
+            if (p := os.environ.get("PAPERBRIDGE_LLAMA_CPU_SERVER_EXE", "").strip())
+            else None
+        )
+    )
     allow_external_translation_host: bool = field(
         default_factory=lambda: os.environ.get(
             "PAPERBRIDGE_ALLOW_EXTERNAL_TRANSLATION_HOST", "false"
