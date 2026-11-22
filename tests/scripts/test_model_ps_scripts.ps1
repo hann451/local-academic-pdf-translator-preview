@@ -93,7 +93,7 @@ try {
     New-Item -ItemType Directory -Path $tmpRoot -Force | Out-Null
 
     # 1. Encoding (UTF-8 BOM + CRLF) and PS 5.1 syntax verification on all production scripts
-    $psScripts = @("apply_update.ps1", "launcher.ps1", "model_registry_common.ps1", "model_setup.ps1", "setup_desktop_shortcut.ps1", "setup_wizard.ps1")
+    $psScripts = @("apply_update.ps1", "launcher.ps1", "model_registry_common.ps1", "model_setup.ps1", "progress_window_common.ps1", "setup_desktop_shortcut.ps1", "setup_wizard.ps1")
     foreach ($name in $psScripts) {
         $p = Join-Path $ScriptsDir $name
         Assert-True (Test-Path -LiteralPath $p) "Script exists: $name"
@@ -107,7 +107,7 @@ try {
         $null = [System.Management.Automation.Language.Parser]::ParseFile($p, [ref]$tokens, [ref]$errors)
         Assert-True ($errors.Count -eq 0) "$name must parse cleanly in PS 5.1 (errors: $($errors.Count))"
     }
-    Write-Output "[PASS] 1. Encoding (UTF-8 BOM + CRLF) & PS 5.1 syntax check passed for all 6 scripts."
+    Write-Output "[PASS] 1. Encoding (UTF-8 BOM + CRLF) & PS 5.1 syntax check passed for all $($psScripts.Count) scripts."
 
     # 2. Dot-source shared helper & create synthetic GGUF payloads + isolated catalog
     . (Join-Path $ScriptsDir "model_registry_common.ps1")
@@ -183,7 +183,47 @@ try {
     Assert-Throws { Register-PaperBridgeLocalModel -UserDataDir $rtDir -ProjectRoot $ProjectRoot -FilePath $unknownPlamo -RegisterMode "reference" -LicenseAccepted $true } "Unknown SHA must throw without treating as 2B"
 
     Assert-Throws { Register-PaperBridgeLocalModel -UserDataDir $rtDir -ProjectRoot $ProjectRoot -FilePath $f08 -ExpectedCatalogModelId "plamo-3-translate-2b-q4_k_m" -RegisterMode "reference" -LicenseAccepted $true } "Wrong expected model ID must throw"
-    Write-Output "[PASS] 2. Corrupt/split/non-plamo3/31B/unknown-SHA rejections passed."
+
+    # 3b. Large GGUF tokenizer string-array fast skip verification (must complete far under 2 seconds)
+    $largeTokGguf = Join-Path $tmpRoot "large_tokens.gguf"
+    $msTok = New-Object System.IO.MemoryStream
+    $bwTok = New-Object System.IO.BinaryWriter($msTok)
+    try {
+        $bwTok.Write([System.Text.Encoding]::ASCII.GetBytes("GGUF"))
+        $bwTok.Write([uint32]3)
+        $bwTok.Write([uint64]4)
+        $bwTok.Write([uint64]3) # general.architecture, tokenizer.ggml.tokens, general.name
+        $kArch = [System.Text.Encoding]::UTF8.GetBytes("general.architecture")
+        $bwTok.Write([uint64]$kArch.Length); $bwTok.Write($kArch); $bwTok.Write([uint32]8)
+        $vArch = [System.Text.Encoding]::UTF8.GetBytes("plamo3")
+        $bwTok.Write([uint64]$vArch.Length); $bwTok.Write($vArch)
+
+        $kArr = [System.Text.Encoding]::UTF8.GetBytes("tokenizer.ggml.tokens")
+        $bwTok.Write([uint64]$kArr.Length); $bwTok.Write($kArr); $bwTok.Write([uint32]9)
+        $bwTok.Write([uint32]8) # string elements
+        $bwTok.Write([uint64]5000)
+        for ($ti = 0; $ti -lt 5000; $ti++) {
+            $tokBytes = [System.Text.Encoding]::UTF8.GetBytes("tok_$ti")
+            $bwTok.Write([uint64]$tokBytes.Length); $bwTok.Write($tokBytes)
+        }
+
+        $kName = [System.Text.Encoding]::UTF8.GetBytes("general.name")
+        $bwTok.Write([uint64]$kName.Length); $bwTok.Write($kName); $bwTok.Write([uint32]8)
+        $vName = [System.Text.Encoding]::UTF8.GetBytes("plamo-3-translate-0.8b")
+        $bwTok.Write([uint64]$vName.Length); $bwTok.Write($vName)
+        $bwTok.Flush()
+        [System.IO.File]::WriteAllBytes($largeTokGguf, $msTok.ToArray())
+    } finally {
+        $bwTok.Dispose()
+        $msTok.Dispose()
+    }
+    $swTok = [System.Diagnostics.Stopwatch]::StartNew()
+    $tokInsp = Inspect-GgufFile -FilePath $largeTokGguf
+    $swTok.Stop()
+    Assert-True ($tokInsp.format_valid -and $tokInsp.architecture -eq "plamo3" -and $tokInsp.model_name -eq "plamo-3-translate-0.8b") "Large string-array GGUF metadata parsed accurately"
+    Assert-True ($swTok.ElapsedMilliseconds -lt 2000) "Large string-array GGUF fast-skip completed quickly ($($swTok.ElapsedMilliseconds)ms)"
+
+    Write-Output "[PASS] 2. Corrupt/split/non-plamo3/31B/unknown-SHA rejections & fast string-array skip passed."
 
     # 4. Reference vs Copy + self-copy guard + Japanese+spaces path
     $rUnconf = Resolve-PaperBridgeActiveModelForLaunch -UserDataDir $rtDir -ProjectRoot $ProjectRoot
@@ -346,11 +386,15 @@ try {
     $updZipOut = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptsDir "apply_update.ps1") `
         -ProjectRoot $zipAppDir -UserDataDir $updRt -BackendPort $ephemeralPort -LlamaPort 0 `
         -LocalZipPath $testZip -TargetCommitSha "fe517c2b0f724785bd01fe6b1f9cbc45418ba2cc" `
-        -PortWaitTimeoutSec 15 -NoRebuild -NoRestart 2>&1) -join "`n"
+        -PortWaitTimeoutSec 15 -NoRebuild -NoRestart -NoUi 2>&1) -join "`n"
     if ($holderProc -and (-not $holderProc.HasExited)) { $holderProc.WaitForExit(5000) | Out-Null }
 
     Assert-True ($LASTEXITCODE -eq 0) "apply_update.ps1 ZIP mode exited 0 (out: $updZipOut)"
     Assert-True ($updZipOut -match "UPDATE_APPLY_SUCCESS") "apply_update.ps1 reported UPDATE_APPLY_SUCCESS"
+    $zipProgPath = Join-Path $updRt "update_progress.json"
+    Assert-True (Test-Path -LiteralPath $zipProgPath) "ZIP update wrote update_progress.json"
+    $zipProg = [System.IO.File]::ReadAllText($zipProgPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+    Assert-True ($zipProg.percent -eq 100 -and $zipProg.status -eq "completed") "ZIP update progress ended at 100% completed"
     Assert-True (([System.IO.File]::ReadAllText((Join-Path $zipAppDir "README.md"))) -eq "NEW_README_V2") "ZIP update replaced README.md"
     Assert-True (Test-Path -LiteralPath (Join-Path $zipAppDir "backend\new_mod.py")) "ZIP update added new file"
     Assert-True (([System.IO.File]::ReadAllText((Join-Path $zipAppDir ".env"))) -eq "SECRET_KEEP=1") ".env MUST be protected from overwrite"
@@ -392,7 +436,7 @@ try {
 
         $updGitOut = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptsDir "apply_update.ps1") `
             -ProjectRoot $cloneRepo -UserDataDir $updRt -BackendPort 0 -LlamaPort 0 `
-            -Branch "main" -NoRebuild -NoRestart 2>&1) -join "`n"
+            -Branch "main" -NoRebuild -NoRestart -NoUi 2>&1) -join "`n"
         $updGitRc = $LASTEXITCODE
         $actualGitSha = (& git -C $cloneRepo rev-parse HEAD 2>$null).Trim()
     } finally {
@@ -403,7 +447,34 @@ try {
     Assert-True (([System.IO.File]::ReadAllText((Join-Path $cloneRepo "app.txt"))) -eq "v2") "Git mode updated tracked file"
     Assert-True (([System.IO.File]::ReadAllText((Join-Path $cloneRepo ".env"))) -eq "LOCAL_GIT_ENV=keep") "Git mode preserved .env"
     Assert-True (([System.IO.File]::ReadAllText((Join-Path $cloneRepo "uat-artifacts\keep.txt"))) -eq "GIT_UAT_KEEP") "Git mode preserved uat-artifacts"
-    Write-Output "[PASS] 8. External updater (apply_update.ps1) port wait, ZIP protection & Git pull passed."
+
+    # 9c. Progress helper clamping & failure-state recording checks
+    . (Join-Path $ScriptsDir "progress_window_common.ps1")
+    $clampJsonPath = Join-Path $tmpRoot "clamp_progress.json"
+    Write-PaperBridgeProgressFile -FilePath $clampJsonPath -Percent 150 -Stage "test_hi" -Status "running" -Message "hi"
+    $clampHi = [System.IO.File]::ReadAllText($clampJsonPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+    Assert-True ($clampHi.percent -eq 100) "Write-PaperBridgeProgressFile clamps percent > 100 to 100"
+    Write-PaperBridgeProgressFile -FilePath $clampJsonPath -Percent -12 -Stage "test_lo" -Status "running" -Message "lo"
+    $clampLo = [System.IO.File]::ReadAllText($clampJsonPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+    Assert-True ($clampLo.percent -eq 0) "Write-PaperBridgeProgressFile clamps percent < 0 to 0"
+
+    [System.IO.File]::WriteAllText((Join-Path $updRt ".update_in_progress"), "{}")
+    $prevFailEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $updFailOut = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptsDir "apply_update.ps1") `
+            -ProjectRoot $zipAppDir -UserDataDir $updRt -BackendPort 0 -LlamaPort 0 `
+            -LocalZipPath (Join-Path $tmpRoot "missing_payload.zip") -NoRebuild -NoRestart -NoUi 2>&1) -join "`n"
+        $updFailRc = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prevFailEap
+    }
+    Assert-True ($updFailRc -ne 0) "apply_update.ps1 exits non-zero on missing LocalZipPath"
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $updRt ".update_in_progress"))) "Failed update still clears .update_in_progress"
+    $failProg = [System.IO.File]::ReadAllText($zipProgPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+    Assert-True ($failProg.status -eq "failed" -and -not [string]::IsNullOrWhiteSpace($failProg.error)) "Failed update records status=failed and error message in update_progress.json"
+
+    Write-Output "[PASS] 8. External updater (apply_update.ps1) port wait, progress JSON, ZIP protection & Git pull passed."
 
     Write-Output "ALL_PS_MODEL_TESTS_PASSED"
 } finally {

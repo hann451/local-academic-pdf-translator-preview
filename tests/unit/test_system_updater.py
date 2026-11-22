@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import threading
 import time
@@ -22,6 +23,7 @@ from backend.updater import (
     UpdateLaunchError,
     get_local_version,
 )
+from backend.updater.manager import _default_spawn_detached
 
 
 def _auth_headers(token: str = "test-tok") -> dict[str, str]:
@@ -210,6 +212,12 @@ def test_apply_update_spawns_external_script_stops_llama_and_shuts_down(tmp_path
     assert res.status == "updating"
     assert res.updater_pid == 42424
     assert (cfg.runtime_dir / ".update_in_progress").is_file()
+    progress_file = cfg.runtime_dir / "update_progress.json"
+    assert progress_file.is_file()
+    progress_data = json.loads(progress_file.read_text(encoding="utf-8"))
+    assert progress_data["percent"] == 2
+    assert progress_data["status"] == "running"
+    assert progress_data["stage"] == "launching_updater"
     assert str(apply_ps1) in captured_cmd
     assert "18080" in captured_cmd
     assert "18000" in captured_cmd
@@ -221,6 +229,63 @@ def test_apply_update_spawns_external_script_stops_llama_and_shuts_down(tmp_path
     # Second call while update already started -> UpdateConflictError
     with pytest.raises(UpdateConflictError):
         updater.apply_update(has_active_job=False)
+
+
+def test_apply_update_spawn_failure_records_failed_progress_and_clears_marker(tmp_path: Path) -> None:
+    proj = tmp_path / "proj_fail"
+    (proj / "scripts").mkdir(parents=True)
+    (proj / "scripts" / "apply_update.ps1").write_text("# stub\n", encoding="utf-8")
+    cfg = AppConfig(runtime_dir=tmp_path / "rt_fail")
+    cfg.ensure_directories()
+
+    def broken_spawn(cmd: list[str], cwd: Path) -> int:
+        raise OSError("mock spawn failure")
+
+    updater = SystemUpdater(config=cfg, project_root=proj, spawn_updater_fn=broken_spawn)
+    with pytest.raises(UpdateLaunchError, match="mock spawn failure"):
+        updater.apply_update(has_active_job=False)
+
+    assert not (cfg.runtime_dir / ".update_in_progress").exists()
+    progress_data = json.loads((cfg.runtime_dir / "update_progress.json").read_text(encoding="utf-8"))
+    assert progress_data["status"] == "failed"
+    assert progress_data["stage"] == "launch_failed"
+    assert "mock spawn failure" in progress_data["error"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows detached PowerShell spawn check")
+def test_default_spawn_detached_executes_powershell_script_on_windows(tmp_path: Path) -> None:
+    out_file = tmp_path / "spawn_verified.txt"
+    ps_script = tmp_path / "verify_spawn.ps1"
+    ps_script.write_text(
+        'param([string]$OutPath)\n'
+        'Start-Sleep -Milliseconds 150\n'
+        '[System.IO.File]::WriteAllText($OutPath, "SPAWN_OK", (New-Object System.Text.UTF8Encoding($false)))\n',
+        encoding="utf-8-sig",
+    )
+
+    pid = _default_spawn_detached(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-WindowStyle",
+            "Hidden",
+            "-File",
+            str(ps_script),
+            "-OutPath",
+            str(out_file),
+        ],
+        tmp_path,
+    )
+    assert pid > 0
+
+    deadline = time.monotonic() + 12.0
+    while time.monotonic() < deadline and not out_file.is_file():
+        time.sleep(0.1)
+
+    assert out_file.is_file(), "powershell.exe exited without executing -File under _default_spawn_detached"
+    assert out_file.read_text(encoding="utf-8") == "SPAWN_OK"
 
 
 def test_apply_update_missing_script_raises_launch_error(tmp_path: Path) -> None:

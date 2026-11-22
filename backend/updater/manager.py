@@ -141,9 +141,12 @@ def get_local_version(project_root: Path | None = None) -> tuple[str, str | None
 def _default_spawn_detached(cmd: list[str], cwd: Path) -> int:
     creationflags = 0
     if os.name == "nt":
+        # Note: DETACHED_PROCESS cannot be combined with CREATE_NO_WINDOW in CreateProcessW,
+        # and Windows PowerShell 5.1 exits silently with code 0 without executing `-File`
+        # under DETACHED_PROCESS. Use CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW so
+        # `powershell.exe` survives backend shutdown while still able to show WinForms UI.
         creationflags = (
             getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
-            | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
             | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         )
     proc = subprocess.Popen(
@@ -156,6 +159,43 @@ def _default_spawn_detached(cmd: list[str], cwd: Path) -> int:
         creationflags=creationflags,
     )
     return int(proc.pid)
+
+
+def _write_update_progress_file(
+    runtime_dir: Path,
+    *,
+    percent: int,
+    stage: str,
+    status: str,
+    message: str,
+    detail: str = "",
+    error: str | None = None,
+    log_path: Path | None = None,
+) -> None:
+    """Atomically persist updater progress state to `update_progress.json`."""
+    try:
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        clamped = max(0, min(100, int(percent)))
+        payload = {
+            "percent": clamped,
+            "stage": stage,
+            "status": status,
+            "message": message,
+            "detail": detail,
+            "error": error or "",
+            "log_path": str(log_path) if log_path is not None else "",
+            "updated_at": _utc_now_iso(),
+        }
+        target_path = runtime_dir / "update_progress.json"
+        tmp_path = runtime_dir / f".update_progress.{os.getpid()}.{threading.get_ident()}.tmp"
+        tmp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(tmp_path, target_path)
+    except Exception:
+        # Progress telemetry must never abort the update handoff itself
+        pass
 
 
 def _default_shutdown_process() -> None:
@@ -439,8 +479,27 @@ class SystemUpdater:
             if sha_to_pass and _is_hex_sha(sha_to_pass):
                 cmd.extend(["-TargetCommitSha", sha_to_pass])
 
+            _write_update_progress_file(
+                self.config.runtime_dir,
+                percent=2,
+                stage="launching_updater",
+                status="running",
+                message="外部アップデーターを起動しています...",
+                detail=f"ログ: {log_path}",
+                log_path=log_path,
+            )
+
             updater_pid = self._spawn_updater_fn(cmd, self.project_root)
         except Exception as exc:
+            _write_update_progress_file(
+                self.config.runtime_dir,
+                percent=2,
+                stage="launch_failed",
+                status="failed",
+                message="外部アップデーターの起動に失敗しました。",
+                error=str(exc),
+                log_path=log_path,
+            )
             try:
                 signal_path.unlink(missing_ok=True)
             except OSError:

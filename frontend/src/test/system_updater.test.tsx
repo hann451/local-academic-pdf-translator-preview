@@ -221,7 +221,9 @@ describe("Software Update Card on Screen 4 & Default 0.8B Selection", () => {
     });
     expect(screen.queryByTestId("update-confirm-modal")).not.toBeInTheDocument();
 
-    // Loading overlay appears while applying
+    // Loading overlay appears while applying with elapsed time, progress bar, and separate window hint
+    const retryFn = vi.fn();
+    const dismissFn = vi.fn();
     rerender(
       <Screen4GlossaryDiagnostics
         glossaries={[]}
@@ -238,6 +240,11 @@ describe("Software Update Card on Screen 4 & Default 0.8B Selection", () => {
         updateCheckResult={availableResult}
         isApplyingUpdate={true}
         updateApplyingMessage="最新版を適用して再起動しています..."
+        updateLogPath={"C:\\runtime\\logs\\updater.log"}
+        updateElapsedSeconds={25}
+        updateReconnectTimedOut={false}
+        onRetryUpdateReconnect={retryFn}
+        onDismissUpdateOverlay={dismissFn}
         onCheckUpdate={onCheckUpdate}
         onApplyUpdate={onApplyUpdate}
       />
@@ -246,6 +253,46 @@ describe("Software Update Card on Screen 4 & Default 0.8B Selection", () => {
     expect(screen.getByTestId("system-update-loading-overlay")).toHaveTextContent(
       "最新版を適用して再起動しています..."
     );
+    expect(screen.getByTestId("system-update-elapsed")).toHaveTextContent("経過時間: 00:25");
+    expect(screen.getByTestId("system-update-progress-bar")).toBeInTheDocument();
+    expect(screen.getByTestId("system-update-log-path")).toHaveTextContent("updater.log");
+
+    // When reconnect times out, show recovery UI with retry and dismiss buttons
+    rerender(
+      <Screen4GlossaryDiagnostics
+        glossaries={[]}
+        diagnostics={makeDiagnostics({ app_version: "c7f9296" })}
+        hasProbedLlama={false}
+        isLoadingDiagnostics={false}
+        diagnosticsError={null}
+        onRefreshDiagnostics={vi.fn()}
+        onCreateGlossary={vi.fn()}
+        onUpdateGlossary={vi.fn()}
+        onDeleteGlossary={vi.fn()}
+        onPurgeTempData={vi.fn()}
+        onRotateToken={vi.fn()}
+        updateCheckResult={availableResult}
+        isApplyingUpdate={true}
+        updateApplyingMessage="最新版を適用して再起動しています..."
+        updateLogPath={"C:\\runtime\\logs\\updater.log"}
+        updateElapsedSeconds={180}
+        updateReconnectTimedOut={true}
+        onRetryUpdateReconnect={retryFn}
+        onDismissUpdateOverlay={dismissFn}
+        onCheckUpdate={onCheckUpdate}
+        onApplyUpdate={onApplyUpdate}
+      />
+    );
+    expect(screen.getByTestId("system-update-timeout-panel")).toHaveTextContent(
+      "再接続がタイムアウトしました（180秒経過）"
+    );
+    expect(screen.getByTestId("system-update-log-path")).toHaveTextContent(
+      "C:\\runtime\\logs\\updater.log"
+    );
+    fireEvent.click(screen.getByTestId("update-retry-reconnect-btn"));
+    expect(retryFn).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByTestId("update-dismiss-overlay-btn"));
+    expect(dismissFn).toHaveBeenCalledTimes(1);
   });
 
   it("App end-to-end update flow checks GitHub API, confirms modal, handles 409 conflict and applies update", async () => {

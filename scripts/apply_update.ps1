@@ -16,7 +16,8 @@ param(
     [switch]$NoRebuild = $false,
     [switch]$NoRestart = $false,
     [switch]$UseCpuInference = $false,
-    [switch]$DryRun = $false
+    [switch]$DryRun = $false,
+    [switch]$NoUi = $false
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,6 +25,10 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$ProgressCommonScript = Join-Path $ScriptDir "progress_window_common.ps1"
+if (Test-Path -LiteralPath $ProgressCommonScript) {
+    . $ProgressCommonScript
+}
 if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
     $ProjectRoot = Split-Path -Parent $ScriptDir
 }
@@ -56,9 +61,45 @@ $UserDataDir = [System.IO.Path]::GetFullPath($UserDataDir.Trim().Trim('"'))
 $LogsDir = Join-Path $UserDataDir "logs"
 $UpdaterLogPath = Join-Path $LogsDir "updater.log"
 $UpdateSignalPath = Join-Path $UserDataDir ".update_in_progress"
+$UpdateProgressPath = Join-Path $UserDataDir "update_progress.json"
+$script:ShowUpdateUi = (-not $NoUi) -and (-not $DryRun)
+$script:ProgressHandle = $null
+$script:LastUpdatePercent = 0
 
 if (-not (Test-Path -LiteralPath $LogsDir)) {
     New-Item -ItemType Directory -Path $LogsDir -Force | Out-Null
+}
+
+function Report-UpdateProgress {
+    param(
+        [int]$Percent,
+        [string]$Stage,
+        [string]$Message,
+        [string]$Detail = "",
+        [string]$Status = "running",
+        [string]$ErrorMessage = ""
+    )
+    $clamped = [Math]::Max(0, [Math]::Min(100, $Percent))
+    $script:LastUpdatePercent = $clamped
+    if (Get-Command Write-PaperBridgeProgressFile -ErrorAction SilentlyContinue) {
+        Write-PaperBridgeProgressFile `
+            -FilePath $UpdateProgressPath `
+            -Percent $clamped `
+            -Stage $Stage `
+            -Status $Status `
+            -Message $Message `
+            -Detail $Detail `
+            -ErrorMessage $ErrorMessage `
+            -LogPath $UpdaterLogPath
+    }
+    if ($script:ProgressHandle -and $script:ProgressHandle.IsActive -and (Get-Command Update-PaperBridgeProgressWindow -ErrorAction SilentlyContinue)) {
+        Update-PaperBridgeProgressWindow `
+            -Handle $script:ProgressHandle `
+            -Percent $clamped `
+            -Message $Message `
+            -Detail $Detail `
+            -Status $Status
+    }
 }
 
 function Write-UpdateLog {
@@ -148,7 +189,9 @@ function Wait-PortsReleased {
     if ($validPorts.Count -eq 0) { return }
 
     Write-UpdateLog "ポート解放を待機中: $($validPorts -join ', ') (最大 ${TimeoutSeconds}秒)..."
+    Report-UpdateProgress -Percent 10 -Stage "waiting_ports" -Message "サーバーポート ($($validPorts -join ', ')) の解放を待機しています..." -Detail "最大 ${TimeoutSeconds} 秒待機中"
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $reportSw = [System.Diagnostics.Stopwatch]::StartNew()
     while ($sw.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         $busy = @()
         foreach ($p in $validPorts) {
@@ -158,7 +201,14 @@ function Wait-PortsReleased {
         }
         if ($busy.Count -eq 0) {
             Write-UpdateLog "対象ポート ($($validPorts -join ', ')) の完全解放を確認しました。"
+            Report-UpdateProgress -Percent 14 -Stage "ports_released" -Message "サーバーポートの解放を確認しました。" -Detail "ポート $($validPorts -join ', ') 解放完了"
             return
+        }
+        if ($reportSw.ElapsedMilliseconds -ge 450) {
+            $elapsedSec = [int][Math]::Floor($sw.Elapsed.TotalSeconds)
+            $pPct = [Math]::Min(14, 10 + [int][Math]::Floor(($sw.Elapsed.TotalSeconds / [Math]::Max(1, $TimeoutSeconds)) * 4.0))
+            Report-UpdateProgress -Percent $pPct -Stage "waiting_ports" -Message "サーバーポートの終了処理を待機しています..." -Detail ("待機中ポート: {0} ({1}秒経過)" -f ($busy -join ", "), $elapsedSec)
+            $reportSw.Restart()
         }
         Start-Sleep -Milliseconds 300
     }
@@ -287,6 +337,7 @@ function Invoke-GitUpdate {
         throw "Git 管理下のディレクトリですが git コマンドが見つかりません。"
     }
     Write-UpdateLog "Git 管理環境を検出しました。'git pull origin $TargetBranch' を実行します..."
+    Report-UpdateProgress -Percent 25 -Stage "git_pull" -Message "Git リポジトリから最新版を取得しています..." -Detail "ブランチ: origin/$TargetBranch"
     if ($DryRun) {
         Write-UpdateLog "[DRY_RUN] git -C `"$RepoRoot`" pull origin $TargetBranch"
         return ""
@@ -311,13 +362,15 @@ function Invoke-GitUpdate {
         $headSha = (& git -C $RepoRoot rev-parse HEAD 2>$null).Trim()
     } catch {}
     Write-UpdateLog "Git 更新が完了しました (HEAD=$headSha)。"
+    Report-UpdateProgress -Percent 82 -Stage "git_applied" -Message "最新コードの取得が完了しました。" -Detail "HEAD: $headSha"
     return $headSha
 }
 
 function Download-ZipFile {
     param(
         [string]$Url,
-        [string]$DestPath
+        [string]$DestPath,
+        [scriptblock]$ProgressCallback = $null
     )
     Write-UpdateLog "ZIP アーカイブをダウンロード中: $Url"
     $req = [System.Net.HttpWebRequest]::Create($Url)
@@ -332,11 +385,22 @@ function Download-ZipFile {
     $fs = $null
     try {
         $resp = $req.GetResponse()
+        $totalBytes = [int64]$resp.ContentLength
         $resStream = $resp.GetResponseStream()
         $fs = [System.IO.File]::Create($DestPath)
         $buf = New-Object byte[] 131072
+        $downloaded = 0L
+        $dlSw = [System.Diagnostics.Stopwatch]::StartNew()
         while (($n = $resStream.Read($buf, 0, $buf.Length)) -gt 0) {
             $fs.Write($buf, 0, $n)
+            $downloaded += $n
+            if ($ProgressCallback -and $dlSw.ElapsedMilliseconds -ge 120) {
+                & $ProgressCallback $downloaded $totalBytes
+                $dlSw.Restart()
+            }
+        }
+        if ($ProgressCallback) {
+            & $ProgressCallback $downloaded $totalBytes
         }
     } finally {
         if ($fs) { try { $fs.Close() } catch {} }
@@ -406,12 +470,27 @@ function Invoke-ZipUpdate {
                 throw "指定されたローカル ZIP ファイルが見つかりません: $ZipOverridePath"
             }
             Write-UpdateLog "指定されたローカル ZIP を使用します: $ZipOverridePath"
+            Report-UpdateProgress -Percent 55 -Stage "downloading" -Message "アップデートパッケージを準備しています..." -Detail $ZipOverridePath
             $zipFile = $ZipOverridePath
         } else {
-            Download-ZipFile -Url $zipUrl -DestPath $zipFile
+            Report-UpdateProgress -Percent 20 -Stage "downloading" -Message "GitHub から最新版パッケージをダウンロードしています..." -Detail $zipUrl
+            Download-ZipFile -Url $zipUrl -DestPath $zipFile -ProgressCallback {
+                param([int64]$dlBytes, [int64]$totalBytes)
+                $mbDl = $dlBytes / 1048576.0
+                if ($totalBytes -gt 0) {
+                    $ratio = [Math]::Min(1.0, $dlBytes / [double]$totalBytes)
+                    $pct = 20 + [int][Math]::Floor($ratio * 35.0)
+                    $mbTot = $totalBytes / 1048576.0
+                    Report-UpdateProgress -Percent $pct -Stage "downloading" -Message "GitHub から最新版パッケージをダウンロードしています..." -Detail ("{0:N1} MB / {1:N1} MB ダウンロード済み" -f $mbDl, $mbTot)
+                } else {
+                    $pct = [Math]::Min(53, 20 + [int][Math]::Floor($mbDl * 1.2))
+                    Report-UpdateProgress -Percent $pct -Stage "downloading" -Message "GitHub から最新版パッケージをダウンロードしています..." -Detail ("{0:N1} MB ダウンロード済み..." -f $mbDl)
+                }
+            }
         }
 
         Write-UpdateLog "ZIP アーカイブを展開中: $extractDir"
+        Report-UpdateProgress -Percent 58 -Stage "extracting" -Message "アップデートパッケージを展開しています..." -Detail "ZIP アーカイブを展開中"
         [System.IO.Compression.ZipFile]::ExtractToDirectory($zipFile, $extractDir)
 
         # GitHub main.zip typically wraps everything inside a single top-level directory
@@ -425,20 +504,32 @@ function Invoke-ZipUpdate {
 
         $copiedCount = 0
         $skippedCount = 0
+        $processedCount = 0
         $srcPrefix = $sourceRoot.TrimEnd('\') + "\"
-        $allFiles = Get-ChildItem -LiteralPath $sourceRoot -File -Recurse -Force
+        $allFiles = @(Get-ChildItem -LiteralPath $sourceRoot -File -Recurse -Force)
+        $totalFiles = $allFiles.Count
+        $copySw = [System.Diagnostics.Stopwatch]::StartNew()
+        Report-UpdateProgress -Percent 62 -Stage "copying_files" -Message "新しいプログラムファイルを適用しています..." -Detail "全 $totalFiles 件（設定・モデル・UAT成果物は保護）"
         foreach ($f in $allFiles) {
+            $processedCount++
             $rel = $f.FullName.Substring($srcPrefix.Length)
             if (Test-IsProtectedRelativePath -RelativePath $rel) {
                 $skippedCount++
-                continue
+            } else {
+                $dest = Join-Path $TargetRoot $rel
+                Copy-FileWithRetry -SourcePath $f.FullName -DestPath $dest
+                $copiedCount++
             }
-            $dest = Join-Path $TargetRoot $rel
-            Copy-FileWithRetry -SourcePath $f.FullName -DestPath $dest
-            $copiedCount++
+            if (($processedCount % 25 -eq 0) -or ($copySw.ElapsedMilliseconds -ge 120)) {
+                $pct = 62 + [int][Math]::Floor(($processedCount / [double][Math]::Max(1, $totalFiles)) * 20.0)
+                Report-UpdateProgress -Percent $pct -Stage "copying_files" -Message "新しいプログラムファイルを適用しています..." -Detail ("$processedCount / $totalFiles 件処理（更新 $copiedCount 件 / 保護 $skippedCount 件）")
+                $copySw.Restart()
+            }
         }
+        Report-UpdateProgress -Percent 82 -Stage "copying_files" -Message "プログラムファイルの適用が完了しました。" -Detail "更新 $copiedCount 件 / 保護スキップ $skippedCount 件"
         Write-UpdateLog "ZIP 上書き完了: 更新ファイル $copiedCount 件 / 保護スキップ $skippedCount 件。"
 
+        Report-UpdateProgress -Percent 84 -Stage "recording_version" -Message "バージョン情報を記録しています..."
         $recordedSha = $KnownSha
         if ([string]::IsNullOrWhiteSpace($recordedSha) -and [string]::IsNullOrWhiteSpace($ZipOverridePath)) {
             $recordedSha = Resolve-RemoteHeadShaBestEffort -Slug $Slug -TargetBranch $TargetBranch
@@ -481,6 +572,7 @@ function Invoke-PostUpdateRebuildIfApplicable {
         try {
             if ((Test-Path -LiteralPath $bundledNode) -and (Test-Path -LiteralPath $bundledNpmCli)) {
                 Write-UpdateLog "同梱 Node.js を使用して frontend/dist を再ビルドします..."
+                Report-UpdateProgress -Percent 86 -Stage "rebuilding_frontend" -Message "UI アセットを再ビルドしています..." -Detail "同梱 Node.js で npm run build を実行中"
                 $prevPath = $env:PATH
                 $env:PATH = "$bundledNodeDir;$prevPath"
                 try {
@@ -494,6 +586,7 @@ function Invoke-PostUpdateRebuildIfApplicable {
                 if (-not $sysNpm) { $sysNpm = Get-Command npm -ErrorAction SilentlyContinue }
                 if ($sysNpm) {
                     Write-UpdateLog "システム npm を使用して frontend/dist を再ビルドします..."
+                    Report-UpdateProgress -Percent 86 -Stage "rebuilding_frontend" -Message "UI アセットを再ビルドしています..." -Detail "npm run build を実行中"
                     $pBuild = Start-Process -FilePath $sysNpm.Source -ArgumentList @("run", "build") -WorkingDirectory $feDir -WindowStyle Hidden -Wait -PassThru
                     Write-UpdateLog "frontend 再ビルド終了 (exit=$($pBuild.ExitCode))。"
                 }
@@ -533,7 +626,7 @@ function Start-RelaunchedApplication {
             $argList += "-UseCpuInference"
         }
         Write-UpdateLog "アプリを再起動します: powershell.exe $($argList -join ' ')"
-        Start-Process -FilePath "powershell.exe" -ArgumentList $argList -WorkingDirectory $TargetRoot | Out-Null
+        Start-Process -FilePath "powershell.exe" -ArgumentList $argList -WorkingDirectory $TargetRoot -WindowStyle Hidden | Out-Null
     } elseif (Test-Path -LiteralPath $startBat -PathType Leaf) {
         Write-UpdateLog "アプリを再起動します: $startBat"
         Start-Process -FilePath "cmd.exe" -ArgumentList @("/c", "`"$startBat`"") -WorkingDirectory $TargetRoot -WindowStyle Hidden | Out-Null
@@ -544,12 +637,25 @@ function Start-RelaunchedApplication {
 
 try {
     Write-UpdateLog "=== PaperBridge Local 自己アップデート開始 ==="
-    Write-UpdateLog "ProjectRoot=$ProjectRoot | UserDataDir=$UserDataDir | BackendPort=$BackendPort | LlamaPort=$LlamaPort | DryRun=$DryRun"
+    Write-UpdateLog "ProjectRoot=$ProjectRoot | UserDataDir=$UserDataDir | BackendPort=$BackendPort | LlamaPort=$LlamaPort | DryRun=$DryRun | NoUi=$NoUi"
+
+    if ($script:ShowUpdateUi -and (Get-Command Start-PaperBridgeProgressWindow -ErrorAction SilentlyContinue)) {
+        $script:ProgressHandle = Start-PaperBridgeProgressWindow `
+            -Title "PaperBridge Local - ソフトウェア更新" `
+            -HeaderText "ソフトウェアを更新しています" `
+            -InitialMessage "アップデートの準備をしています..." `
+            -InitialDetail "対象ディレクトリ: $ProjectRoot" `
+            -InitialPercent 4 `
+            -LogPath $UpdaterLogPath
+    }
+    Report-UpdateProgress -Percent 4 -Stage "initializing" -Message "アップデートの準備をしています..." -Detail "対象ディレクトリ: $ProjectRoot"
 
     # 1. Wait for backend process exit & port release (8080 and 8000)
     if (-not $DryRun) {
+        Report-UpdateProgress -Percent 6 -Stage "waiting_backend" -Message "アプリの終了を待機しています..." -Detail "実行中サーバーの安全な停止を確認中"
         Wait-ProcessExitSafe -TargetPid $BackendPid -GraceSeconds 10
         Wait-PortsReleased -Ports @($BackendPort, $LlamaPort) -TimeoutSeconds $PortWaitTimeoutSec
+        Report-UpdateProgress -Percent 16 -Stage "waiting_launcher" -Message "起動制御ロックの解放を確認しています..." -Detail "ランチャーの完全終了を確認中"
         Wait-LauncherMutexReleased -DataDir $UserDataDir -TimeoutSeconds 12
     }
 
@@ -570,19 +676,30 @@ try {
 
     # 3. Rebuild frontend dist if provisioned
     Invoke-PostUpdateRebuildIfApplicable -TargetRoot $ProjectRoot
+    Report-UpdateProgress -Percent 92 -Stage "rebuild_done" -Message "更新プログラムの準備が完了しました。"
 
     # 4. Clear update-in-progress marker before relaunch
+    Report-UpdateProgress -Percent 94 -Stage "clearing_marker" -Message "一時ロックファイルを整理しています..."
     if (Test-Path -LiteralPath $UpdateSignalPath) {
         Remove-Item -LiteralPath $UpdateSignalPath -Force -ErrorAction SilentlyContinue
     }
 
     # 5. Relaunch application and open browser
+    if (-not $NoRestart -and -not $DryRun) {
+        Report-UpdateProgress -Percent 96 -Stage "relaunching" -Message "PaperBridge Local を再起動しています..." -Detail "新しいバージョンの起動ウィンドウが開きます"
+    }
     Start-RelaunchedApplication `
         -TargetRoot $ProjectRoot `
         -DataDir $UserDataDir `
         -BPort $BackendPort `
         -LPort $LlamaPort `
         -CpuMode ([bool]$UseCpuInference)
+
+    $doneDetail = if ($NoRestart -or $DryRun) { "更新ファイルの適用が正常に完了しました。" } else { "新しいバージョンのアプリを起動しています..." }
+    Report-UpdateProgress -Percent 100 -Stage "completed" -Status "completed" -Message "アップデートが完了しました。" -Detail $doneDetail
+    if ($script:ShowUpdateUi -and (-not $NoRestart)) {
+        Start-Sleep -Milliseconds 700
+    }
 
     Write-UpdateLog "=== PaperBridge Local 自己アップデート正常完了 (SHA=$appliedSha) ==="
     Write-Output "UPDATE_APPLY_SUCCESS"
@@ -593,6 +710,14 @@ try {
     if (Test-Path -LiteralPath $UpdateSignalPath) {
         Remove-Item -LiteralPath $UpdateSignalPath -Force -ErrorAction SilentlyContinue
     }
+    Report-UpdateProgress -Percent $script:LastUpdatePercent -Stage "failed" -Status "failed" -Message "アップデートに失敗しました。" -Detail "ログ: $UpdaterLogPath" -ErrorMessage $errMsg
+    if ($script:ShowUpdateUi -and $script:ProgressHandle -and $script:ProgressHandle.IsActive -and (Get-Command Show-PaperBridgeProgressErrorAndWait -ErrorAction SilentlyContinue)) {
+        Show-PaperBridgeProgressErrorAndWait -Handle $script:ProgressHandle -ErrorTitle "アップデートに失敗しました" -ErrorMessage $errMsg -LogPath $UpdaterLogPath
+    }
     Write-Error $errMsg
     exit 1
+} finally {
+    if (Get-Command Close-PaperBridgeProgressWindow -ErrorAction SilentlyContinue) {
+        Close-PaperBridgeProgressWindow -Handle $script:ProgressHandle
+    }
 }

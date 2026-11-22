@@ -5,6 +5,41 @@
 $script:PB_SPLIT_FILENAME_REGEX = '-\d{4,5}-of-\d{4,5}\.gguf$'
 $script:PB_UNIX_EPOCH_TICKS = 621355968000000000L
 
+if (-not ("PaperBridgeGgufFastSkip" -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.IO;
+
+public static class PaperBridgeGgufFastSkip {
+    public static void SkipStringArray(BinaryReader reader, long count) {
+        Stream s = reader.BaseStream;
+        long streamLen = s.CanSeek ? s.Length : -1L;
+        for (long i = 0; i < count; i++) {
+            ulong lenU64 = reader.ReadUInt64();
+            if (lenU64 > 1048576UL) {
+                throw new InvalidDataException("Invalid GGUF string length: " + lenU64);
+            }
+            long len = (long)lenU64;
+            if (len == 0) {
+                continue;
+            }
+            if (streamLen >= 0) {
+                if (s.Position + len > streamLen) {
+                    throw new EndOfStreamException("Unexpected EOF while skipping GGUF string");
+                }
+                s.Seek(len, SeekOrigin.Current);
+            } else {
+                byte[] skipped = reader.ReadBytes((int)len);
+                if (skipped.Length != (int)len) {
+                    throw new EndOfStreamException("Unexpected EOF while skipping GGUF string");
+                }
+            }
+        }
+    }
+}
+"@
+}
+
 function ConvertTo-SafeSlug {
     param([string]$Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return "model" }
@@ -202,6 +237,12 @@ function Read-OrSkipGgufValue {
             if ((-not $Store -or $arrLen -gt 16) -and $scalarSize -gt 0) {
                 $skipBytes = [int64]($scalarSize * $arrLen)
                 $Reader.BaseStream.Seek($skipBytes, [System.IO.SeekOrigin]::Current) | Out-Null
+                return $null
+            }
+            if ((-not $Store -or $arrLen -gt 16) -and $elemType -eq 8) {
+                if ($arrLen -gt 0) {
+                    [PaperBridgeGgufFastSkip]::SkipStringArray($Reader, $arrLen)
+                }
                 return $null
             }
             if (-not $Store -or $arrLen -gt 16) {
