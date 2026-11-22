@@ -338,6 +338,12 @@ export interface Job {
   processed_pages: number;
   total_blocks: number;
   processed_blocks: number;
+  progress_percent?: number;
+  stage_code?: string;
+  stage_detail?: string | null;
+  substage_current?: number;
+  substage_total?: number;
+  current_page?: number;
   retry_count: number;
   warning_count: number;
   error_message: string | null;
@@ -355,7 +361,9 @@ export interface Job {
   execution_provenance: ExecutionProvenance;
   created_at: string;
   updated_at: string;
+  started_at?: string | null;
   completed_at: string | null;
+  estimated_remaining_seconds?: number | null;
 }
 
 export interface RetypesetJobResponse {

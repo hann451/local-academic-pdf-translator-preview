@@ -675,6 +675,12 @@ class Job(BaseModel):
     processed_pages: int = 0
     total_blocks: int = 0
     processed_blocks: int = 0
+    progress_percent: float = 0.0
+    stage_code: str = "created"
+    stage_detail: str | None = None
+    substage_current: int = 0
+    substage_total: int = 0
+    current_page: int = 0
     retry_count: int = 0
     warning_count: int = 0
     error_message: str | None = None
@@ -692,7 +698,9 @@ class Job(BaseModel):
     execution_provenance: dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=utc_now_iso)
     updated_at: str = Field(default_factory=utc_now_iso)
+    started_at: str | None = None
     completed_at: str | None = None
+    estimated_remaining_seconds: float | None = None
 
     def can_transition_to(self, next_state: JobState) -> bool:
         return next_state in VALID_JOB_TRANSITIONS.get(self.state, set())
@@ -703,11 +711,18 @@ class Job(BaseModel):
                 f"Invalid job state transition: {self.state.value} -> {next_state.value}"
             )
         self.state = next_state
+        self.stage_code = next_state.value
         if stage_description:
             self.current_stage = stage_description
         self.updated_at = utc_now_iso()
         if next_state in (JobState.COMPLETED, JobState.COMPLETED_WITH_WARNINGS):
             self.completed_at = self.updated_at
+            self.progress_percent = 100.0
+            self.estimated_remaining_seconds = 0.0
+            if self.total_pages > 0:
+                self.processed_pages = max(self.processed_pages, self.total_pages)
+        elif next_state in (JobState.FAILED, JobState.CANCELED, JobState.INTERRUPTED):
+            self.estimated_remaining_seconds = None
 
 
 class SystemDiagnostics(BaseModel):

@@ -77,6 +77,83 @@ function getStageStatus(
   return "pending";
 }
 
+function formatDurationJa(seconds: number | null | undefined): string {
+  if (seconds === null || seconds === undefined || !Number.isFinite(seconds) || seconds < 0) {
+    return "-";
+  }
+  const rounded = Math.max(0, Math.round(seconds));
+  const h = Math.floor(rounded / 3600);
+  const m = Math.floor((rounded % 3600) / 60);
+  const s = rounded % 60;
+  if (h > 0) {
+    return `${h}時間 ${String(m).padStart(2, "0")}分`;
+  }
+  if (m > 0) {
+    return `${m}分 ${String(s).padStart(2, "0")}秒`;
+  }
+  return `${s}秒`;
+}
+
+function computeDisplayPercent(job: Job): number {
+  if (job.state === "completed" || job.state === "completed_with_warnings") {
+    return 100;
+  }
+  if (
+    typeof job.progress_percent === "number" &&
+    Number.isFinite(job.progress_percent) &&
+    job.progress_percent > 0
+  ) {
+    return Math.max(0, Math.min(100, Math.round(job.progress_percent)));
+  }
+  if (job.total_blocks > 0 && job.processed_blocks > 0 && job.state === "translating") {
+    return Math.min(75, Math.max(8, Math.round(8 + (67 * job.processed_blocks) / job.total_blocks)));
+  }
+  switch (job.state) {
+    case "preflight":
+      return 2;
+    case "parsing":
+      return 5;
+    case "awaiting_review":
+      return 8;
+    case "translating":
+      return 8;
+    case "validating":
+      return 76;
+    case "typesetting":
+      return 82;
+    default:
+      return 0;
+  }
+}
+
+function getMilestoneStepStatus(
+  stepIdx: number,
+  jobState: JobState
+): "done" | "active" | "pending" {
+  if (jobState === "completed" || jobState === "completed_with_warnings") {
+    return "done";
+  }
+  const map: Record<JobState, number> = {
+    created: 0,
+    preflight: 0,
+    parsing: 0,
+    awaiting_review: 0,
+    translating: 1,
+    validating: 1,
+    typesetting: 2,
+    completed: 3,
+    completed_with_warnings: 3,
+    failed: -1,
+    canceled: -1,
+    interrupted: -1,
+  };
+  const activeIdx = map[jobState] ?? 0;
+  if (activeIdx < 0) return "pending";
+  if (stepIdx < activeIdx) return "done";
+  if (stepIdx === activeIdx) return "active";
+  return "pending";
+}
+
 function isInferenceConnectionError(job: Job): boolean {
   const combined = `${job.error_message ?? ""} ${job.current_stage ?? ""}`;
   return (
@@ -155,6 +232,22 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
   const [isSavingBlock, setIsSavingBlock] = useState<boolean>(false);
   const [strictRetypesetGate, setStrictRetypesetGate] = useState<boolean>(false);
   const [downloadFeedback, setDownloadFeedback] = useState<string | null>(null);
+  const isJobRunning = [
+    "created",
+    "preflight",
+    "parsing",
+    "translating",
+    "validating",
+    "typesetting",
+  ].includes(job.state);
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
+
+  useEffect(() => {
+    if (!isJobRunning) return;
+    setNowMs(Date.now());
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [isJobRunning]);
 
   const totalPages = Math.max(1, document.page_count);
   const safeDisplayPage = Math.max(1, Math.min(totalPages, displayPage));
@@ -272,9 +365,6 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
     }
   };
 
-  const isJobRunning = ["created", "preflight", "parsing", "translating", "validating", "typesetting"].includes(
-    job.state
-  );
   const isCancelRequestedWaiting = job.cancel_requested && job.state !== "canceled";
   const isCancelCompleted = job.state === "canceled";
   const canResume =
@@ -282,6 +372,28 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
     job.state === "canceled" ||
     job.state === "awaiting_review" ||
     job.state === "failed";
+
+  const displayPercent = computeDisplayPercent(job);
+  const startIso = job.started_at || job.created_at;
+  const startMs = Date.parse(startIso);
+  const endMs =
+    job.completed_at && !isJobRunning ? Date.parse(job.completed_at) : nowMs;
+  const elapsedSeconds =
+    Number.isFinite(startMs) && Number.isFinite(endMs)
+      ? Math.max(0, (endMs - startMs) / 1000)
+      : null;
+  const etaText =
+    job.state === "completed" || job.state === "completed_with_warnings"
+      ? "完了"
+      : isJobRunning
+      ? job.estimated_remaining_seconds !== null &&
+        job.estimated_remaining_seconds !== undefined &&
+        Number.isFinite(job.estimated_remaining_seconds)
+        ? `残り約 ${formatDurationJa(job.estimated_remaining_seconds)}`
+        : "計算中..."
+      : job.state === "canceled"
+      ? "停止済み"
+      : "中断中";
 
   const pageMeta = document.pages.find((p) => p.page_index === currentPageIndex0) || {
     width_pt: 595,
@@ -329,21 +441,12 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
         </div>
       )}
 
-      {/* Top Panel: 13-Stage Pipeline Progress & Job Control */}
-      <section className="card" style={{ marginBottom: "16px" }}>
-        <div
-          style={{
-            display: "flex",
-            flexWrap: "wrap",
-            justifyContent: "space-between",
-            alignItems: "center",
-            gap: "12px",
-            marginBottom: "12px",
-          }}
-        >
+      {/* Top Panel: Hero Progress Card, 4-Step Stepper & Job Control */}
+      <section className="hero-progress-card">
+        <div className="hero-progress-header">
           <div>
-            <h2 className="card-title" style={{ marginBottom: "4px" }}>
-              ジョブ進行状況・13ステージパイプライン ({job.id})
+            <h2 className="card-title" style={{ marginBottom: "6px" }}>
+              翻訳の進行状況 <span style={{ fontSize: "13px", fontWeight: 500, color: "#64748b" }}>({job.id})</span>
             </h2>
             <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center" }}>
               <span
@@ -383,7 +486,6 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
                 </span>
               )}
 
-              {/* Explicit Distinction: Cancel Requested vs Cancel Completed */}
               {isCancelRequestedWaiting && (
                 <span
                   data-testid="cancel-requested-badge"
@@ -400,70 +502,13 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
                   ⏹ 停止完了（キャンセル済み）
                 </span>
               )}
-
-              <span className="badge badge-neutral" data-testid="job-progress-counts">
-                ページ: {job.processed_pages}/{job.total_pages} | ブロック:{" "}
-                {job.processed_blocks}/{job.total_blocks} | 再試行: {job.retry_count}回 | 警告:{" "}
-                {job.warning_count}件 | 再組版rev: {job.retypeset_revision}
-              </span>
             </div>
-            {job.execution_provenance && job.execution_provenance.total_blocks !== undefined && (
-              <div
-                data-testid="job-execution-provenance"
-                style={{ marginTop: "6px", fontSize: "12px", color: "#334155" }}
-              >
-                <div>
-                  実行経路: {job.execution_provenance.adapter_name ?? "不明"}（
-                  {job.execution_provenance.engine_process ?? "-"}） / モデル:{" "}
-                  {job.execution_provenance.model_display_name
-                    ? `${job.execution_provenance.model_display_name} (${
-                        job.execution_provenance.model_file ??
-                        job.execution_provenance.model_name ??
-                        "不明"
-                      })`
-                    : job.execution_provenance.model_file ??
-                      job.execution_provenance.model_name ??
-                      "不明"}
-                  {job.execution_provenance.model_sha256
-                    ? ` [SHA:${job.execution_provenance.model_sha256.slice(0, 12)}]`
-                    : ""}{" "}
-                  / 計算: {job.execution_provenance.compute_backend ?? "不明"}
-                  {job.execution_provenance.is_mock ? "（疑似翻訳）" : ""}
-                </div>
-                <div>
-                  新規LLM推論 {job.execution_provenance.newly_inferenced_blocks ?? 0} / キャッシュ利用{" "}
-                  {job.execution_provenance.cache_hit_blocks ?? 0} / 再利用{" "}
-                  {job.execution_provenance.reused_existing_blocks ?? 0} / 手動修正{" "}
-                  {job.execution_provenance.manual_translation_blocks ?? 0} / 非翻訳保護{" "}
-                  {job.execution_provenance.protected_skip_blocks ?? 0} / 原文維持{" "}
-                  {job.execution_provenance.fallback_original_blocks ?? 0}（LLM呼出し{" "}
-                  {job.execution_provenance.llm_api_calls_made ?? 0}回）
-                </div>
-              </div>
-            )}
-            {(() => {
-              const untranslatedCount = blocks.filter(
-                (b) =>
-                  b.status === "pending" ||
-                  (b.needs_retranslation &&
-                    b.status !== "protected_skip" &&
-                    b.manual_translation_text == null)
-              ).length;
-              if (untranslatedCount === 0) return null;
-              return (
-                <div
-                  data-testid="unprotected-pending-notice"
-                  className="badge badge-warning"
-                  style={{ marginTop: "6px" }}
-                >
-                  未翻訳・再翻訳待ちのブロックがあります（
-                  {untranslatedCount}件）。ブロックを選択して「再翻訳」を実行し、再組版してください。
-                </div>
-              );
-            })()}
           </div>
 
-          <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap" }}>
+            <div className="hero-percent" data-testid="job-progress-percent">
+              {displayPercent}%
+            </div>
             {isJobRunning && (
               <button
                 type="button"
@@ -472,7 +517,7 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
                 disabled={isCanceling || job.cancel_requested}
                 onClick={() => void onCancelJob()}
               >
-                {job.cancel_requested ? "停止要求送信済み..." : "⏹ ジョブを安全停止 (Cancel)"}
+                {job.cancel_requested ? "停止要求送信済み..." : "⏹ 安全停止"}
               </button>
             )}
 
@@ -490,6 +535,84 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
           </div>
         </div>
 
+        {/* Visual Progress Bar & Live ETA */}
+        <div
+          className="progress-bar-track"
+          role="progressbar"
+          data-testid="job-progress-bar"
+          aria-valuenow={displayPercent}
+          aria-valuemin={0}
+          aria-valuemax={100}
+        >
+          <div
+            className="progress-bar-fill"
+            style={{ width: `${displayPercent}%` }}
+          />
+        </div>
+
+        <div className="hero-eta-row">
+          <div data-testid="job-stage-detail" style={{ fontWeight: 600, color: "#0f172a" }}>
+            {job.stage_detail || job.current_stage}
+          </div>
+          <div style={{ display: "flex", gap: "16px", flexWrap: "wrap" }}>
+            <span data-testid="job-elapsed-time">
+              経過時間: <strong>{formatDurationJa(elapsedSeconds)}</strong>
+            </span>
+            <span data-testid="job-eta">
+              予測残り時間: <strong>{etaText}</strong>
+            </span>
+          </div>
+        </div>
+
+        {/* 4-Step High-Level Milestone Stepper */}
+        <div className="milestone-stepper">
+          {[
+            "1. 準備・解析",
+            "2. 翻訳",
+            "3. 組版・検証",
+            "4. 完了",
+          ].map((label, stepIdx) => {
+            const st = getMilestoneStepStatus(stepIdx, job.state);
+            const icon = st === "done" ? "✓" : st === "active" ? "●" : "○";
+            return (
+              <div key={label} className={`milestone-step ${st}`}>
+                <span>{icon}</span>
+                <span>{label}</span>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="stat-strip">
+          <span className="stat-chip" data-testid="job-progress-counts">
+            ページ: {job.processed_pages}/{job.total_pages} | ブロック:{" "}
+            {job.processed_blocks}/{job.total_blocks} | 再試行: {job.retry_count}回 | 警告:{" "}
+            {job.warning_count}件 | 再組版rev: {job.retypeset_revision}
+          </span>
+        </div>
+
+        {(() => {
+          if (isJobRunning) return null;
+          const untranslatedCount = blocks.filter(
+            (b) =>
+              b.status === "pending" ||
+              (b.needs_retranslation &&
+                b.status !== "protected_skip" &&
+                b.manual_translation_text == null)
+          ).length;
+          if (untranslatedCount === 0) return null;
+          return (
+            <div
+              data-testid="unprotected-pending-notice"
+              className="badge badge-warning"
+              style={{ marginTop: "10px" }}
+            >
+              未翻訳・再翻訳待ちのブロックがあります（
+              {untranslatedCount}件）。ブロックを選択して「再翻訳」を実行し、再組版してください。
+            </div>
+          );
+        })()}
+
         {(job.error_message || job.state === "interrupted" || job.state === "failed") && (() => {
           const isConnectionError = isInferenceConnectionError(job);
           const safeErrorSummary = sanitizeJobErrorMessage(job.error_message, job.current_stage);
@@ -498,7 +621,7 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
               role="alert"
               data-testid="job-error-banner"
               className={`alert ${job.state === "interrupted" ? "alert-warning" : "alert-error"}`}
-              style={{ marginBottom: "12px", fontSize: "13px" }}
+              style={{ marginTop: "12px", fontSize: "13px" }}
             >
               <div>
                 <strong>
@@ -535,45 +658,83 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
           );
         })()}
 
-        {/* 13 Stages Grid */}
-        <div
-          data-testid="pipeline-13-stages"
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fill, minmax(175px, 1fr))",
-            gap: "6px",
-          }}
-        >
-          {PIPELINE_STAGES_13.map((st) => {
-            const status = getStageStatus(st.phaseKey, job.state);
-            return (
-              <div
-                key={st.stageNumber}
-                data-testid={`stage-item-${st.stageNumber}`}
-                data-stage-status={status}
-                style={{
-                  padding: "6px 8px",
-                  borderRadius: "6px",
-                  fontSize: "11px",
-                  border:
-                    status === "active"
-                      ? "2px solid #2563eb"
-                      : status === "done"
-                      ? "1px solid #16a34a"
-                      : "1px solid #cbd5e1",
-                  backgroundColor:
-                    status === "active"
-                      ? "#eff6ff"
-                      : status === "done"
-                      ? "#f0fdf4"
-                      : "#f8fafc",
-                }}
-              >
-                <strong>Stage {st.stageNumber}:</strong> {st.title}
+        {/* Collapsible Technical Pipeline Details Drawer */}
+        <details className="details-drawer">
+          <summary>詳細な処理ステップ（13ステージ・実行詳細）を表示</summary>
+          {job.execution_provenance && job.execution_provenance.total_blocks !== undefined && (
+            <div
+              data-testid="job-execution-provenance"
+              style={{ marginBottom: "10px", fontSize: "12px", color: "#334155" }}
+            >
+              <div>
+                実行経路: {job.execution_provenance.adapter_name ?? "不明"}（
+                {job.execution_provenance.engine_process ?? "-"}） / モデル:{" "}
+                {job.execution_provenance.model_display_name
+                  ? `${job.execution_provenance.model_display_name} (${
+                      job.execution_provenance.model_file ??
+                      job.execution_provenance.model_name ??
+                      "不明"
+                    })`
+                  : job.execution_provenance.model_file ??
+                    job.execution_provenance.model_name ??
+                    "不明"}
+                {job.execution_provenance.model_sha256
+                  ? ` [SHA:${job.execution_provenance.model_sha256.slice(0, 12)}]`
+                  : ""}{" "}
+                / 計算: {job.execution_provenance.compute_backend ?? "不明"}
+                {job.execution_provenance.is_mock ? "（疑似翻訳）" : ""}
               </div>
-            );
-          })}
-        </div>
+              <div>
+                新規LLM推論 {job.execution_provenance.newly_inferenced_blocks ?? 0} / キャッシュ利用{" "}
+                {job.execution_provenance.cache_hit_blocks ?? 0} / 再利用{" "}
+                {job.execution_provenance.reused_existing_blocks ?? 0} / 手動修正{" "}
+                {job.execution_provenance.manual_translation_blocks ?? 0} / 非翻訳保護{" "}
+                {job.execution_provenance.protected_skip_blocks ?? 0} / 原文維持{" "}
+                {job.execution_provenance.fallback_original_blocks ?? 0}（LLM呼出し{" "}
+                {job.execution_provenance.llm_api_calls_made ?? 0}回）
+              </div>
+            </div>
+          )}
+
+          <div
+            data-testid="pipeline-13-stages"
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fill, minmax(175px, 1fr))",
+              gap: "6px",
+            }}
+          >
+            {PIPELINE_STAGES_13.map((st) => {
+              const status = getStageStatus(st.phaseKey, job.state);
+              return (
+                <div
+                  key={st.stageNumber}
+                  data-testid={`stage-item-${st.stageNumber}`}
+                  data-stage-status={status}
+                  style={{
+                    padding: "6px 8px",
+                    borderRadius: "6px",
+                    fontSize: "11px",
+                    border:
+                      status === "active"
+                        ? "2px solid #2563eb"
+                        : status === "done"
+                        ? "1px solid #16a34a"
+                        : "1px solid #cbd5e1",
+                    backgroundColor:
+                      status === "active"
+                        ? "#eff6ff"
+                        : status === "done"
+                        ? "#f0fdf4"
+                        : "#ffffff",
+                  }}
+                >
+                  <strong>Stage {st.stageNumber}:</strong> {st.title}
+                </div>
+              );
+            })}
+          </div>
+        </details>
       </section>
 
       {/* Artifacts & Zero-LLM Retypeset Bar */}
@@ -588,11 +749,11 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
           }}
         >
           <div>
-            <h3 className="card-title" style={{ fontSize: "16px", marginBottom: "4px" }}>
-              成果物ダウンロード ＆ LLM呼び出しなしPDF再組版 (Zero-LLM Retypeset)
+            <h3 className="card-title" style={{ fontSize: "16px", marginBottom: "2px" }}>
+              成果物ダウンロード ＆ PDF再組版
             </h3>
             <div style={{ fontSize: "12px", color: "#475569" }}>
-              手動修正後、「LLM呼び出しなしでPDF再組版」を押すと、推論サーバへ一切通信せず（LLM呼び出し0回）Stage 10〜13のみを再実行してPDFを更新します。
+              手動修正後、LLM呼び出し0回でPDFのみを高速に更新します。
             </div>
           </div>
 
@@ -665,12 +826,7 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
         {/* Artifact Download Buttons */}
         <div
           data-testid="artifact-list"
-          style={{
-            display: "flex",
-            flexWrap: "wrap",
-            gap: "10px",
-            marginTop: "12px",
-          }}
+          className="artifact-card-grid"
         >
           {artifacts.length === 0 ? (
             <span style={{ fontSize: "13px", color: "#64748b" }}>

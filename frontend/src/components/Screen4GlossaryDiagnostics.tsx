@@ -980,8 +980,7 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
           </div>
 
           <p className="card-subtitle">
-            以下の診断項目はすべてバックエンド <code>GET /api/diagnostics</code>{" "}
-            の実行時レスポンスのみを根拠に表示しています（UI側のハードコード値は一切使用していません）。
+            実行環境・GPU・推論サーバ（<code>llama-server</code>）の実接続状態を確認します。
           </p>
 
           {diagnosticsError && (
@@ -998,269 +997,278 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
           {!diagnostics ? (
             <div data-testid="diagnostics-loading">診断情報を取得中...</div>
           ) : (
-            <dl className="meta-grid" data-testid="diagnostics-dl">
-              <div>
-                <dt>OS / バージョン</dt>
-                <dd data-testid="diag-os">
-                  {diagnostics.os_name} ({diagnostics.os_version})
-                </dd>
-              </div>
-              <div>
-                <dt>CPU / コア・スレッド</dt>
-                <dd data-testid="diag-cpu">
-                  {diagnostics.cpu_name} ({diagnostics.cpu_cores}C / {diagnostics.cpu_threads}T)
-                </dd>
-              </div>
-              <div>
-                <dt>システム RAM</dt>
-                <dd data-testid="diag-ram">{diagnostics.ram_total_mb.toLocaleString()} MB</dd>
-              </div>
-              <div>
-                <dt>GPU / VRAM / ドライバ</dt>
-                <dd data-testid="diag-gpu">
-                  {diagnostics.gpu_name} ({diagnostics.gpu_vram_mb.toLocaleString()} MB / Driver:{" "}
-                  {diagnostics.gpu_driver_version})
-                </dd>
-              </div>
-              <div>
-                <dt>推論サーバ（llama.cpp）</dt>
-                <dd data-testid="diag-llama-runtime">
-                  モデル: {diagnostics.llama_model_path ?? "不明"} / ビルド:{" "}
-                  {diagnostics.llama_build_info ?? "不明"} / 計算:{" "}
-                  {diagnostics.llama_compute_backend ?? "不明"} / PID:{" "}
-                  {diagnostics.llama_server_pid ?? "不明"}
-                </dd>
-              </div>
-              <div>
-                <dt>Python / PDFエンジン</dt>
-                <dd data-testid="diag-pdf-engine">
-                  Python {diagnostics.python_version} / Primary: {diagnostics.pdf_engine_primary}
-                </dd>
-              </div>
-              <div>
-                <dt>OFL 日本語フォント</dt>
-                <dd data-testid="diag-font">
-                  {diagnostics.japanese_font_available
-                    ? `利用可能 (${diagnostics.japanese_font_path || ""})`
-                    : "未検出"}
-                </dd>
-              </div>
-              <div>
-                <dt>ローカル限定強制 (127.0.0.1)</dt>
-                <dd data-testid="diag-loopback">
-                  {diagnostics.loopback_only_enforced
-                    ? "有効 (loopback_only_enforced = true)"
-                    : "無効"}
-                </dd>
-              </div>
-              <div>
-                <dt>推論サーバ URL</dt>
-                <dd data-testid="diag-llama-url">
-                  <code>{diagnostics.llama_server_url}</code>
-                </dd>
-              </div>
-              <div>
-                <dt>UI選択中の翻訳モデル / 過去の検証実績（履歴）</dt>
-                <dd data-testid="diag-active-model">
-                  {diagnostics.active_model_display_name || "未登録 / 既定"} (
-                  {diagnostics.active_model_status || "unregistered"})
-                  {modelsOverview?.active_model &&
-                    (() => {
-                      const verInfo = verificationStatusLabel(modelsOverview.active_model);
+            <>
+              <dl className="meta-grid" data-testid="diagnostics-dl">
+                <div>
+                  <dt>GPU / VRAM / ドライバ</dt>
+                  <dd data-testid="diag-gpu">
+                    {diagnostics.gpu_name} ({diagnostics.gpu_vram_mb.toLocaleString()} MB / Driver:{" "}
+                    {diagnostics.gpu_driver_version})
+                  </dd>
+                </div>
+                <div>
+                  <dt>UI選択中の翻訳モデル / 過去の検証実績（履歴）</dt>
+                  <dd data-testid="diag-active-model">
+                    {diagnostics.active_model_display_name || "未登録 / 既定"} (
+                    {diagnostics.active_model_status || "unregistered"})
+                    {modelsOverview?.active_model &&
+                      (() => {
+                        const verInfo = verificationStatusLabel(modelsOverview.active_model);
+                        return (
+                          <>
+                            {" "}
+                            <span
+                              data-testid="diag-active-model-verification-badge"
+                              data-verification-stage={verInfo.stage}
+                              title="この登録モデルについての過去の検証実績"
+                              className={`badge ${verInfo.badgeClass}`}
+                              style={{ marginLeft: "6px" }}
+                            >
+                              {verInfo.label}
+                            </span>
+                            <div
+                              data-testid="diag-verification-history-note"
+                              style={{ fontSize: "11px", color: "#475569", marginTop: "3px" }}
+                            >
+                              {verInfo.detailText}
+                            </div>
+                          </>
+                        );
+                      })()}
+                    {diagnostics.active_model_file_path && (
+                      <>
+                        <code style={{ fontSize: "11px", wordBreak: "break-all" }}>
+                          {diagnostics.active_model_file_path}
+                        </code>
+                      </>
+                    )}
+                  </dd>
+                </div>
+                <div>
+                  <dt>現在のサーバー接続・モデル一致状態</dt>
+                  <dd data-testid="diag-model-server-match">
+                    {(() => {
+                      const fallbackCode = diagnostics.model_server_match_status || "not_probed";
+                      const syntheticMatch =
+                        modelsOverview?.server_match ??
+                        (fallbackCode === "not_probed"
+                          ? null
+                          : {
+                              match_status: fallbackCode as NonNullable<
+                                ModelsOverviewResponse["server_match"]
+                              >["match_status"],
+                              is_matched:
+                                fallbackCode === "matched" ||
+                                fallbackCode === "matched_same_model_different_path",
+                              message_ja: diagnostics.model_server_match_message || "",
+                            });
+                      const info = describeServerMatchStatus(syntheticMatch, fallbackCode);
+                      const displayMessage =
+                        diagnostics.model_server_match_message ||
+                        (fallbackCode === "not_probed" ? info.detailJa : "");
                       return (
                         <>
-                          {" "}
-                          <span
-                            data-testid="diag-active-model-verification-badge"
-                            data-verification-stage={verInfo.stage}
-                            title="この登録モデルについての過去の検証実績"
-                            className={`badge ${verInfo.badgeClass}`}
-                            style={{ marginLeft: "6px" }}
-                          >
-                            {verInfo.label}
-                          </span>
-                          <div
-                            data-testid="diag-verification-history-note"
-                            style={{ fontSize: "11px", color: "#475569", marginTop: "3px" }}
-                          >
-                            {verInfo.detailText}
-                          </div>
+                          <span className={`badge ${info.badgeClass}`}>{info.labelJa}</span>{" "}
+                          {displayMessage && (
+                            <span style={{ fontSize: "12px" }}>{displayMessage}</span>
+                          )}
                         </>
                       );
                     })()}
-                  {diagnostics.active_model_file_path && (
-                    <>
-                      <code style={{ fontSize: "11px", wordBreak: "break-all" }}>
-                        {diagnostics.active_model_file_path}
-                      </code>
-                    </>
-                  )}
-                </dd>
-              </div>
-              <div>
-                <dt>現在のサーバー接続・モデル一致状態</dt>
-                <dd data-testid="diag-model-server-match">
-                  {(() => {
-                    const fallbackCode = diagnostics.model_server_match_status || "not_probed";
-                    const syntheticMatch =
-                      modelsOverview?.server_match ??
-                      (fallbackCode === "not_probed"
-                        ? null
-                        : {
-                            match_status: fallbackCode as NonNullable<
-                              ModelsOverviewResponse["server_match"]
-                            >["match_status"],
-                            is_matched:
-                              fallbackCode === "matched" ||
-                              fallbackCode === "matched_same_model_different_path",
-                            message_ja: diagnostics.model_server_match_message || "",
-                          });
-                    const info = describeServerMatchStatus(syntheticMatch, fallbackCode);
-                    const displayMessage =
-                      diagnostics.model_server_match_message ||
-                      (fallbackCode === "not_probed" ? info.detailJa : "");
-                    return (
-                      <>
-                        <span className={`badge ${info.badgeClass}`}>{info.labelJa}</span>{" "}
-                        {displayMessage && (
-                          <span style={{ fontSize: "12px" }}>{displayMessage}</span>
-                        )}
-                      </>
-                    );
-                  })()}
-                </dd>
-              </div>
-              <div style={{ gridColumn: "1 / -1" }}>
-                <dt>現在の推論エンドポイント接続状態・ロード済みモデル</dt>
-                <dd style={{ marginTop: "4px" }}>
-                  {renderConnectionBadge(diagnostics)}
-                  {diagnostics.model_server_mismatch && (
-                    <div
-                      role="alert"
-                      data-testid="diag-model-server-mismatch-alert"
-                      className="alert alert-error"
-                      style={{ marginTop: "8px", fontSize: "12px" }}
-                    >
-                      <div>
-                        <strong>選択モデルと応答中 llama-server が一致していません:</strong>{" "}
-                        {diagnostics.model_server_match_message ||
-                          "選択したモデルの再起動または実機切替が必要です。"}
-                      </div>
-                      {diagnostics.model_server_match_status === "mismatch" &&
-                        onRestartLlamaServer && (
-                          <div style={{ marginTop: "8px" }}>
-                            <button
-                              type="button"
-                              className="btn btn-primary btn-sm"
-                              data-testid="diag-restart-llama-server-btn"
-                              disabled={
-                                isSwitchingServer ||
-                                Boolean(modelsOverview?.has_active_translation_job)
-                              }
-                              onClick={async () => {
-                                setDiagSwitchError(null);
-                                try {
-                                  await onRestartLlamaServer(
-                                    modelsOverview?.active_model_id ??
-                                      diagnostics.active_registration_id ??
-                                      null
-                                  );
-                                } catch (err) {
-                                  setDiagSwitchError(
-                                    err instanceof Error ? err.message : String(err)
-                                  );
+                  </dd>
+                </div>
+                <div style={{ gridColumn: "1 / -1" }}>
+                  <dt>現在の推論エンドポイント接続状態・ロード済みモデル</dt>
+                  <dd style={{ marginTop: "4px" }}>
+                    {renderConnectionBadge(diagnostics)}
+                    {diagnostics.model_server_mismatch && (
+                      <div
+                        role="alert"
+                        data-testid="diag-model-server-mismatch-alert"
+                        className="alert alert-error"
+                        style={{ marginTop: "8px", fontSize: "12px" }}
+                      >
+                        <div>
+                          <strong>選択モデルと応答中 llama-server が一致していません:</strong>{" "}
+                          {diagnostics.model_server_match_message ||
+                            "選択したモデルの再起動または実機切替が必要です。"}
+                        </div>
+                        {diagnostics.model_server_match_status === "mismatch" &&
+                          onRestartLlamaServer && (
+                            <div style={{ marginTop: "8px" }}>
+                              <button
+                                type="button"
+                                className="btn btn-primary btn-sm"
+                                data-testid="diag-restart-llama-server-btn"
+                                disabled={
+                                  isSwitchingServer ||
+                                  Boolean(modelsOverview?.has_active_translation_job)
                                 }
-                              }}
-                            >
-                              {isSwitchingServer
-                                ? "推論サーバーを再起動・モデルをロード中..."
-                                : "このモデルで推論サーバーを再起動して切り替える"}
-                            </button>
-                            {diagSwitchError && (
-                              <div
-                                role="alert"
-                                data-testid="diag-restart-llama-server-error"
-                                style={{ marginTop: "6px", color: "#b91c1c" }}
+                                onClick={async () => {
+                                  setDiagSwitchError(null);
+                                  try {
+                                    await onRestartLlamaServer(
+                                      modelsOverview?.active_model_id ??
+                                        diagnostics.active_registration_id ??
+                                        null
+                                    );
+                                  } catch (err) {
+                                    setDiagSwitchError(
+                                      err instanceof Error ? err.message : String(err)
+                                    );
+                                  }
+                                }}
                               >
-                                {diagSwitchError}
-                              </div>
-                            )}
-                          </div>
-                        )}
-                    </div>
-                  )}
-                  {diagnostics.llama_connection_status !== "connected" && (
-                    <div
-                      data-testid="diag-llama-disconnected-guide"
-                      style={{
-                        marginTop: "6px",
-                        fontSize: "12px",
-                        color: "#334155",
-                        lineHeight: 1.5,
-                      }}
-                    >
-                      {diagnostics.llama_connection_status === "server_unreachable"
-                        ? "推論エンドポイントへ接続できません（サーバー未起動のほか、ポート・URL設定の差異や接続制限により接続できない可能性があります）。"
-                        : "現在の推論エンドポイント接続状態はまだ確認されていません。"}{" "}
-                      実機翻訳を行う場合は、選択中の翻訳モデルを指定した{" "}
-                      <code>llama-server</code>（接続先設定:{" "}
+                                {isSwitchingServer
+                                  ? "推論サーバーを再起動・モデルをロード中..."
+                                  : "このモデルで推論サーバーを再起動して切り替える"}
+                              </button>
+                              {diagSwitchError && (
+                                <div
+                                  role="alert"
+                                  data-testid="diag-restart-llama-server-error"
+                                  style={{ marginTop: "6px", color: "#b91c1c" }}
+                                >
+                                  {diagSwitchError}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                      </div>
+                    )}
+                    {diagnostics.llama_connection_status !== "connected" && (
+                      <div
+                        data-testid="diag-llama-disconnected-guide"
+                        style={{
+                          marginTop: "6px",
+                          fontSize: "12px",
+                          color: "#334155",
+                          lineHeight: 1.5,
+                        }}
+                      >
+                        {diagnostics.llama_connection_status === "server_unreachable"
+                          ? "推論エンドポイントへ接続できません（サーバー未起動のほか、ポート・URL設定の差異や接続制限により接続できない可能性があります）。"
+                          : "現在の推論エンドポイント接続状態はまだ確認されていません。"}{" "}
+                        実機翻訳を行う場合は、選択中の翻訳モデルを指定した{" "}
+                        <code>llama-server</code>（接続先設定:{" "}
+                        <code>{diagnostics.llama_server_url}</code>
+                        ）へ接続できる状態にしたうえで、上部の「🔌 推論サーバ疎通確認 (probe_llama=true)」を押してください（疎通確認は{" "}
+                        <code>GET /v1/models</code>{" "}
+                        の軽量確認のみを行い、翻訳リクエストは送信しません）。モデル未導入で画面遷移のみ試す場合は画面1で「モック推論」を選択できますが、モックは決定論的な疑似翻訳であり実翻訳ではありません。
+                      </div>
+                    )}
+                  </dd>
+                </div>
+              </dl>
+
+              <details className="details-drawer">
+                <summary>詳細な環境情報（OS・CPU・パス・接続先 URL）を表示</summary>
+                <dl className="meta-grid">
+                  <div>
+                    <dt>OS / バージョン</dt>
+                    <dd data-testid="diag-os">
+                      {diagnostics.os_name} ({diagnostics.os_version})
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>CPU / コア・スレッド</dt>
+                    <dd data-testid="diag-cpu">
+                      {diagnostics.cpu_name} ({diagnostics.cpu_cores}C / {diagnostics.cpu_threads}T)
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>システム RAM</dt>
+                    <dd data-testid="diag-ram">{diagnostics.ram_total_mb.toLocaleString()} MB</dd>
+                  </div>
+                  <div>
+                    <dt>推論サーバ（llama.cpp）</dt>
+                    <dd data-testid="diag-llama-runtime">
+                      モデル: {diagnostics.llama_model_path ?? "不明"} / ビルド:{" "}
+                      {diagnostics.llama_build_info ?? "不明"} / 計算:{" "}
+                      {diagnostics.llama_compute_backend ?? "不明"} / PID:{" "}
+                      {diagnostics.llama_server_pid ?? "不明"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>Python / PDFエンジン</dt>
+                    <dd data-testid="diag-pdf-engine">
+                      Python {diagnostics.python_version} / Primary: {diagnostics.pdf_engine_primary}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>OFL 日本語フォント</dt>
+                    <dd data-testid="diag-font">
+                      {diagnostics.japanese_font_available
+                        ? `利用可能 (${diagnostics.japanese_font_path || ""})`
+                        : "未検出"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>ローカル限定強制 (127.0.0.1)</dt>
+                    <dd data-testid="diag-loopback">
+                      {diagnostics.loopback_only_enforced
+                        ? "有効 (loopback_only_enforced = true)"
+                        : "無効"}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>推論サーバ URL</dt>
+                    <dd data-testid="diag-llama-url">
                       <code>{diagnostics.llama_server_url}</code>
-                      ）へ接続できる状態にしたうえで、上部の「🔌 推論サーバ疎通確認 (probe_llama=true)」を押してください（疎通確認は{" "}
-                      <code>GET /v1/models</code>{" "}
-                      の軽量確認のみを行い、翻訳リクエストは送信しません）。モデル未導入で画面遷移のみ試す場合は画面1で「モック推論」を選択できますが、モックは決定論的な疑似翻訳であり実翻訳ではありません。
-                    </div>
-                  )}
-                </dd>
+                    </dd>
+                  </div>
+                </dl>
+              </details>
+            </>
+          )}
+
+          <details className="details-drawer">
+            <summary>モデルライセンス表記・セキュリティ・メンテナンス操作</summary>
+            <ModelLicenseNotice
+              variant="screen4"
+              catalogModel={activeCatalogModel}
+              activeModel={modelsOverview?.active_model ?? null}
+            />
+
+            <h3 style={{ fontSize: "14px", margin: "12px 0 8px 0" }}>
+              セキュリティ・メンテナンス操作
+            </h3>
+            {systemActionFeedback && (
+              <div
+                data-testid="system-action-feedback"
+                className="alert alert-info"
+                style={{ marginBottom: "10px", fontSize: "12px" }}
+              >
+                {systemActionFeedback}
               </div>
-            </dl>
-          )}
-
-          <hr style={{ border: "none", borderTop: "1px solid #e2e8f0", margin: "16px 0" }} />
-
-          <ModelLicenseNotice
-            variant="screen4"
-            catalogModel={activeCatalogModel}
-            activeModel={modelsOverview?.active_model ?? null}
-          />
-
-          <h3 style={{ fontSize: "15px", margin: "0 0 8px 0" }}>
-            セキュリティ・メンテナンス操作
-          </h3>
-          {systemActionFeedback && (
-            <div
-              data-testid="system-action-feedback"
-              className="alert alert-info"
-              style={{ marginBottom: "10px", fontSize: "12px" }}
-            >
-              {systemActionFeedback}
+            )}
+            <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                data-testid="rotate-token-btn"
+                onClick={async () => {
+                  await onRotateToken();
+                  setSystemActionFeedback(
+                    "X-PaperBridge-Token をローテーションしました（旧トークンは即時失効済み）。"
+                  );
+                }}
+              >
+                🔑 セッショントークンを更新 (Rotate Token)
+              </button>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                data-testid="purge-temp-btn"
+                onClick={async () => {
+                  const dir = await onPurgeTempData();
+                  setSystemActionFeedback(`一時作業ディレクトリを消去しました (${dir})。`);
+                }}
+              >
+                🧹 一時作業データを削除 (Purge Working Data)
+              </button>
             </div>
-          )}
-          <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
-            <button
-              type="button"
-              className="btn btn-secondary"
-              data-testid="rotate-token-btn"
-              onClick={async () => {
-                await onRotateToken();
-                setSystemActionFeedback(
-                  "X-PaperBridge-Token をローテーションしました（旧トークンは即時失効済み）。"
-                );
-              }}
-            >
-              🔑 セッショントークンを更新 (Rotate Token)
-            </button>
-            <button
-              type="button"
-              className="btn btn-secondary"
-              data-testid="purge-temp-btn"
-              onClick={async () => {
-                const dir = await onPurgeTempData();
-                setSystemActionFeedback(`一時作業ディレクトリを消去しました (${dir})。`);
-              }}
-            >
-              🧹 一時作業データを削除 (Purge Working Data)
-            </button>
-          </div>
+          </details>
         </section>
       </div>
     </div>

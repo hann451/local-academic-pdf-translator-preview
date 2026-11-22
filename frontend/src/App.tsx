@@ -118,6 +118,8 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
   const [isScreen2Dirty, setIsScreen2Dirty] = useState<boolean>(false);
   const isScreen2DirtyRef = useRef<boolean>(false);
   isScreen2DirtyRef.current = isScreen2Dirty;
+  const loadedMonoPdfKeyRef = useRef<string | null>(null);
+  const pollInFlightRef = useRef<boolean>(false);
   const [isScreen3Dirty, setIsScreen3Dirty] = useState<boolean>(false);
 
   // Shared Domain State
@@ -317,15 +319,19 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
       setCurrentDocument(doc);
       setBlockSplits(splits);
 
-      const hasMono = arts.some(
+      const monoArt = arts.find(
         (a) => a.artifact_type === "mono_ja_pdf" && a.is_finalized
       );
-      if (hasMono) {
-        try {
-          const pdfRes = await fetchArtifactPdfBytes(jobId, "mono_ja_pdf");
-          setTranslatedPdfBytes(pdfRes.data);
-        } catch {
-          // ignore if preview bytes unavailable
+      if (monoArt) {
+        const pdfKey = `${jobId}:${monoArt.sha256_hash}`;
+        if (loadedMonoPdfKeyRef.current !== pdfKey) {
+          try {
+            const pdfRes = await fetchArtifactPdfBytes(jobId, "mono_ja_pdf");
+            setTranslatedPdfBytes(pdfRes.data);
+            loadedMonoPdfKeyRef.current = pdfKey;
+          } catch {
+            // ignore if preview bytes unavailable
+          }
         }
       }
       return job;
@@ -333,29 +339,45 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
     []
   );
 
-  // Poll while currentJob is in an active running state
+  // Poll while currentJob is in an active running state (lightweight job status every 800ms)
   useEffect(() => {
     if (!currentJob || !currentDocument) return;
-    const isRunning = [
+    const activeStates = new Set([
       "created",
       "preflight",
       "parsing",
       "translating",
       "validating",
       "typesetting",
-    ].includes(currentJob.state);
-    if (!isRunning) return;
+    ]);
+    if (!activeStates.has(currentJob.state)) return;
 
+    let tickCount = 0;
+    const prevState = currentJob.state;
     const timer = window.setInterval(async () => {
+      if (pollInFlightRef.current) return;
+      pollInFlightRef.current = true;
+      tickCount += 1;
       try {
-        const updatedJob = await refreshJobDetails(currentJob.id, currentDocument.id);
-        maybeRefreshModelsAfterRealJob(updatedJob);
+        const updatedJob = await fetchJob(currentJob.id);
+        setCurrentJob(updatedJob);
+        const stateChanged = updatedJob.state !== prevState;
+        const leftRunning = !activeStates.has(updatedJob.state);
+        if (stateChanged || leftRunning || tickCount % 6 === 0) {
+          const refreshed = await refreshJobDetails(currentJob.id, currentDocument.id);
+          maybeRefreshModelsAfterRealJob(refreshed);
+        }
       } catch {
         // ignore transient poll error
+      } finally {
+        pollInFlightRef.current = false;
       }
-    }, 600);
+    }, 800);
 
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearInterval(timer);
+      pollInFlightRef.current = false;
+    };
   }, [currentJob?.id, currentJob?.state, currentDocument?.id, refreshJobDetails, maybeRefreshModelsAfterRealJob]);
 
   const syncScreen2Data = useCallback(
@@ -426,6 +448,7 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
       const doc = await uploadPdfDocument(file);
       setCurrentDocument(doc);
       setCurrentJob(null);
+      loadedMonoPdfKeyRef.current = null;
       setTranslatedPdfBytes(null);
       setIssues([]);
       setArtifacts([]);
@@ -493,6 +516,7 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
         effectiveConfig,
         runJobsInBackground
       );
+      loadedMonoPdfKeyRef.current = null;
       setCurrentJob(job);
       const refreshedJob = await refreshJobDetails(job.id, currentDocument.id);
       maybeRefreshModelsAfterRealJob(refreshedJob);
@@ -743,6 +767,7 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
     setIsRetranslatingBlock(true);
     try {
       const job = await retranslateSpecificBlocks(currentJob.id, [blockId]);
+      loadedMonoPdfKeyRef.current = null;
       setCurrentJob(job);
       const refreshedJob = await refreshJobDetails(job.id, currentDocument.id);
       maybeRefreshModelsAfterRealJob(refreshedJob);
@@ -1031,9 +1056,7 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
       <header className="app-header">
         <div className="app-brand">
           <h1>PaperBridge Local</h1>
-          <span className="badge badge-info">
-            127.0.0.1 ローカル完結・数式保護優先
-          </span>
+          <span className="badge badge-info">ローカル完結・数式保護</span>
         </div>
 
         <nav className="nav-tabs" aria-label="画面切り替えナビゲーション">
@@ -1043,7 +1066,7 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
             className={`nav-tab-btn ${activeScreen === "screen1" ? "active" : ""}`}
             onClick={() => handleNavigate("screen1")}
           >
-            1. ホーム・プリフライト・設定
+            1. ホーム・設定
           </button>
           <button
             type="button"
@@ -1052,7 +1075,7 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
             className={`nav-tab-btn ${activeScreen === "screen2" ? "active" : ""}`}
             onClick={() => handleNavigate("screen2")}
           >
-            2. PDFビューア・保護領域編集
+            2. PDF・保護編集
           </button>
           <button
             type="button"
@@ -1061,7 +1084,7 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
             className={`nav-tab-btn ${activeScreen === "screen3" ? "active" : ""}`}
             onClick={() => handleNavigate("screen3")}
           >
-            3. 進行表示・対訳レビュー・再組版
+            3. 進行・対訳レビュー
           </button>
           <button
             type="button"
@@ -1069,7 +1092,7 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
             className={`nav-tab-btn ${activeScreen === "screen4" ? "active" : ""}`}
             onClick={() => handleNavigate("screen4")}
           >
-            4. 用語集管理・システム診断
+            4. 用語集・診断
           </button>
         </nav>
       </header>
