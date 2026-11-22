@@ -148,10 +148,10 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
         {/* Left Column: PDF Upload & Preflight Inspection */}
         <section className="card" aria-labelledby="upload-section-title">
           <h2 id="upload-section-title" className="card-title">
-            1. 論文PDFの登録・プリフライト検証
+            1. 論文PDFの登録
           </h2>
           <p className="card-subtitle">
-            原本PDFはローカルの隔離領域へ安全にコピーされ、SHA-256ハッシュにより処理前後の不変性が保証されます（外部送信・Word中間変換・無断OCRは一切行いません）。
+            ローカル環境で安全に処理します（外部送信・Word変換・無断OCRは行いません）。
           </p>
 
           <div
@@ -268,10 +268,6 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
 
               <dl className="meta-grid">
                 <div>
-                  <dt>ドキュメントID</dt>
-                  <dd data-testid="doc-id-value">{currentDocument.id}</dd>
-                </div>
-                <div>
                   <dt>総ページ数</dt>
                   <dd data-testid="doc-page-count">{currentDocument.page_count} ページ</dd>
                 </div>
@@ -282,57 +278,67 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
                     {currentDocument.file_size_bytes.toLocaleString()} bytes)
                   </dd>
                 </div>
-                <div>
-                  <dt>抽出ステータス</dt>
-                  <dd data-testid="doc-extract-status">
-                    {currentDocument.extractable_Sync_status}
-                  </dd>
-                </div>
-                <div style={{ gridColumn: "1 / -1" }}>
-                  <dt>原本 SHA-256 ハッシュ</dt>
-                  <dd
-                    data-testid="doc-sha256"
-                    style={{
-                      fontFamily: "monospace",
-                      fontSize: "12px",
-                      wordBreak: "break-all",
-                    }}
-                  >
-                    {currentDocument.sha256_hash}
-                  </dd>
-                </div>
               </dl>
 
-              <div
-                style={{
-                  display: "flex",
-                  gap: "8px",
-                  flexWrap: "wrap",
-                  marginTop: "12px",
-                }}
-              >
-                <span
-                  className={`badge ${
-                    currentDocument.is_scanned_pdf ? "badge-error" : "badge-neutral"
-                  }`}
+              <details className="details-drawer">
+                <summary>詳細メタデータ（ID・SHA-256・検査内訳）</summary>
+                <dl className="meta-grid">
+                  <div>
+                    <dt>ドキュメントID</dt>
+                    <dd data-testid="doc-id-value">{currentDocument.id}</dd>
+                  </div>
+                  <div>
+                    <dt>抽出ステータス</dt>
+                    <dd data-testid="doc-extract-status">
+                      {currentDocument.extractable_Sync_status}
+                    </dd>
+                  </div>
+                  <div style={{ gridColumn: "1 / -1" }}>
+                    <dt>原本 SHA-256 ハッシュ</dt>
+                    <dd
+                      data-testid="doc-sha256"
+                      style={{
+                        fontFamily: "monospace",
+                        fontSize: "12px",
+                        wordBreak: "break-all",
+                      }}
+                    >
+                      {currentDocument.sha256_hash}
+                    </dd>
+                  </div>
+                </dl>
+
+                <div
+                  style={{
+                    display: "flex",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                    marginTop: "10px",
+                  }}
                 >
-                  スキャン判定: {currentDocument.is_scanned_pdf ? "スキャンPDF (非対応)" : "デジタルテキストPDF"}
-                </span>
-                <span
-                  className={`badge ${
-                    currentDocument.is_corrupted ? "badge-error" : "badge-neutral"
-                  }`}
-                >
-                  破損判定: {currentDocument.is_corrupted ? "破損あり" : "正常"}
-                </span>
-                <span
-                  className={`badge ${
-                    currentDocument.is_encrypted ? "badge-error" : "badge-neutral"
-                  }`}
-                >
-                  暗号化判定: {currentDocument.is_encrypted ? "暗号化あり" : "なし"}
-                </span>
-              </div>
+                  <span
+                    className={`badge ${
+                      currentDocument.is_scanned_pdf ? "badge-error" : "badge-neutral"
+                    }`}
+                  >
+                    スキャン判定: {currentDocument.is_scanned_pdf ? "スキャンPDF (非対応)" : "デジタルテキストPDF"}
+                  </span>
+                  <span
+                    className={`badge ${
+                      currentDocument.is_corrupted ? "badge-error" : "badge-neutral"
+                    }`}
+                  >
+                    破損判定: {currentDocument.is_corrupted ? "破損あり" : "正常"}
+                  </span>
+                  <span
+                    className={`badge ${
+                      currentDocument.is_encrypted ? "badge-error" : "badge-neutral"
+                    }`}
+                  >
+                    暗号化判定: {currentDocument.is_encrypted ? "暗号化あり" : "なし"}
+                  </span>
+                </div>
+              </details>
 
               {isDocumentUnsupported && (
                 <div
@@ -507,7 +513,7 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
                     })
                   }
                 />
-                日本語単一PDF（数式・図表を原本ベクター保持した日本語置換PDF）
+                日本語単一PDF（数式・図表をそのまま保持）
               </label>
               <label style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                 <input
@@ -521,7 +527,7 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
                     })
                   }
                 />
-                見開き対訳PDF（左：英語原本ページ ／ 右：日本語組版ページ）
+                見開き対訳PDF（左：英語 ／ 右：日本語）
               </label>
               <label style={{ display: "flex", alignItems: "center", gap: "8px" }}>
                 <input
@@ -535,7 +541,7 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
                     })
                   }
                 />
-                非翻訳ラウンドトリップ検証（翻訳を行わずPDF再構成の完全性のみ検証）
+                非翻訳ラウンドトリップ検証（PDF再構成のみ確認）
               </label>
             </div>
             {!hasAtLeastOneOutput && (
@@ -884,29 +890,35 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
                       <code>is_mock_translation: true</code> が記録され、実機翻訳とは区別されます。
                     </div>
                   ) : (
-                    <div
-                      data-testid="real-inference-prerequisite-note"
-                      className="field-hint"
-                      style={{ marginTop: "8px", fontSize: "12px", color: "#334155" }}
-                    >
-                      実機翻訳には、本アプリとは別ターミナルで推論サーバ（選択中の翻訳モデルを指定した{" "}
-                      <code>llama-server</code>、
-                      {endpointDisplay ? (
-                        <>
-                          接続先設定: <code>{endpointDisplay}</code>
-                        </>
-                      ) : (
-                        "設定済み接続先"
-                      )}
-                      ）が応答し、接続できる状態である必要があります。接続できない場合（未起動のほか、ポート・URL設定差異や接続制限の可能性があります）や別モデルが応答する場合は、開始時エラーまたは中断となります。事前確認は画面4の「推論サーバ疎通確認」（翻訳リクエストは送信しません）で行えます。モデル未導入で画面動作のみ確認する場合は「モック推論」（実翻訳ではありません）を選択してください。
-                    </div>
+                    <details className="details-drawer">
+                      <summary>接続要件・ローカル推論の前提条件</summary>
+                      <div
+                        data-testid="real-inference-prerequisite-note"
+                        className="field-hint"
+                        style={{ marginTop: "6px", fontSize: "12px", color: "#334155" }}
+                      >
+                        実機翻訳には、本アプリとは別ターミナルで推論サーバ（選択中の翻訳モデルを指定した{" "}
+                        <code>llama-server</code>、
+                        {endpointDisplay ? (
+                          <>
+                            接続先設定: <code>{endpointDisplay}</code>
+                          </>
+                        ) : (
+                          "設定済み接続先"
+                        )}
+                        ）が応答し、接続できる状態である必要があります。接続できない場合（未起動のほか、ポート・URL設定差異や接続制限の可能性があります）や別モデルが応答する場合は、開始時エラーまたは中断となります。事前確認は画面4の「推論サーバ疎通確認」（翻訳リクエストは送信しません）で行えます。モデル未導入で画面動作のみ確認する場合は「モック推論」（実翻訳ではありません）を選択してください。
+                      </div>
+                    </details>
                   )}
 
-                  <ModelLicenseNotice
-                    variant="screen1"
-                    catalogModel={activeCatalogModel}
-                    activeModel={activeModel}
-                  />
+                  <details className="details-drawer">
+                    <summary>モデル利用規約・ライセンス表示</summary>
+                    <ModelLicenseNotice
+                      variant="screen1"
+                      catalogModel={activeCatalogModel}
+                      activeModel={activeModel}
+                    />
+                  </details>
                 </div>
               </>
             );

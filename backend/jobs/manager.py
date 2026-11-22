@@ -15,8 +15,9 @@ import json
 import shutil
 import threading
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from time import monotonic
 
 from typing import Any
 
@@ -38,6 +39,7 @@ from backend.domain.models import (
     ProtectionRegion,
     TranslationJobConfig,
     ValidationIssue,
+    utc_now_iso,
 )
 from backend.pdf.adapters.base import PdfEngineAdapter
 from backend.pdf.adapters.native_preserving_adapter import (
@@ -247,6 +249,122 @@ def _deduplicate_validation_issues(
         )
         unique.setdefault(identity, issue)
     return list(unique.values())
+
+
+_STAGE_WEIGHTS_FULL: dict[str, tuple[float, float]] = {
+    "preflight": (0.0, 2.0),
+    "parsing": (2.0, 8.0),
+    "translating": (8.0, 75.0),
+    "validating": (75.0, 76.0),
+    "typesetting": (76.0, 86.0),
+    "exporting": (86.0, 90.0),
+    "visual_verify": (90.0, 96.0),
+    "layout_metrics": (96.0, 99.0),
+}
+_STAGE_WEIGHTS_RETYPESET: dict[str, tuple[float, float]] = {
+    "typesetting": (0.0, 35.0),
+    "exporting": (35.0, 55.0),
+    "visual_verify": (55.0, 80.0),
+    "layout_metrics": (80.0, 99.0),
+}
+
+
+class _JobProgressTracker:
+    """Tracks fine-grained %, live page/substage counts, and smoothed ETA with throttled persistence."""
+
+    def __init__(
+        self,
+        db: DatabaseRepository,
+        job: Job,
+        *,
+        is_retypeset: bool = False,
+        min_save_interval_s: float = 0.25,
+    ) -> None:
+        self.db = db
+        self.job = job
+        self.weights = _STAGE_WEIGHTS_RETYPESET if is_retypeset else _STAGE_WEIGHTS_FULL
+        self.min_save_interval_s = min_save_interval_s
+        self.last_save_mono = 0.0
+        self.current_phase = ""
+        self.phase_start_mono = monotonic()
+        self.ewma_sec_per_block: float | None = None
+        if is_retypeset:
+            self.job.progress_percent = 0.0
+            self.job.estimated_remaining_seconds = None
+
+    def update(
+        self,
+        stage_code: str,
+        *,
+        current: int = 0,
+        total: int = 0,
+        current_page: int | None = None,
+        processed_pages: int | None = None,
+        stage_detail: str | None = None,
+        current_stage_text: str | None = None,
+        remaining_work_units: int | None = None,
+        sample_dt: float | None = None,
+        tail_pages_for_post_eta: int = 0,
+        force_save: bool = False,
+    ) -> None:
+        now = monotonic()
+        if stage_code != self.current_phase:
+            self.current_phase = stage_code
+            self.phase_start_mono = now
+
+        lo, hi = self.weights.get(stage_code, (0.0, 99.0))
+        frac = (max(0, min(current, total)) / total) if total > 0 else 0.0
+        pct = lo + (hi - lo) * frac
+        pct = max(0.0, min(99.5, max(float(self.job.progress_percent or 0.0), round(pct, 1))))
+
+        self.job.stage_code = stage_code
+        self.job.progress_percent = pct
+        self.job.substage_current = max(0, current)
+        self.job.substage_total = max(0, total)
+        if current_page is not None:
+            self.job.current_page = max(0, current_page)
+        if processed_pages is not None:
+            self.job.processed_pages = max(0, processed_pages)
+        if stage_detail is not None:
+            self.job.stage_detail = stage_detail
+        if current_stage_text is not None:
+            self.job.current_stage = current_stage_text
+
+        if sample_dt is not None and sample_dt > 0.01:
+            if self.ewma_sec_per_block is None:
+                self.ewma_sec_per_block = sample_dt
+            else:
+                self.ewma_sec_per_block = 0.72 * self.ewma_sec_per_block + 0.28 * sample_dt
+
+        eta: float | None = None
+        if stage_code == "translating" and remaining_work_units is not None:
+            if self.ewma_sec_per_block is not None:
+                tail = 0.30 * max(0, tail_pages_for_post_eta)
+                eta = round(remaining_work_units * self.ewma_sec_per_block + tail, 1)
+        elif stage_code in ("typesetting", "exporting", "visual_verify", "layout_metrics"):
+            phase_elapsed = max(0.0, now - self.phase_start_mono)
+            if total > 0 and current >= 1:
+                per_item = phase_elapsed / current
+                rem_in_stage = max(0, total - current) * per_item
+                rem_tail = 0.0
+                if stage_code == "typesetting":
+                    rem_tail = 0.28 * max(1, total)
+                elif stage_code == "exporting":
+                    rem_tail = 0.20 * max(1, total)
+                elif stage_code == "visual_verify":
+                    rem_tail = 0.12 * max(1, total)
+                eta = round(rem_in_stage + rem_tail, 1)
+        elif stage_code == "parsing" and total > 0 and current >= 1:
+            phase_elapsed = max(0.0, now - self.phase_start_mono)
+            eta = round(max(0, total - current) * (phase_elapsed / current), 1)
+
+        if eta is not None:
+            self.job.estimated_remaining_seconds = max(0.0, eta)
+
+        if force_save or (now - self.last_save_mono >= self.min_save_interval_s):
+            self.job.updated_at = utc_now_iso()
+            self.db.save_job(self.job)
+            self.last_save_mono = now
 
 
 class JobManager:
@@ -1256,6 +1374,7 @@ class JobManager:
         page_indices: list[int],
         mono_pdf_path: Path | None,
         dual_pdf_path: Path | None,
+        progress_callback: Callable[[int, int, int], None] | None = None,
     ) -> dict[str, Any] | None:
         if not Path(doc.safe_storage_path).exists():
             return None
@@ -1267,6 +1386,7 @@ class JobManager:
             dual_pdf_path=dual_pdf_path,
             document_id=doc.id,
             original_filename=doc.original_filename,
+            progress_callback=progress_callback,
         )
         return report.model_dump()
 
@@ -1318,10 +1438,20 @@ class JobManager:
                 self.db.save_job(job)
                 return job
 
+            if not job.started_at:
+                job.started_at = utc_now_iso()
+            tracker = _JobProgressTracker(self.db, job, is_retypeset=False)
+
             # Stage 1 - 3: Preflight verification
             if job.state in (JobState.CREATED, JobState.INTERRUPTED, JobState.CANCELED, JobState.FAILED) and not resume:
                 job.transition_to(JobState.PREFLIGHT, "Stage 1-3: ファイル・ページ・抽出可否検証")
-                self.db.save_job(job)
+                tracker.update(
+                    "preflight",
+                    current=0,
+                    total=1,
+                    stage_detail="Stage 1-3: ファイル・SHA-256・抽出可否を検証中",
+                    force_save=True,
+                )
 
             if not verify_original_unchanged(doc.safe_storage_path, doc.sha256_hash):
                 job.original_hash_verified = False
@@ -1339,7 +1469,13 @@ class JobManager:
 
             page_indices = parse_page_range_spec(job.config.page_range_spec, doc.page_count)
             job.total_pages = len(page_indices)
-            self.db.save_job(job)
+            tracker.update(
+                "preflight",
+                current=1,
+                total=1,
+                stage_detail=f"Stage 1-3: 対象 {len(page_indices)} ページを確認済み",
+                force_save=True,
+            )
 
             if self._check_cancel_or_interrupt(job):
                 return job
@@ -1352,17 +1488,37 @@ class JobManager:
             if not existing_blocks or not resume:
                 if job.can_transition_to(JobState.PARSING):
                     job.transition_to(JobState.PARSING, "Stage 4-7: 構造・数式解析および保護領域決定")
-                    self.db.save_job(job)
+                    tracker.update(
+                        "parsing",
+                        current=0,
+                        total=max(1, len(page_indices)),
+                        processed_pages=0,
+                        stage_detail="Stage 4-7: PDF構造と数式領域を解析中",
+                        force_save=True,
+                    )
+
+                def _on_parse_page(done: int, total: int, p_idx: int) -> None:
+                    tracker.update(
+                        "parsing",
+                        current=done,
+                        total=total,
+                        current_page=p_idx + 1,
+                        processed_pages=done,
+                        stage_detail=f"Stage 4-7: PDF構造を解析中 ({done}/{total} ページ・P.{p_idx + 1})",
+                    )
 
                 updated_splits: list[BlockSplitSpec] = []
-                parsed_blocks = self.pdf_adapter.parse_and_extract_blocks(
-                    document=doc,
-                    page_indices=page_indices,
-                    manual_regions=manual_regions,
-                    job_config=job.config,
-                    split_specs=split_specs,
-                    updated_split_specs_out=updated_splits,
-                )
+                parse_kwargs: dict[str, Any] = {
+                    "document": doc,
+                    "page_indices": page_indices,
+                    "manual_regions": manual_regions,
+                    "job_config": job.config,
+                    "split_specs": split_specs,
+                    "updated_split_specs_out": updated_splits,
+                }
+                if isinstance(self.pdf_adapter, NativePreservingAdapter):
+                    parse_kwargs["progress_callback"] = _on_parse_page
+                parsed_blocks = self.pdf_adapter.parse_and_extract_blocks(**parse_kwargs)
                 # Preserve existing translations/manual edits and user overrides safely
                 clear_ids = self._merge_existing_block_state(
                     parsed_blocks=parsed_blocks,
@@ -1529,8 +1685,65 @@ class JobManager:
                         and not (target_block_ids and item.id in target_block_ids)
                     )
 
+                def _block_is_done(item: Block) -> bool:
+                    if item.status == BlockStatus.PROTECTED_SKIP:
+                        return True
+                    if item.status == BlockStatus.MANUALLY_EDITED and (
+                        target_block_ids is None or item.id not in target_block_ids
+                    ):
+                        return True
+                    item_is_mock_origin = bool(item.translation_is_mock) or str(
+                        item.translation_text or ""
+                    ).lstrip().startswith("[MOCK")
+                    if item.status == BlockStatus.FALLBACK_ORIGINAL and (
+                        (target_block_ids is not None and item.id not in target_block_ids)
+                        or (
+                            resume
+                            and not item.needs_retranslation
+                            and not (not translator.is_mock and item_is_mock_origin)
+                        )
+                    ):
+                        return True
+                    if (
+                        item.status == BlockStatus.TRANSLATED
+                        and item.translation_text
+                        and not item.needs_retranslation
+                        and not (not translator.is_mock and item_is_mock_origin)
+                        and (target_block_ids is None or item.id not in target_block_ids)
+                    ):
+                        return True
+                    return False
+
+                page_total_counts: dict[int, int] = {}
+                page_done_ids: dict[int, set[str]] = {}
+                pending_work_ids: set[str] = set()
+                for item in blocks:
+                    page_total_counts[item.page_index] = page_total_counts.get(item.page_index, 0) + 1
+                    s = page_done_ids.setdefault(item.page_index, set())
+                    if item.status in processed_statuses and _block_is_done(item):
+                        s.add(item.id)
+                    else:
+                        pending_work_ids.add(item.id)
+
+                def _finished_page_count() -> int:
+                    return sum(
+                        1
+                        for p in page_indices
+                        if page_total_counts.get(p, 0) > 0
+                        and len(page_done_ids.get(p, set())) >= page_total_counts[p]
+                    )
+
                 job.processed_blocks = processed_block_count()
-                self.db.save_job(job)
+                tracker.update(
+                    "translating",
+                    current=job.processed_blocks,
+                    total=max(1, job.total_blocks),
+                    processed_pages=_finished_page_count(),
+                    stage_detail=f"Stage 8: 翻訳を開始中 (0/{len(pending_work_ids)} 件残)",
+                    remaining_work_units=len(pending_work_ids),
+                    tail_pages_for_post_eta=len(page_indices),
+                    force_save=True,
+                )
 
                 for blk in blocks:
                     if self._check_cancel_or_interrupt(job):
@@ -1594,6 +1807,7 @@ class JobManager:
                         context_parts.append(continuation_contexts[blk.id])
                     context_hint = "\n".join(context_parts) or None
 
+                    t0_blk = monotonic()
                     block_source_outcome, block_llm_calls = self._translate_and_validate_single_block(
                         job=job,
                         doc=doc,
@@ -1604,12 +1818,15 @@ class JobManager:
                         history_window=history_window,
                         issues=issues,
                     )
+                    blk_dt = monotonic() - t0_blk
                     llm_api_calls_made += block_llm_calls
                     if block_source_outcome == "cache_hit":
                         cache_hit_blocks += 1
                     elif block_source_outcome == "llm_inference":
                         newly_inferenced_blocks += 1
                     self.db.save_blocks(doc.id, [blk])
+                    page_done_ids.setdefault(blk.page_index, set()).add(blk.id)
+                    pending_work_ids.discard(blk.id)
                     job.processed_blocks = sum(
                         1
                         for b in blocks
@@ -1617,7 +1834,20 @@ class JobManager:
                         and not (target_block_ids and b.id in target_block_ids)
                     )
                     job.warning_count = len(_deduplicate_validation_issues(issues))
-                    self.db.save_job(job)
+                    tracker.update(
+                        "translating",
+                        current=job.processed_blocks,
+                        total=max(1, job.total_blocks),
+                        current_page=blk.page_index + 1,
+                        processed_pages=_finished_page_count(),
+                        stage_detail=(
+                            f"Stage 8: 翻訳中 {job.processed_blocks}/{job.total_blocks} ブロック"
+                            f" (P.{blk.page_index + 1})"
+                        ),
+                        remaining_work_units=len(pending_work_ids),
+                        sample_dt=blk_dt if block_source_outcome == "llm_inference" else None,
+                        tail_pages_for_post_eta=len(page_indices),
+                    )
 
                     if blk.status == BlockStatus.TRANSLATED and blk.translation_text:
                         hist_src, _ = _resolve_block_llm_input(blk, job.config)
@@ -1630,14 +1860,28 @@ class JobManager:
                         history_window = history_window[-2:]
 
                 job.transition_to(JobState.VALIDATING, "Stage 9: 訳文および保護記号の整合性検証")
-                self.db.save_job(job)
+                tracker.update(
+                    "validating",
+                    current=1,
+                    total=1,
+                    processed_pages=len(page_indices),
+                    stage_detail="Stage 9: 訳文と数式プレースホルダの整合性を確認中",
+                    force_save=True,
+                )
 
             if self._check_cancel_or_interrupt(job):
                 return job
 
             # Stage 10 - 13: Typesetting, Preservation Verification, Final Export, Report
             job.transition_to(JobState.TYPESETTING, "Stage 10-12: 日本語再配置・数式保持検証・PDF出力")
-            self.db.save_job(job)
+            tracker.update(
+                "typesetting",
+                current=0,
+                total=max(1, len(page_indices)),
+                processed_pages=0,
+                stage_detail="Stage 10: 日本語PDFの組版・出力を開始中",
+                force_save=True,
+            )
 
             work_dir = self.config.runtime_dir / "working" / job.id
             final_dir = self.config.runtime_dir / "outputs" / job.id
@@ -1647,30 +1891,65 @@ class JobManager:
             work_mono = work_dir / f"{doc.id}.ja.pdf" if job.config.output_mono_pdf else None
             work_dual = work_dir / f"{doc.id}.dual.pdf" if job.config.output_dual_pdf else None
 
-            blocks, typeset_issues = self.pdf_adapter.typeset_and_export(
-                document=doc,
-                blocks=blocks,
-                page_indices=page_indices,
-                mono_output_path=work_mono,
-                dual_output_path=work_dual,
-                job_id=job.id,
-                job_config=job.config,
-                manual_regions=manual_regions,
-            )
+            def _on_typeset_or_export(stage: str, done: int, total: int, p_idx: int) -> None:
+                label = "Stage 12: 見開き対訳PDF出力中" if stage == "exporting" else "Stage 10: 日本語PDF組版中"
+                tracker.update(
+                    stage,
+                    current=done,
+                    total=total,
+                    current_page=p_idx + 1,
+                    processed_pages=done,
+                    stage_detail=f"{label} ({done}/{total} ページ・P.{p_idx + 1})",
+                )
+
+            typeset_kwargs: dict[str, Any] = {
+                "document": doc,
+                "blocks": blocks,
+                "page_indices": page_indices,
+                "mono_output_path": work_mono,
+                "dual_output_path": work_dual,
+                "job_id": job.id,
+                "job_config": job.config,
+                "manual_regions": manual_regions,
+            }
+            if isinstance(self.pdf_adapter, NativePreservingAdapter):
+                typeset_kwargs["progress_callback"] = _on_typeset_or_export
+            blocks, typeset_issues = self.pdf_adapter.typeset_and_export(**typeset_kwargs)
             issues.extend(typeset_issues)
             self.db.save_blocks(doc.id, blocks)
 
             # Stage 11: Verify visual preservation of protected formulas and figures
             visual_reports = []
             if work_mono and work_mono.exists():
-                v_reps = self.pdf_adapter.verify_preservation(
-                    document=doc,
-                    output_pdf_path=work_mono,
-                    blocks=blocks,
-                    page_indices=page_indices,
-                    manual_regions=manual_regions,
-                    is_roundtrip_only=job.config.only_roundtrip_preservation,
+                def _on_verify_page(done: int, total: int, p_idx: int) -> None:
+                    tracker.update(
+                        "visual_verify",
+                        current=done,
+                        total=total,
+                        current_page=p_idx + 1,
+                        processed_pages=done,
+                        stage_detail=f"Stage 11: 数式・図表の視覚保持検証中 ({done}/{total} ページ・P.{p_idx + 1})",
+                    )
+
+                tracker.update(
+                    "visual_verify",
+                    current=0,
+                    total=max(1, len(page_indices)),
+                    processed_pages=0,
+                    stage_detail="Stage 11: 保護領域の視覚保持検証を実行中",
+                    force_save=True,
                 )
+                verify_kwargs: dict[str, Any] = {
+                    "document": doc,
+                    "output_pdf_path": work_mono,
+                    "blocks": blocks,
+                    "page_indices": page_indices,
+                    "manual_regions": manual_regions,
+                    "is_roundtrip_only": job.config.only_roundtrip_preservation,
+                }
+                if isinstance(self.pdf_adapter, NativePreservingAdapter):
+                    verify_kwargs["progress_callback"] = _on_verify_page
+                v_reps = self.pdf_adapter.verify_preservation(**verify_kwargs)
                 for rep in v_reps:
                     visual_reports.append(
                         {
@@ -1885,12 +2164,31 @@ class JobManager:
                 if work_dual and (final_dir / f"{doc.id}.dual.pdf").exists()
                 else work_dual
             )
+            def _on_layout_metric_page(done: int, total: int, p_idx: int) -> None:
+                tracker.update(
+                    "layout_metrics",
+                    current=done,
+                    total=total,
+                    current_page=p_idx + 1,
+                    processed_pages=done,
+                    stage_detail=f"Stage 11: レイアウト・数式整合性検証中 ({done}/{total} ページ・P.{p_idx + 1})",
+                )
+
+            tracker.update(
+                "layout_metrics",
+                current=0,
+                total=max(1, len(page_indices)),
+                processed_pages=0,
+                stage_detail="Stage 11: レイアウト・数式整合性レポートを作成中",
+                force_save=True,
+            )
             layout_regression_metrics = self._compute_layout_regression_report(
                 doc=doc,
                 blocks=blocks,
                 page_indices=page_indices,
                 mono_pdf_path=mono_for_metrics if (mono_for_metrics and mono_for_metrics.exists()) else None,
                 dual_pdf_path=dual_for_metrics if (dual_for_metrics and dual_for_metrics.exists()) else None,
+                progress_callback=_on_layout_metric_page,
             )
             report_path = final_dir / f"{doc.id}.report.json"
             report_payload = {
@@ -1992,10 +2290,12 @@ class JobManager:
         fail_stage_for_test: bool = False,
     ) -> dict[str, Any]:
         staging_dir: Path | None = None
+        prev_job_snapshot: Job | None = None
         try:
             job = self.db.get_job(job_id)
             if not job:
                 raise KeyError(f"Job not found: {job_id}")
+            prev_job_snapshot = job.model_copy(deep=True)
             doc = self.db.get_document(job.document_id)
             if not doc:
                 raise KeyError(f"Document not found: {job.document_id}")
@@ -2187,16 +2487,43 @@ class JobManager:
                     if b.status in (BlockStatus.TRANSLATED, BlockStatus.MANUALLY_EDITED):
                         reevaluated_scopes_by_block.setdefault(b.id, set()).add("typesetting")
 
-            working_blocks, typeset_issues = self.pdf_adapter.typeset_and_export(
-                document=doc,
-                blocks=working_blocks,
-                page_indices=page_indices,
-                mono_output_path=staging_mono,
-                dual_output_path=staging_dual,
-                job_id=job.id,
-                job_config=job.config,
-                manual_regions=manual_regions,
+            job.started_at = utc_now_iso()
+            rt_tracker = _JobProgressTracker(self.db, job, is_retypeset=True)
+            if job.can_transition_to(JobState.TYPESETTING):
+                job.transition_to(JobState.TYPESETTING, "Stage 10-12: 手動修正のPDF再組版（LLM呼び出しなし）")
+            rt_tracker.update(
+                "typesetting",
+                current=0,
+                total=max(1, len(page_indices)),
+                processed_pages=0,
+                stage_detail="Stage 10: PDF再組版を開始中（LLM呼び出しなし）",
+                force_save=True,
             )
+
+            def _on_rt_typeset_or_export(stage: str, done: int, total: int, p_idx: int) -> None:
+                label = "Stage 12: 見開き対訳PDF出力中" if stage == "exporting" else "Stage 10: PDF再組版中"
+                rt_tracker.update(
+                    stage,
+                    current=done,
+                    total=total,
+                    current_page=p_idx + 1,
+                    processed_pages=done,
+                    stage_detail=f"{label} ({done}/{total} ページ・P.{p_idx + 1})",
+                )
+
+            rt_typeset_kwargs: dict[str, Any] = {
+                "document": doc,
+                "blocks": working_blocks,
+                "page_indices": page_indices,
+                "mono_output_path": staging_mono,
+                "dual_output_path": staging_dual,
+                "job_id": job.id,
+                "job_config": job.config,
+                "manual_regions": manual_regions,
+            }
+            if isinstance(self.pdf_adapter, NativePreservingAdapter):
+                rt_typeset_kwargs["progress_callback"] = _on_rt_typeset_or_export
+            working_blocks, typeset_issues = self.pdf_adapter.typeset_and_export(**rt_typeset_kwargs)
             for ts_iss in typeset_issues:
                 if ts_iss.block_id:
                     reevaluated_scopes_by_block.setdefault(ts_iss.block_id, set()).add(
@@ -2207,14 +2534,36 @@ class JobManager:
             visual_reports = []
             if staging_mono and staging_mono.exists():
                 evaluated_visual_pages.update(page_indices)
-                v_reps = self.pdf_adapter.verify_preservation(
-                    document=doc,
-                    output_pdf_path=staging_mono,
-                    blocks=working_blocks,
-                    page_indices=page_indices,
-                    manual_regions=manual_regions,
-                    is_roundtrip_only=job.config.only_roundtrip_preservation,
+
+                def _on_rt_verify_page(done: int, total: int, p_idx: int) -> None:
+                    rt_tracker.update(
+                        "visual_verify",
+                        current=done,
+                        total=total,
+                        current_page=p_idx + 1,
+                        processed_pages=done,
+                        stage_detail=f"Stage 11: 数式・図表の視覚保持検証中 ({done}/{total} ページ・P.{p_idx + 1})",
+                    )
+
+                rt_tracker.update(
+                    "visual_verify",
+                    current=0,
+                    total=max(1, len(page_indices)),
+                    processed_pages=0,
+                    stage_detail="Stage 11: 保護領域の視覚保持検証を実行中",
+                    force_save=True,
                 )
+                rt_verify_kwargs: dict[str, Any] = {
+                    "document": doc,
+                    "output_pdf_path": staging_mono,
+                    "blocks": working_blocks,
+                    "page_indices": page_indices,
+                    "manual_regions": manual_regions,
+                    "is_roundtrip_only": job.config.only_roundtrip_preservation,
+                }
+                if isinstance(self.pdf_adapter, NativePreservingAdapter):
+                    rt_verify_kwargs["progress_callback"] = _on_rt_verify_page
+                v_reps = self.pdf_adapter.verify_preservation(**rt_verify_kwargs)
                 for rep in v_reps:
                     visual_reports.append(
                         {
@@ -2317,12 +2666,31 @@ class JobManager:
             job.execution_provenance = prov
 
             staging_report = staging_dir / f"{doc.id}.report.json"
+            def _on_rt_layout_page(done: int, total: int, p_idx: int) -> None:
+                rt_tracker.update(
+                    "layout_metrics",
+                    current=done,
+                    total=total,
+                    current_page=p_idx + 1,
+                    processed_pages=done,
+                    stage_detail=f"Stage 11: レイアウト・数式整合性検証中 ({done}/{total} ページ・P.{p_idx + 1})",
+                )
+
+            rt_tracker.update(
+                "layout_metrics",
+                current=0,
+                total=max(1, len(page_indices)),
+                processed_pages=0,
+                stage_detail="Stage 11: レイアウト・数式整合性レポートを作成中",
+                force_save=True,
+            )
             layout_regression_metrics = self._compute_layout_regression_report(
                 doc=doc,
                 blocks=working_blocks,
                 page_indices=page_indices,
                 mono_pdf_path=staging_mono if (staging_mono and staging_mono.exists()) else None,
                 dual_pdf_path=staging_dual if (staging_dual and staging_dual.exists()) else None,
+                progress_callback=_on_rt_layout_page,
             )
             report_payload = {
                 "job_id": job.id,
@@ -2424,9 +2792,6 @@ class JobManager:
             self.db.replace_validation_issues_for_job(job.id, issues)
             self.db.replace_export_artifacts_for_job(job.id, new_artifacts)
 
-            if job.can_transition_to(JobState.TYPESETTING):
-                job.transition_to(JobState.TYPESETTING, "Stage 10-12: 手動修正のPDF再組版（LLM呼び出しなし）")
-
             job.retypeset_revision = next_rev
             job.based_on_edit_revision = doc.edit_revision
             job.based_on_protection_revision = doc.protection_revision
@@ -2480,6 +2845,10 @@ class JobManager:
                 "requires_reparse_or_retranslate": requires_reparse_or_retranslate,
                 "llm_calls_made": 0,
             }
+        except Exception:
+            if prev_job_snapshot is not None:
+                self.db.save_job(prev_job_snapshot)
+            raise
         finally:
             if staging_dir and staging_dir.exists():
                 shutil.rmtree(staging_dir, ignore_errors=True)

@@ -13,6 +13,7 @@ from __future__ import annotations
 import re
 import statistics
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
 
@@ -762,7 +763,31 @@ def check_formula_block_count_consistency(
                     if str(s.get("text", "")).strip()
                 ]
                 has_math_font = any(
-                    any(k in fn for k in ("cmmi", "cmsy", "cmex", "math", "txsys", "txexs", "txmia"))
+                    any(
+                        k in fn
+                        for k in (
+                            "cmmi",
+                            "cmsy",
+                            "cmex",
+                            "math",
+                            "symbol",
+                            "txsys",
+                            "txexs",
+                            "txmia",
+                            "txex",
+                            "txsy",
+                            "rtxmi",
+                            "rtxr",
+                            "txsya",
+                            "txsyb",
+                            "txsyc",
+                            "linlibertinei",
+                            "linlibertinezi",
+                            "newtx",
+                            "stix",
+                            "mt2",
+                        )
+                    )
                     for fn in clip_fonts
                 )
                 has_eq_num = bool(re.search(r"\(\s*\d+(?:\.\d+)*[a-z]?\s*\)\s*$", clip_text))
@@ -1735,6 +1760,7 @@ def evaluate_document_layout_regression(
     document_id: str | None = None,
     original_filename: str | None = None,
     dpi: int = 150,
+    progress_callback: Callable[[int, int, int], None] | None = None,
 ) -> LayoutRegressionReport:
     """Evaluate all 4 layout/math regression metrics across the requested document pages."""
     blocks_by_page: dict[int, list[Block]] = {}
@@ -1788,6 +1814,8 @@ def evaluate_document_layout_regression(
                 dpi=dpi,
             )
             page_reports.append(p_rep)
+            if progress_callback is not None:
+                progress_callback(seq_idx + 1, len(target_pages), p_idx)
 
         flagged_indices = [p.page_index for p in page_reports if p.needs_visual_review]
         flagged_pages = [p.display_page_number for p in page_reports if p.needs_visual_review]

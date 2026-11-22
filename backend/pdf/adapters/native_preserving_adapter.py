@@ -23,6 +23,7 @@ import re
 import shutil
 import statistics
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 
@@ -352,8 +353,10 @@ def _select_char_font(
     Returns `None` if neither `ja_font` nor `math_font` has a glyph for `ch`.
     """
     cp = ord(ch)
-    if cp <= 0x20 or ch.isspace():
+    if ch in (" ", "\t", "\n", "\r", "\xa0") or (cp >= 0x20 and ch.isspace()):
         return (ja_font_tag, ja_font)
+    if cp < 0x20 or cp == 0x7F:
+        return None
     if _is_math_preferred_codepoint(cp):
         if math_font is not None and math_font_tag and math_font.has_glyph(cp) != 0:
             return (math_font_tag, math_font)
@@ -1288,6 +1291,8 @@ def _build_styled_line_plan(
     math_font_tag: str | None = None,
     math_font: pymupdf.Font | None = None,
     inline_math_spans: list[InlineMathSpan] | None = None,
+    *,
+    _char_cache: dict[tuple[str, float], tuple[str, pymupdf.Font | None, float]] | None = None,
 ) -> tuple[
     list[tuple[str, pymupdf.Font | None, str, float, float, float]],
     list[tuple[float, float, float, float]],
@@ -1374,14 +1379,28 @@ def _build_styled_line_plan(
                         overbar_ranges.append((t0, t1))
 
     def _measure_char(ch: str, fs: float) -> tuple[str, pymupdf.Font | None, float]:
+        if _char_cache is not None:
+            cached = _char_cache.get((ch, fs))
+            if cached is not None:
+                return cached
         if ja_font is not None:
             sel = _select_char_font(ch, ja_font_tag, ja_font, math_font_tag, math_font)
             tag, fobj = sel if sel is not None else (ja_font_tag, ja_font)
-            return tag, fobj, float(fobj.text_length(ch, fontsize=fs))
-        w = fs * 0.56 if (ord(ch) < 128 or (0x1D400 <= ord(ch) <= 0x1D7FF)) else fs * 1.02
-        return ja_font_tag, None, w
+            res: tuple[str, pymupdf.Font | None, float] = (
+                tag,
+                fobj,
+                float(fobj.text_length(ch, fontsize=fs)),
+            )
+        else:
+            w = fs * 0.56 if (ord(ch) < 128 or (0x1D400 <= ord(ch) <= 0x1D7FF)) else fs * 1.02
+            res = (ja_font_tag, None, w)
+        if _char_cache is not None:
+            _char_cache[(ch, fs)] = res
+        return res
 
     styled_runs: list[tuple[str, pymupdf.Font | None, str, float, float, float]] = []
+    # Buffer the active contiguous run and call `text_length` once on flush instead of per char (O(L^2) -> O(L)).
+    open_run: list[Any] | None = None
     char_x0 = [0.0] * n
     char_x1 = [0.0] * n
     cursor_x = 0.0
@@ -1391,6 +1410,27 @@ def _build_styled_line_plan(
     sup_group_x1 = 0.0
     sub_group_x1 = 0.0
     in_stacked_sub = False
+
+    def _flush_open_run() -> None:
+        nonlocal open_run, cursor_x, last_run_end_x, max_rendered_x1, sup_group_x1, sub_group_x1
+        if open_run is None:
+            return
+        r_tag, r_fobj, r_chars, r_x0, r_y, r_fs, r_last_i, r_role, r_stacked = open_run
+        run_txt = "".join(r_chars)
+        styled_runs.append((r_tag, r_fobj, run_txt, r_x0, r_y, r_fs))
+        if r_fobj is not None and len(r_chars) > 1:
+            actual_w = float(r_fobj.text_length(run_txt, fontsize=r_fs))
+            end_x = r_x0 + actual_w
+            last_run_end_x = end_x
+            if end_x > cursor_x:
+                cursor_x = end_x
+                char_x1[r_last_i] = cursor_x
+                if r_role == "super":
+                    sup_group_x1 = max(sup_group_x1, cursor_x)
+                if r_stacked:
+                    sub_group_x1 = max(sub_group_x1, cursor_x)
+            max_rendered_x1 = max(max_rendered_x1, cursor_x, last_run_end_x)
+        open_run = None
 
     for i in range(n):
         ch = line_str[i]
@@ -1403,11 +1443,13 @@ def _build_styled_line_plan(
             and char_role[i - 1] == "super"
             and char_role[i + 1] == "sub"
         ):
+            _flush_open_run()
             char_x0[i] = cursor_x
             char_x1[i] = cursor_x
             continue
 
         if role == "hat" and i + 1 < n:
+            _flush_open_run()
             hat_fs = font_size_pt * char_scale[i]
             hat_tag, hat_fobj, hat_w = _measure_char(ch, hat_fs)
             base_fs = font_size_pt * char_scale[i + 1]
@@ -1435,6 +1477,7 @@ def _build_styled_line_plan(
                 or (i >= 2 and line_str[i - 1] == " " and char_role[i - 2] == "super")
             )
             if is_sub_start and preceded_by_super and sup_group_x0 is not None:
+                _flush_open_run()
                 in_stacked_sub = True
                 sub_group_x1 = sup_group_x0
                 cursor_x = sup_group_x0
@@ -1455,37 +1498,36 @@ def _build_styled_line_plan(
             sub_group_x1 = max(sub_group_x1, cursor_x)
 
         can_merge = (
-            bool(styled_runs)
+            open_run is not None
             and (i == 0 or char_role[i - 1] != "hat")
             and not (role == "sub" and in_stacked_sub and (i == 0 or char_role[i - 1] != "sub"))
-            and styled_runs[-1][0] == c_tag
-            and abs(styled_runs[-1][4] - c_y) < 1e-4
-            and abs(styled_runs[-1][5] - c_fs) < 1e-4
+            and open_run[0] == c_tag
+            and abs(open_run[4] - c_y) < 1e-4
+            and abs(open_run[5] - c_fs) < 1e-4
             and abs(last_run_end_x - c_x0) < 1e-4
         )
-        if can_merge:
-            p_tag, p_fobj, p_txt, p_x, p_y, p_fs = styled_runs[-1]
-            new_txt = p_txt + ch
-            styled_runs[-1] = (p_tag, p_fobj, new_txt, p_x, p_y, p_fs)
-            if c_fobj is not None:
-                actual_w = float(c_fobj.text_length(new_txt, fontsize=c_fs))
-                last_run_end_x = p_x + actual_w
-                cursor_x = max(cursor_x, last_run_end_x)
-                char_x1[i] = cursor_x
-            else:
-                last_run_end_x = cursor_x
+        if can_merge and open_run is not None:
+            open_run[2].append(ch)
+            open_run[6] = i
+            open_run[7] = role
+            open_run[8] = in_stacked_sub
+            last_run_end_x = cursor_x
         else:
-            styled_runs.append((c_tag, c_fobj, ch, c_x0, c_y, c_fs))
+            _flush_open_run()
+            open_run = [c_tag, c_fobj, [ch], c_x0, c_y, c_fs, i, role, in_stacked_sub]
             last_run_end_x = cursor_x
 
         max_rendered_x1 = max(max_rendered_x1, cursor_x, last_run_end_x)
 
         # At the end of a stacked sub/super group, advance cursor_x past the wider group
         if in_stacked_sub and (i + 1 >= n or char_role[i + 1] != "sub"):
+            _flush_open_run()
             cursor_x = max(sup_group_x1, sub_group_x1)
             max_rendered_x1 = max(max_rendered_x1, cursor_x)
             in_stacked_sub = False
             sup_group_x0 = None
+
+    _flush_open_run()
 
     overbars: list[tuple[float, float, float, float]] = []
     for t0, t1 in overbar_ranges:
@@ -1660,6 +1702,223 @@ def _preserve_page_transparency_groups(
     return restored
 
 
+def _find_separation_colorspace_names(doc: pymupdf.Document, page: pymupdf.Page) -> set[str]:
+    """Return resource names (without leading '/') under `/Resources/ColorSpace` that resolve to `/Separation`."""
+    sep_names: set[str] = set()
+    try:
+        res_type, res_val = doc.xref_get_key(page.xref, "Resources")
+        if res_type == "xref":
+            res_xref = int(res_val.split()[0])
+            cs_type, cs_val = doc.xref_get_key(res_xref, "ColorSpace")
+        else:
+            cs_type, cs_val = doc.xref_get_key(page.xref, "Resources/ColorSpace")
+    except Exception:
+        return sep_names
+    cs_text = ""
+    if cs_type == "xref":
+        try:
+            cs_xref = int(cs_val.split()[0])
+            cs_text = doc.xref_object(cs_xref)
+        except Exception:
+            cs_text = ""
+    elif cs_type in ("dict", "array"):
+        cs_text = cs_val
+    if not cs_text:
+        return sep_names
+
+    # Match `/Name <num> 0 R` entries inside the ColorSpace dict
+    for m in re.finditer(r"/([^\s/\[\]<>()]+)\s+(\d+)\s+\d+\s+R\b", cs_text):
+        name, ref_xref = m.group(1), int(m.group(2))
+        try:
+            obj_str = doc.xref_object(ref_xref)
+        except Exception:
+            continue
+        if "/Separation" in obj_str:
+            sep_names.add(name)
+
+    # Also match inline `/Name [/Separation ...]` entries
+    for m in re.finditer(r"/([^\s/\[\]<>()]+)\s*\[([^\]]*)\]", cs_text):
+        if "/Separation" in m.group(2):
+            sep_names.add(m.group(1))
+    return sep_names
+
+
+def _tokenize_pdf_content_stream(raw: bytes) -> list[tuple[int, int, bytes]]:
+    """Lex PDF content stream bytes into `(start, end, token_bytes)`, preserving inline image boundaries."""
+    tokens: list[tuple[int, int, bytes]] = []
+    n = len(raw)
+    i = 0
+    _DELIM = frozenset(b" \t\r\n\f\x00()<>[]{}/%")
+    _WS = frozenset(b" \t\r\n\f\x00")
+    while i < n:
+        ch = raw[i]
+        if ch in _WS:
+            i += 1
+            continue
+        if ch == 0x25:  # % comment
+            end_nl = raw.find(b"\n", i)
+            end_cr = raw.find(b"\r", i)
+            if end_nl == -1 and end_cr == -1:
+                break
+            if end_nl == -1:
+                i = end_cr + 1
+            elif end_cr == -1:
+                i = end_nl + 1
+            else:
+                i = min(end_nl, end_cr) + 1
+            continue
+        if ch == 0x28:  # ( ... ) string literal
+            start = i
+            depth = 1
+            i += 1
+            while i < n and depth > 0:
+                if raw[i] == 0x5C:  # backslash escape
+                    i += 2
+                    continue
+                if raw[i] == 0x28:
+                    depth += 1
+                elif raw[i] == 0x29:
+                    depth -= 1
+                i += 1
+            tokens.append((start, i, raw[start:i]))
+            continue
+        if ch == 0x3C:  # < or <<
+            start = i
+            if i + 1 < n and raw[i + 1] == 0x3C:
+                i += 2
+                tokens.append((start, i, b"<<"))
+            else:
+                i += 1
+                while i < n and raw[i] != 0x3E:
+                    i += 1
+                if i < n:
+                    i += 1
+                tokens.append((start, i, raw[start:i]))
+            continue
+        if ch == 0x3E:  # > or >>
+            start = i
+            if i + 1 < n and raw[i + 1] == 0x3E:
+                i += 2
+                tokens.append((start, i, b">>"))
+            else:
+                i += 1
+                tokens.append((start, i, b">"))
+            continue
+        if ch in (0x5B, 0x5D, 0x7B, 0x7D):  # [ ] { }
+            tokens.append((i, i + 1, raw[i : i + 1]))
+            i += 1
+            continue
+        if ch == 0x2F:  # /Name
+            start = i
+            i += 1
+            while i < n and raw[i] not in _DELIM:
+                i += 1
+            tokens.append((start, i, raw[start:i]))
+            continue
+
+        start = i
+        while i < n and raw[i] not in _DELIM:
+            i += 1
+        tok = raw[start:i]
+        tokens.append((start, i, tok))
+        if tok == b"BI":
+            # Skip inline image dictionary and raw image bytes until `<ws>EI(<ws>|$)`
+            m_id = re.search(rb"\bID[\x00\t\n\f\r ]", raw[i:])
+            if m_id is None:
+                break
+            data_pos = i + m_id.end()
+            m_ei = re.search(rb"[\x00\t\n\f\r ]EI(?:[\x00\t\n\f\r ]|$)", raw[data_pos:])
+            if m_ei is None:
+                break
+            ei_pos = data_pos + m_ei.start() + 1
+            tokens.append((ei_pos, ei_pos + 2, b"EI"))
+            i = ei_pos + 2
+    return tokens
+
+
+def _restore_elided_separation_scn(
+    doc: pymupdf.Document,
+    page: pymupdf.Page,
+) -> int:
+    """Restore default `1 scn` / `1 SCN` right after `/CS* cs`/`CS` when MuPDF's `apply_redactions`
+    elided it (leaving PDFium/PDF.js rendering Separation text white/invisible).
+    """
+    sep_names = _find_separation_colorspace_names(doc, page)
+    if not sep_names:
+        return 0
+    stream_xrefs = list(page.get_contents())
+    if not stream_xrefs:
+        return 0
+
+    _NONSTROKING_RESET_OPS = frozenset({b"scn", b"sc", b"g", b"rg", b"k"})
+    _STROKING_RESET_OPS = frozenset({b"SCN", b"SC", b"G", b"RG", b"K"})
+    _FILL_PAINT_OPS = frozenset({b"Tj", b"TJ", b"'", b'"', b"f", b"F", b"f*", b"B", b"B*", b"b", b"b*", b"sh"})
+    _STROKE_PAINT_OPS = frozenset({b"S", b"s", b"B", b"B*", b"b", b"b*"})
+
+    # Track `(stream_idx, insert_offset)` where `cs`/`CS` lacked a tint before paint
+    pending_cs: tuple[int, int] | None = None
+    pending_CS: tuple[int, int] | None = None
+    gs_stack: list[tuple[tuple[int, int] | None, tuple[int, int] | None]] = []
+    insertions_by_stream: dict[int, list[tuple[int, bytes]]] = {}
+    stream_bytes_map: dict[int, bytes] = {}
+
+    for s_idx, xref in enumerate(stream_xrefs):
+        try:
+            raw = doc.xref_stream(xref)
+        except Exception:
+            continue
+        if not raw:
+            continue
+        stream_bytes_map[s_idx] = raw
+        prev_tok = b""
+        for start, end, tok in _tokenize_pdf_content_stream(raw):
+            if tok == b"q":
+                gs_stack.append((pending_cs, pending_CS))
+            elif tok == b"Q":
+                if gs_stack:
+                    pending_cs, pending_CS = gs_stack.pop()
+            elif tok == b"cs":
+                if prev_tok.startswith(b"/") and prev_tok[1:].decode("latin-1", "ignore") in sep_names:
+                    pending_cs = (s_idx, end)
+                else:
+                    pending_cs = None
+            elif tok == b"CS":
+                if prev_tok.startswith(b"/") and prev_tok[1:].decode("latin-1", "ignore") in sep_names:
+                    pending_CS = (s_idx, end)
+                else:
+                    pending_CS = None
+            elif tok in _NONSTROKING_RESET_OPS:
+                pending_cs = None
+            elif tok in _STROKING_RESET_OPS:
+                pending_CS = None
+            else:
+                if pending_cs is not None and tok in _FILL_PAINT_OPS:
+                    ins_s_idx, ins_off = pending_cs
+                    insertions_by_stream.setdefault(ins_s_idx, []).append((ins_off, b" 1 scn"))
+                    pending_cs = None
+                if pending_CS is not None and tok in _STROKE_PAINT_OPS:
+                    ins_s_idx, ins_off = pending_CS
+                    insertions_by_stream.setdefault(ins_s_idx, []).append((ins_off, b" 1 SCN"))
+                    pending_CS = None
+            prev_tok = tok
+
+    restored = 0
+    for s_idx, ins_list in insertions_by_stream.items():
+        orig_raw = stream_bytes_map[s_idx]
+        # Deduplicate & splice in ascending offset order
+        unique_sorted = sorted(set(ins_list), key=lambda x: x[0])
+        parts: list[bytes] = []
+        cursor = 0
+        for off, snippet in unique_sorted:
+            parts.append(orig_raw[cursor:off])
+            parts.append(snippet)
+            cursor = off
+            restored += 1
+        parts.append(orig_raw[cursor:])
+        doc.update_stream(stream_xrefs[s_idx], b"".join(parts))
+    return restored
+
+
 def _collect_document_tounicode_xrefs(doc: pymupdf.Document) -> set[int]:
     """Return the set of all `/ToUnicode` stream xrefs currently referenced anywhere in `doc`."""
     tu_xrefs: set[int] = set()
@@ -1758,11 +2017,14 @@ def _find_unrenderable_chars(
     seen: set[int] = set()
     for ch in norm_text:
         cp = ord(ch)
-        if cp <= 0x20 or ch.isspace() or cp in seen:
+        if ch in (" ", "\t", "\n", "\r", "\xa0") or (cp >= 0x20 and ch.isspace()) or cp in seen:
             continue
         if _select_char_font(ch, ja_font_tag, ja_font, math_font_tag, math_font) is None:
             seen.add(cp)
-            missing.append(f"{ch}(U+{cp:04X})")
+            if cp < 0x20 or cp == 0x7F:
+                missing.append(f"CTRL(U+{cp:04X})")
+            else:
+                missing.append(f"{ch}(U+{cp:04X})")
     return missing
 
 _ISOLATED_FORMULA_LINE_RE = re.compile(
@@ -1848,6 +2110,22 @@ _MATH_FONT_KEYWORDS: tuple[str, ...] = (
     "txsys",
     "txexs",
     "txmia",
+    "txex",
+    "txsy",
+    "rtxmi",
+    "rtxr",
+    "txsya",
+    "txsyb",
+    "txsyc",
+    "linlibertinei",
+    "linlibertinezi",
+    "newtx",
+    "stix",
+    "mt2",
+    "eufm",
+    "eurm",
+    "msam",
+    "msbm",
 )
 _STRONG_MATH_OP_RE = re.compile(
     r"[=<>≤≥≈≠±∑∏∫∬∭∮∂∇∞∈∉⊂⊆∪∩∀∃≡∝∼≃≅≪≫√+−×÷*/·⋅^_∥]"
@@ -1894,7 +2172,7 @@ _INTRO_HEADING_RE = re.compile(
     r"^\s*(?:1\.?\s+|I\.?\s+)?Introduction\s*$", re.IGNORECASE
 )
 _RUNNING_HEADER_PATTERN_RE = re.compile(
-    r"(?:^\s*\d{1,4}\s+[A-Z]\.\s*[A-Za-z\-]+|et\s+al\.\s*$|^\s*[A-Z]\.\s*[A-Za-z\-]+\s+et\s+al\.|\s+\d{1,4}\s*$|^\s*\d{1,4}\s*$)"
+    r"(?:^\s*\d{1,4}\s+[A-Z]\.\s*[A-Za-z\-]+|^\s*\d{1,3}:\d{1,4}(?:\s|$)|et\s+al\.\s*$|^\s*[A-Z]\.\s*[A-Za-z\-]+\s+et\s+al\.|\s+\d{1,3}:\d{1,4}\s*$|\s+\d{1,4}\s*$|^\s*\d{1,4}\s*$)"
 )
 
 
@@ -2082,6 +2360,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
         )
         prepared = self._group_spatial_fraction_equations(prepared, drawings)
         drawing_boxes = self._cluster_vector_drawings(drawings, page_w, page_h)
+        table_boxes = self._detect_ruled_table_boxes(drawings, prepared, page_w, page_h)
         frontmatter_end_y = (
             self._find_page1_frontmatter_boundary_y(prepared, page_h, body_font_size)
             if p_idx == 0
@@ -2095,6 +2374,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
             body_font_size=body_font_size,
             frontmatter_end_y=frontmatter_end_y,
             drawing_boxes=drawing_boxes,
+            extra_blockers=table_boxes,
         )
         return prepared, drawing_boxes, frontmatter_end_y
 
@@ -2106,6 +2386,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
         job_config: TranslationJobConfig | None = None,
         split_specs: list[BlockSplitSpec] | None = None,
         updated_split_specs_out: list[BlockSplitSpec] | None = None,
+        progress_callback: Callable[[int, int, int], None] | None = None,
     ) -> list[Block]:
         cfg = job_config or TranslationJobConfig()
         manual_by_page: dict[int, list[ProtectionRegion]] = {}
@@ -2128,9 +2409,8 @@ class NativePreservingAdapter(PdfEngineAdapter):
             )
             in_references_section = False
 
-            for p_idx in page_indices:
-                if p_idx < 0 or p_idx >= len(mupdf_doc):
-                    continue
+            valid_pages = [p for p in page_indices if 0 <= p < len(mupdf_doc)]
+            for seq_p_idx, p_idx in enumerate(valid_pages):
                 mpage = mupdf_doc[p_idx]
                 page_w = float(mpage.cropbox.width)
                 page_h = float(mpage.cropbox.height)
@@ -2331,9 +2611,42 @@ class NativePreservingAdapter(PdfEngineAdapter):
                                     cand.protection_rule_id = "RULE_TABLE_CELL"
                                     self._apply_protection_and_masking(cand, page_manual, cfg)
 
+                # Reclassify blocks inside ruled/booktabs tables as TABLE
+                ruled_table_boxes = self._detect_ruled_table_boxes(
+                    drawings, raw_blocks, page_w, page_h
+                )
+                if ruled_table_boxes:
+                    for cand in page_candidates:
+                        if cand.kind in (
+                            BlockKind.CAPTION,
+                            BlockKind.TITLE,
+                            BlockKind.HEADER_FOOTER,
+                        ) or cand.split_role is not None:
+                            continue
+                        if cand.kind == BlockKind.TABLE:
+                            continue
+                        if any(
+                            bbox_intersection_ratio(cand.bbox, tb) >= 0.50
+                            for tb in ruled_table_boxes
+                        ):
+                            cand.kind = BlockKind.TABLE
+                            cand.semantic_category = "table"
+                            cand.is_uncertain_region = False
+                            if cand.source_text == "[Vector Figure / Diagram]":
+                                cand.source_text = "[Table Grid]"
+                                cand.masked_source_text = "[Table Grid]"
+                                cand.protection_reason = "自動：表グリッド要素"
+                                cand.protection_rule_id = "RULE_TABLE_GRID"
+                            else:
+                                cand.protection_reason = "自動：表内部セル"
+                                cand.protection_rule_id = "RULE_TABLE_CELL"
+                            self._apply_protection_and_masking(cand, page_manual, cfg)
+
                 # Sort reading order (Stage 5)
                 ordered_page_blocks = self._assign_reading_order(page_candidates, page_w)
                 all_blocks.extend(ordered_page_blocks)
+                if progress_callback is not None:
+                    progress_callback(seq_p_idx + 1, len(valid_pages), p_idx)
 
             attach_continuation_candidates(all_blocks)
             return all_blocks
@@ -2514,6 +2827,242 @@ class NativePreservingAdapter(PdfEngineAdapter):
             boxes = new_boxes
 
         return [b for b in boxes if (b[2] - b[0]) >= 30 and (b[3] - b[1]) >= 18]
+
+    def _detect_ruled_table_boxes(
+        self,
+        drawings: list[dict],
+        raw_blocks: list[dict],
+        page_w: float,
+        page_h: float,
+    ) -> list[list[float]]:
+        """Detect grid/semi-grid and booktabs ruled tables on a page without false-positiving on Page 1 rules."""
+        min_h_len = max(80.0, page_w * 0.16)
+        raw_h_rules: list[list[float]] = []
+        v_rules: list[list[float]] = []
+        for d in drawings:
+            r = d.get("rect")
+            if not r:
+                continue
+            x0, y0, x1, y1 = float(r.x0), float(r.y0), float(r.x1), float(r.y1)
+            w, h = x1 - x0, y1 - y0
+            if h <= 3.0 and w >= min_h_len and page_h * 0.05 < y0 < page_h * 0.94:
+                raw_h_rules.append([x0, y0, x1, y1])
+            elif w <= 3.0 and h >= 8.0 and page_w * 0.04 < x0 < page_w * 0.94:
+                v_rules.append([x0, y0, x1, y1])
+
+        if not raw_h_rules:
+            return []
+
+        # Deduplicate nearly identical horizontal rules (e.g. double lines or split segments)
+        raw_h_rules.sort(key=lambda b: ((b[1] + b[3]) / 2.0, b[0]))
+        h_rules: list[list[float]] = []
+        for hr in raw_h_rules:
+            hy = (hr[1] + hr[3]) / 2.0
+            merged_dup = False
+            for existing in h_rules:
+                ey = (existing[1] + existing[3]) / 2.0
+                if abs(hy - ey) <= 2.5:
+                    x_ov = min(hr[2], existing[2]) - max(hr[0], existing[0])
+                    min_w = min(hr[2] - hr[0], existing[2] - existing[0])
+                    if x_ov >= 0.80 * max(min_w, 1e-3):
+                        existing[0] = min(existing[0], hr[0])
+                        existing[1] = min(existing[1], hr[1])
+                        existing[2] = max(existing[2], hr[2])
+                        existing[3] = max(existing[3], hr[3])
+                        merged_dup = True
+                        break
+            if not merged_dup:
+                h_rules.append(list(hr))
+
+        text_blocks = [
+            b for b in raw_blocks if b.get("type", 0) == 0 and b.get("lines")
+        ]
+        table_boxes: list[list[float]] = []
+        used_h: set[int] = set()
+
+        # 1) Grid / Semi-grid tables: horizontal rules linked vertically by vertical rules
+        if v_rules and len(h_rules) >= 1:
+            n_h = len(h_rules)
+            h_adj: dict[int, set[int]] = {i: set() for i in range(n_h)}
+            h_attached_v: dict[int, list[list[float]]] = {i: [] for i in range(n_h)}
+            for vr in v_rules:
+                vx = (vr[0] + vr[2]) / 2.0
+                vy0, vy1 = vr[1], vr[3]
+                touching_h: list[int] = []
+                for hi, hr in enumerate(h_rules):
+                    if hr[0] - 4.0 <= vx <= hr[2] + 4.0 and (vy0 <= hr[3] + 4.0 and vy1 >= hr[1] - 4.0):
+                        touching_h.append(hi)
+                        h_attached_v[hi].append(vr)
+                for a_pos in range(len(touching_h)):
+                    for b_pos in range(a_pos + 1, len(touching_h)):
+                        ia, ib = touching_h[a_pos], touching_h[b_pos]
+                        h_adj[ia].add(ib)
+                        h_adj[ib].add(ia)
+            # Also link horizontally aligned H rules that both intersect vertical rules within shared X span
+            for vr in v_rules:
+                vx = (vr[0] + vr[2]) / 2.0
+                for ia in range(n_h):
+                    if not h_attached_v[ia]:
+                        continue
+                    ha = h_rules[ia]
+                    if not (ha[0] - 4.0 <= vx <= ha[2] + 4.0):
+                        continue
+                    for ib in range(ia + 1, n_h):
+                        hb = h_rules[ib]
+                        if not (hb[0] - 4.0 <= vx <= hb[2] + 4.0):
+                            continue
+                        x_ov = min(ha[2], hb[2]) - max(ha[0], hb[0])
+                        if x_ov >= 0.55 * min(ha[2] - ha[0], hb[2] - hb[0]):
+                            min_y = min(ha[1], hb[1])
+                            max_y = max(ha[3], hb[3])
+                            # Bridge through any chain of vertical rules inside shared X span
+                            spanning_v = [
+                                v
+                                for v in v_rules
+                                if (ha[0] - 4.0 <= (v[0] + v[2]) / 2.0 <= ha[2] + 4.0)
+                                and v[3] >= min_y - 4.0
+                                and v[1] <= max_y + 4.0
+                            ]
+                            if spanning_v:
+                                span_y0 = min(v[1] for v in spanning_v)
+                                span_y1 = max(v[3] for v in spanning_v)
+                                if span_y0 <= min_y + 24.0 and span_y1 >= max_y - 24.0:
+                                    h_adj[ia].add(ib)
+                                    h_adj[ib].add(ia)
+
+            visited: set[int] = set()
+            for hi in range(n_h):
+                if hi in visited or not h_attached_v[hi]:
+                    continue
+                comp_h: list[int] = []
+                stack = [hi]
+                visited.add(hi)
+                while stack:
+                    cur = stack.pop()
+                    comp_h.append(cur)
+                    for nxt in h_adj[cur]:
+                        if nxt not in visited:
+                            visited.add(nxt)
+                            stack.append(nxt)
+                parts = [h_rules[idx] for idx in comp_h]
+                for idx in comp_h:
+                    parts.extend(h_attached_v[idx])
+                tx0 = min(p[0] for p in parts)
+                ty0 = min(p[1] for p in parts)
+                tx1 = max(p[2] for p in parts)
+                ty1 = max(p[3] for p in parts)
+                # Pull in remaining v_rules strictly inside `[tx0-4, tx1+4]` adjacent to component y-range
+                changed = True
+                while changed:
+                    changed = False
+                    for vr in v_rules:
+                        vx = (vr[0] + vr[2]) / 2.0
+                        if tx0 - 4.0 <= vx <= tx1 + 4.0 and vr[1] <= ty1 + 4.0 and vr[3] >= ty0 - 4.0:
+                            new_y0 = min(ty0, vr[1])
+                            new_y1 = max(ty1, vr[3])
+                            if new_y0 < ty0 - 0.5 or new_y1 > ty1 + 0.5:
+                                ty0, ty1 = new_y0, new_y1
+                                changed = True
+                if (tx1 - tx0) < 80.0 or (ty1 - ty0) < 24.0:
+                    continue
+                cand_box = [round(tx0, 2), round(ty0, 2), round(tx1, 2), round(ty1, 2)]
+                inside_count = sum(
+                    1
+                    for tb in text_blocks
+                    if bbox_intersection_ratio([float(x) for x in tb.get("bbox", [0, 0, 0, 0])], cand_box) >= 0.40
+                )
+                if inside_count >= 2:
+                    table_boxes.append(cand_box)
+                    used_h.update(comp_h)
+
+        # 2) Pure horizontal Booktabs tables (>= 3 aligned rules with tight header band, zero abstract/intro)
+        rem_h = [i for i in range(len(h_rules)) if i not in used_h]
+        used_booktabs: set[int] = set()
+        for start_pos, hi in enumerate(rem_h):
+            if hi in used_booktabs:
+                continue
+            hx0, _, hx1, _ = h_rules[hi]
+            hw = hx1 - hx0
+            group = [hi]
+            for nxt_i in rem_h[start_pos + 1 :]:
+                if nxt_i in used_booktabs:
+                    continue
+                nx0, _, nx1, _ = h_rules[nxt_i]
+                nw = nx1 - nx0
+                x_ov = min(hx1, nx1) - max(hx0, nx0)
+                if (
+                    abs(nx0 - hx0) <= 12.0
+                    and abs(nx1 - hx1) <= 12.0
+                    and x_ov >= 0.75 * max(hw, nw, 1e-3)
+                ):
+                    group.append(nxt_i)
+            if len(group) < 3:
+                continue
+            # Segment into sub-groups if a huge vertical gap separates distinct tables
+            sub_group = [group[0]]
+            sub_groups: list[list[int]] = []
+            for gi in group[1:]:
+                gap = (h_rules[gi][1] + h_rules[gi][3]) / 2.0 - (
+                    h_rules[sub_group[-1]][1] + h_rules[sub_group[-1]][3]
+                ) / 2.0
+                if gap <= page_h * 0.45:
+                    sub_group.append(gi)
+                else:
+                    sub_groups.append(sub_group)
+                    sub_group = [gi]
+            sub_groups.append(sub_group)
+
+            for sg in sub_groups:
+                if len(sg) < 3:
+                    continue
+                gaps = [
+                    (h_rules[sg[k + 1]][1] + h_rules[sg[k + 1]][3]) / 2.0
+                    - (h_rules[sg[k]][1] + h_rules[sg[k]][3]) / 2.0
+                    for k in range(len(sg) - 1)
+                ]
+                if not any(8.0 <= g <= 60.0 for g in gaps):
+                    continue
+                tx0 = min(h_rules[idx][0] for idx in sg)
+                ty0 = min(h_rules[idx][1] for idx in sg)
+                tx1 = max(h_rules[idx][2] for idx in sg)
+                ty1 = max(h_rules[idx][3] for idx in sg)
+                cand_box = [round(tx0, 2), round(ty0, 2), round(tx1, 2), round(ty1, 2)]
+                inside_tbs = [
+                    tb
+                    for tb in text_blocks
+                    if bbox_intersection_ratio([float(x) for x in tb.get("bbox", [0, 0, 0, 0])], cand_box) >= 0.40
+                ]
+                if len(inside_tbs) < 4:
+                    continue
+                word_counts: list[int] = []
+                has_non_table_heading = False
+                row_boxes: list[list[float]] = []
+                for tb in inside_tbs:
+                    txt_lines, _, _, _ = self._extract_lines_and_style(tb.get("lines", []))
+                    txt = " ".join(txt_lines).strip()
+                    if _ABSTRACT_START_RE.match(txt) or _INTRO_HEADING_RE.match(txt):
+                        has_non_table_heading = True
+                        break
+                    word_counts.append(len(txt.split()))
+                    tbb = tb.get("bbox")
+                    if tbb and len(tbb) == 4:
+                        row_boxes.append([float(v) for v in tbb])
+                if has_non_table_heading:
+                    continue
+                side_by_side_pairs = 0
+                for ra_i in range(len(row_boxes)):
+                    ra = row_boxes[ra_i]
+                    for rb in row_boxes[ra_i + 1 :]:
+                        y_ov = min(ra[3], rb[3]) - max(ra[1], rb[1])
+                        x_gap = max(0.0, rb[0] - ra[2], ra[0] - rb[2])
+                        if y_ov >= 2.0 and x_gap >= 4.0:
+                            side_by_side_pairs += 1
+                med_words = statistics.median(word_counts) if word_counts else 999
+                if side_by_side_pairs >= 2 or med_words <= 25:
+                    table_boxes.append(cand_box)
+                    used_booktabs.update(sg)
+
+        return table_boxes
 
     @staticmethod
     def _group_spatial_fraction_equations(
@@ -2832,7 +3381,14 @@ class NativePreservingAdapter(PdfEngineAdapter):
         joined = "".join(raw_texts).strip()
         if not joined:
             return True
-        return len(joined) <= 3 and not re.search(r"[A-Za-z0-9]", joined)
+        if re.search(r"[A-Za-z0-9]", joined):
+            return False
+        if len(joined) <= 3:
+            return True
+        return all(
+            ord(c) < 0x20 or c.isspace() or not c.isalnum()
+            for c in joined
+        ) and any(ord(c) < 0x20 for c in joined if not c.isspace())
 
     @staticmethod
     def _extract_block_non_func_alpha_words(text: str) -> list[str]:
@@ -3315,13 +3871,17 @@ class NativePreservingAdapter(PdfEngineAdapter):
         body_font_size: float,
         frontmatter_end_y: float,
         drawing_boxes: list[list[float]],
+        extra_blockers: list[list[float]] | None = None,
     ) -> list[dict]:
         """Merge spatially adjacent raw blocks belonging to one multi-part display equation."""
         if len(raw_blocks) < 2:
             return raw_blocks
 
         eligible: dict[int, dict] = {}
+        underbrace_labels: dict[int, list[float]] = {}
         blocker_boxes: list[list[float]] = [list(d_box) for d_box in drawing_boxes]
+        if extra_blockers:
+            blocker_boxes.extend(list(b) for b in extra_blockers)
 
         for idx, b in enumerate(raw_blocks):
             b_box = [float(x) for x in b.get("bbox", [0, 0, 0, 0])]
@@ -3404,11 +3964,48 @@ class NativePreservingAdapter(PdfEngineAdapter):
                     "tag": "F3",
                     "has_eq_num": bool(_TRAILING_EQ_NUM_RE.search(full_text)),
                 }
+            elif (
+                len(txt_lines) <= 2
+                and 0 < len(full_text) <= 45
+                and avg_sz <= body_font_size * 0.82
+                and len(re.findall(r"[A-Za-z]{2,}", full_text)) <= 4
+                and not _PROSE_SENTENCE_VERB_RE.search(full_text)
+                and not re.search(r"[A-Za-z]{2,}[.,;:?!]\s*$", full_text)
+            ):
+                underbrace_labels[idx] = b_box
             else:
                 blocker_boxes.append(b_box)
 
         if len(eligible) < 2:
             return raw_blocks
+
+        wide_prose = 0
+        left_col_prose = 0
+        right_col_prose = 0
+        excluded_for_cols = [list(d_box) for d_box in drawing_boxes]
+        if extra_blockers:
+            excluded_for_cols.extend(list(eb) for eb in extra_blockers)
+        for idx, rb in enumerate(raw_blocks):
+            if idx in eligible or idx in underbrace_labels or rb.get("type", 0) != 0:
+                continue
+            r_box = [float(x) for x in rb.get("bbox", [0, 0, 0, 0])]
+            if len(r_box) != 4 or len(rb.get("lines", [])) < 2:
+                continue
+            if r_box[1] < page_h * 0.08 or r_box[3] > page_h * 0.92:
+                continue
+            if p_idx == 0 and r_box[1] < frontmatter_end_y:
+                continue
+            if any(bbox_intersection_ratio(r_box, ex) >= 0.40 for ex in excluded_for_cols):
+                continue
+            rw = r_box[2] - r_box[0]
+            if rw >= page_w * 0.56 and r_box[0] < page_w * 0.35 and r_box[2] > page_w * 0.65:
+                wide_prose += 1
+            elif r_box[2] <= page_w * 0.52:
+                left_col_prose += 1
+            elif r_box[0] >= page_w * 0.48:
+                right_col_prose += 1
+        is_two_column_page = left_col_prose >= 1 and right_col_prose >= 1 and wide_prose == 0
+        max_eqnum_h_gap = 95.0 if is_two_column_page else max(95.0, page_w * 0.48)
 
         parent: dict[int, int] = {i: i for i in eligible}
         comp_has_eq_num: dict[int, bool] = {i: bool(eligible[i]["has_eq_num"]) for i in eligible}
@@ -3422,7 +4019,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
         def _can_link(idx_a: int, idx_b: int) -> bool:
             a, b = eligible[idx_a], eligible[idx_b]
             ba, bb = a["bbox"], b["bbox"]
-            if not self._same_column_for_math(ba, bb, page_w):
+            if is_two_column_page and not self._same_column_for_math(ba, bb, page_w):
                 return False
 
             v_gap = max(0.0, bb[1] - ba[3], ba[1] - bb[3])
@@ -3432,7 +4029,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
 
             horiz_band_match = (y_ov >= 4.0 or mid_y_diff <= 10.0) and (
                 h_gap <= 32.0
-                or ((a["tag"] == "F2" or b["tag"] == "F2") and h_gap <= 95.0)
+                or ((a["tag"] == "F2" or b["tag"] == "F2") and h_gap <= max_eqnum_h_gap)
             )
             stacked_match = v_gap <= 10.0 and h_gap <= 22.0
             if not (horiz_band_match or stacked_match):
@@ -3453,6 +4050,22 @@ class NativePreservingAdapter(PdfEngineAdapter):
                     nb_mid_y = (nb[1] + nb[3]) / 2.0
                     if nb_x_ov > 4.0 and gap_y0 < nb_mid_y < gap_y1:
                         return False
+
+            # Reject linking if a non-formula blocker sits horizontally between ba and bb
+            if ba[2] < bb[0]:
+                gap_x0, gap_x1 = ba[2], bb[0]
+            elif bb[2] < ba[0]:
+                gap_x0, gap_x1 = bb[2], ba[0]
+            else:
+                gap_x0, gap_x1 = 0.0, 0.0
+            if gap_x1 > gap_x0 + 8.0:
+                pair_y0 = min(ba[1], bb[1])
+                pair_y1 = max(ba[3], bb[3])
+                for nb in blocker_boxes:
+                    nb_y_ov = min(pair_y1, nb[3]) - max(pair_y0, nb[1])
+                    nb_mid_x = (nb[0] + nb[2]) / 2.0
+                    if nb_y_ov > 4.0 and gap_x0 < nb_mid_x < gap_x1:
+                        return False
             return True
 
         eligible_indices = sorted(eligible)
@@ -3471,14 +4084,61 @@ class NativePreservingAdapter(PdfEngineAdapter):
         for idx in eligible_indices:
             components.setdefault(_find(idx), []).append(idx)
 
+        # Attach small underbrace/annotation labels sitting directly below multi-part equation components
+        attached_label_indices: set[int] = set()
+        if underbrace_labels:
+            for members in components.values():
+                if len(members) < 2:
+                    continue
+                comp_boxes: list[list[float]] = [list(eligible[m]["bbox"]) for m in members]
+                label_boxes: list[list[float]] = []
+                changed = True
+                while changed:
+                    changed = False
+                    for l_idx, l_box in underbrace_labels.items():
+                        if l_idx in attached_label_indices:
+                            continue
+                        lx0, ly0, lx1, ly1 = l_box
+                        attached = False
+                        for mb in comp_boxes:
+                            if is_two_column_page and not self._same_column_for_math(mb, l_box, page_w):
+                                continue
+                            v_gap = ly0 - mb[3]
+                            x_ov = min(lx1, mb[2]) - max(lx0, mb[0])
+                            if -2.0 <= v_gap <= 16.0 and x_ov > 4.0:
+                                attached = True
+                                break
+                        if not attached:
+                            for lb in label_boxes:
+                                if is_two_column_page and not self._same_column_for_math(lb, l_box, page_w):
+                                    continue
+                                v_gap = ly0 - lb[3]
+                                x_ov = min(lx1, lb[2]) - max(lx0, lb[0])
+                                if -1.0 <= v_gap <= 6.0 and x_ov > 4.0:
+                                    attached = True
+                                    break
+                        if attached:
+                            members.append(l_idx)
+                            label_boxes.append(list(l_box))
+                            attached_label_indices.add(l_idx)
+                            changed = True
+
+        # Any remaining unattached small labels act as blockers to avoid false merging
+        for l_idx, l_box in underbrace_labels.items():
+            if l_idx not in attached_label_indices:
+                blocker_boxes.append(l_box)
+
         merged_blocks_by_start: dict[int, dict] = {}
         absorbed_indices: set[int] = set()
         for members in components.values():
             if len(members) < 2:
                 continue
-            if not any(eligible[m]["tag"] == "F3" for m in members):
+            if not any(m in eligible and eligible[m]["tag"] == "F3" for m in members):
                 continue
-            member_boxes = [eligible[m]["bbox"] for m in members]
+            member_boxes = [
+                eligible[m]["bbox"] if m in eligible else underbrace_labels[m]
+                for m in members
+            ]
             union_bbox = [
                 min(bx[0] for bx in member_boxes),
                 min(bx[1] for bx in member_boxes),
@@ -3574,17 +4234,35 @@ class NativePreservingAdapter(PdfEngineAdapter):
 
         # 1. Running Header / Footer check (top 7.5% or bottom 7% of page)
         if not is_large_page1_title and len(stripped) <= 130 and line_count <= 2:
-            if bbox[1] < page_h * 0.075 and bbox[3] < page_h * 0.095:
-                if p_idx >= 1 or _RUNNING_HEADER_PATTERN_RE.search(stripped) or avg_font_size <= body_font_size - 0.4:
-                    return (
-                        BlockKind.HEADER_FOOTER,
-                        "running_header",
-                        "自動：ランニングヘッダ・ページ番号",
-                        "RULE_RUNNING_HEADER_FOOTER",
-                        "high",
-                        False,
-                        in_references_section,
-                    )
+            in_top_strict = bbox[1] < page_h * 0.075 and bbox[3] < page_h * 0.095
+            in_top_acm = (
+                p_idx >= 1
+                and line_count <= 2
+                and (bbox[3] - bbox[1]) <= max(16.0, body_font_size * 1.8)
+                and bbox[1] < page_h * 0.088
+                and bbox[3] < page_h * 0.105
+                and (
+                    bool(_RUNNING_HEADER_PATTERN_RE.search(stripped))
+                    or avg_font_size <= body_font_size - 0.3
+                )
+            )
+            if (
+                in_top_strict
+                and (
+                    p_idx >= 1
+                    or _RUNNING_HEADER_PATTERN_RE.search(stripped)
+                    or avg_font_size <= body_font_size - 0.4
+                )
+            ) or in_top_acm:
+                return (
+                    BlockKind.HEADER_FOOTER,
+                    "running_header",
+                    "自動：ランニングヘッダ・ページ番号",
+                    "RULE_RUNNING_HEADER_FOOTER",
+                    "high",
+                    False,
+                    in_references_section,
+                )
             if bbox[3] > page_h * 0.935 and bbox[1] > page_h * 0.90 and not _PUBLISHING_META_RE.search(stripped):
                 return (
                     BlockKind.HEADER_FOOTER,
@@ -3842,8 +4520,10 @@ class NativePreservingAdapter(PdfEngineAdapter):
             )
 
         # High symbol density check for multi-part display equations (e.g. fractions, integrals, matrices)
+        has_math_ctrl = any(ord(c) < 0x20 and c not in "\t\n\r" for c in stripped)
         has_strong_math_cue = (
             has_math_font
+            or has_math_ctrl
             or has_sub_super
             or bool(_STRONG_MATH_OP_RE.search(cleaned_for_math_tokens))
             or bool(_MATH_ALPHA_SYMBOL_RE.search(stripped))
@@ -3854,7 +4534,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
             and len(prose_clause_words) < 2
             and not _EMAIL_RE.search(stripped)
             and has_strong_math_cue
-            and (math_Tokens >= max(3, int(len(stripped) * 0.22)) or has_math_font)
+            and (math_Tokens >= max(3, int(len(stripped) * 0.22)) or has_math_font or has_math_ctrl)
             and len(stripped) < 180
         ):
             return (
@@ -4209,6 +4889,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
         job_id: str,
         job_config: TranslationJobConfig,
         manual_regions: list[ProtectionRegion] | None = None,
+        progress_callback: Callable[[str, int, int, int], None] | None = None,
     ) -> tuple[list[Block], list[ValidationIssue]]:
         issues: list[ValidationIssue] = []
 
@@ -4263,11 +4944,9 @@ class NativePreservingAdapter(PdfEngineAdapter):
         try:
             out_doc.insert_pdf(src_doc)
             orig_tounicode_xrefs = _collect_document_tounicode_xrefs(out_doc)
-            target_set = set(page_indices)
+            target_set = sorted(i for i in set(page_indices) if 0 <= i < len(out_doc))
 
-            for p_idx in sorted(target_set):
-                if p_idx < 0 or p_idx >= len(out_doc):
-                    continue
+            for seq_t_idx, p_idx in enumerate(target_set):
                 mpage = out_doc[p_idx]
                 raw_page_blocks = blocks_by_page.get(p_idx, [])
                 # Sort deterministically by geometry/id so protection decisions and rendering
@@ -4689,6 +5368,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
                         images=pymupdf.PDF_REDACT_IMAGE_NONE,
                         graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
                     )
+                    _restore_elided_separation_scn(out_doc, mpage)
 
                     # Clear any inline radical vinculum bar from the original English position
                     # for blocks that are being re-typeset, subtracting all protected_boxes
@@ -4756,6 +5436,9 @@ class NativePreservingAdapter(PdfEngineAdapter):
                                 )
                             cursor_y += line_height
 
+                if progress_callback is not None:
+                    progress_callback("typesetting", seq_t_idx + 1, len(target_set), p_idx)
+
             _fix_embedded_tounicode_smp(
                 out_doc,
                 target_font_tags=("F_JA", "F_MATH"),
@@ -4787,6 +5470,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
                         mono_ref,
                         dual_output_path,
                         page_indices,
+                        progress_callback=progress_callback,
                     )
                 finally:
                     if temp_ref and temp_ref.exists():
@@ -4832,6 +5516,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
         translated_path: Path,
         dual_output_path: Path,
         page_indices: list[int],
+        progress_callback: Callable[[str, int, int, int], None] | None = None,
     ) -> None:
         """Create side-by-side bilingual PDF (Original on Left, Japanese on Right)
         preserving exact page correspondence and vector quality.
@@ -4845,9 +5530,8 @@ class NativePreservingAdapter(PdfEngineAdapter):
         try:
             orig_group_pairs: list[tuple[int, int]] = []
             trans_group_pairs: list[tuple[int, int]] = []
-            for out_idx, p_idx in enumerate(page_indices):
-                if p_idx < 0 or p_idx >= len(orig_doc):
-                    continue
+            valid_pages = [i for i in page_indices if 0 <= i < len(orig_doc)]
+            for out_idx, p_idx in enumerate(valid_pages):
                 orig_page = orig_doc[p_idx]
                 trans_page_idx = p_idx if len(trans_doc) == len(orig_doc) else out_idx
                 w = float(orig_page.rect.width)
@@ -4862,6 +5546,8 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 if 0 <= trans_page_idx < len(trans_doc):
                     new_page.show_pdf_page(right_rect, trans_doc, trans_page_idx)
                     trans_group_pairs.append((trans_page_idx, dual_page_idx))
+                if progress_callback is not None:
+                    progress_callback("exporting", out_idx + 1, len(valid_pages), p_idx)
             _preserve_page_transparency_groups(orig_doc, dual_doc, orig_group_pairs)
             _preserve_page_transparency_groups(trans_doc, dual_doc, trans_group_pairs)
             dual_doc.save(str(temp_dual), garbage=2, deflate=True)
@@ -4883,6 +5569,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
         page_indices: list[int],
         manual_regions: list[ProtectionRegion] | None = None,
         is_roundtrip_only: bool = False,
+        progress_callback: Callable[[int, int, int], None] | None = None,
     ) -> list[PageVisualComparisonReport]:
         if not verify_original_unchanged(document.safe_storage_path, document.sha256_hash):
             raise RuntimeError("Original PDF SHA-256 was altered!")
@@ -4895,45 +5582,52 @@ class NativePreservingAdapter(PdfEngineAdapter):
         for r in manual_regions or []:
             manual_by_page.setdefault(r.page_index, []).append(r)
 
+        src_doc = pymupdf.open(str(document.safe_storage_path))
         out_doc = pymupdf.open(str(output_pdf_path))
         try:
             total_out_pages = len(out_doc)
+            total_pages = len(page_indices)
+
+            for seq_idx, p_idx in enumerate(page_indices):
+                p_blocks = blocks_by_page.get(p_idx, [])
+                p_manual = manual_by_page.get(p_idx, [])
+
+                protected_list: list[tuple[str, list[float]]] = []
+                translated_bboxes: list[list[float]] = []
+
+                for b in p_blocks:
+                    if is_roundtrip_only:
+                        protected_list.append((b.id, b.bbox))
+                    elif b.status in (BlockStatus.PROTECTED_SKIP, BlockStatus.FALLBACK_ORIGINAL) or b.kind in (
+                        BlockKind.ISOLATED_FORMULA,
+                        BlockKind.FIGURE,
+                        BlockKind.TABLE,
+                    ):
+                        protected_list.append((b.id, b.bbox))
+                    elif b.status in (BlockStatus.TRANSLATED, BlockStatus.MANUALLY_EDITED):
+                        translated_bboxes.append(b.bbox)
+
+                for r in p_manual:
+                    if r.mode != ProtectionMode.TRANSLATE_AS_BODY:
+                        protected_list.append((r.id, r.bbox))
+
+                out_page_idx = p_idx if total_out_pages == document.page_count else seq_idx
+                rep = compare_protected_regions_visually(
+                    original_pdf_path=document.safe_storage_path,
+                    output_pdf_path=output_pdf_path,
+                    page_index=p_idx,
+                    protected_regions=protected_list,
+                    translated_bboxes=[] if is_roundtrip_only else translated_bboxes,
+                    output_page_index=out_page_idx,
+                    orig_doc=src_doc,
+                    out_doc=out_doc,
+                )
+                reports.append(rep)
+                if progress_callback is not None:
+                    progress_callback(seq_idx + 1, total_pages, p_idx)
         finally:
             out_doc.close()
-
-        for seq_idx, p_idx in enumerate(page_indices):
-            p_blocks = blocks_by_page.get(p_idx, [])
-            p_manual = manual_by_page.get(p_idx, [])
-
-            protected_list: list[tuple[str, list[float]]] = []
-            translated_bboxes: list[list[float]] = []
-
-            for b in p_blocks:
-                if is_roundtrip_only:
-                    protected_list.append((b.id, b.bbox))
-                elif b.status in (BlockStatus.PROTECTED_SKIP, BlockStatus.FALLBACK_ORIGINAL) or b.kind in (
-                    BlockKind.ISOLATED_FORMULA,
-                    BlockKind.FIGURE,
-                    BlockKind.TABLE,
-                ):
-                    protected_list.append((b.id, b.bbox))
-                elif b.status in (BlockStatus.TRANSLATED, BlockStatus.MANUALLY_EDITED):
-                    translated_bboxes.append(b.bbox)
-
-            for r in p_manual:
-                if r.mode != ProtectionMode.TRANSLATE_AS_BODY:
-                    protected_list.append((r.id, r.bbox))
-
-            out_page_idx = p_idx if total_out_pages == document.page_count else seq_idx
-            rep = compare_protected_regions_visually(
-                original_pdf_path=document.safe_storage_path,
-                output_pdf_path=output_pdf_path,
-                page_index=p_idx,
-                protected_regions=protected_list,
-                translated_bboxes=[] if is_roundtrip_only else translated_bboxes,
-                output_page_index=out_page_idx,
-            )
-            reports.append(rep)
+            src_doc.close()
 
         return reports
 
@@ -5210,12 +5904,14 @@ def _measure_rendered_line_width(
     ja_font: pymupdf.Font | None = None,
     math_font: pymupdf.Font | None = None,
     inline_math_spans: list[InlineMathSpan] | None = None,
+    *,
+    _char_cache: dict[tuple[str, float], tuple[str, pymupdf.Font | None, float]] | None = None,
 ) -> float:
     """Measure the exact rendered horizontal extent of a line matching `_build_styled_line_plan`."""
     if not line_str:
         return 0.0
     if inline_math_spans or ja_font is not None:
-        styled_runs, _, plan_w, _, _ = _build_styled_line_plan(
+        _, _, plan_w, _, _ = _build_styled_line_plan(
             line_str=line_str,
             font_size_pt=font_size_pt,
             ja_font_tag="F_JA",
@@ -5223,12 +5919,9 @@ def _measure_rendered_line_width(
             math_font_tag="F_MATH" if math_font is not None else None,
             math_font=math_font,
             inline_math_spans=inline_math_spans,
+            _char_cache=_char_cache,
         )
-        max_x1 = plan_w
-        for _, r_fobj, r_txt, r_x0, _, r_fs in styled_runs:
-            if r_fobj is not None:
-                max_x1 = max(max_x1, r_x0 + float(r_fobj.text_length(r_txt, fontsize=r_fs)))
-        return max_x1
+        return plan_w
     return sum(
         font_size_pt * 0.56
         if (ord(c) < 128 or (0x1D400 <= ord(c) <= 0x1D7FF))
@@ -5244,6 +5937,8 @@ def wrap_japanese_kinsoku(
     ja_font: pymupdf.Font | None = None,
     math_font: pymupdf.Font | None = None,
     inline_math_spans: list[InlineMathSpan] | None = None,
+    *,
+    _char_cache: dict[tuple[str, float], tuple[str, pymupdf.Font | None, float]] | None = None,
 ) -> list[str]:
     """Wrap mixed Japanese/English/math text into lines respecting `max_width_pt`
     and Kinsoku Shori (prohibited line-start and line-end characters) without
@@ -5253,6 +5948,7 @@ def wrap_japanese_kinsoku(
         return []
     norm_text = normalize_for_pdf_rendering(text)
     lines: list[str] = []
+    char_cache = _char_cache if _char_cache is not None else {}
 
     def _measure_str(s: str) -> float:
         return _measure_rendered_line_width(
@@ -5261,7 +5957,38 @@ def wrap_japanese_kinsoku(
             ja_font=ja_font,
             math_font=math_font,
             inline_math_spans=inline_math_spans,
+            _char_cache=char_cache,
         )
+
+    math_tag = "F_MATH" if math_font is not None else None
+
+    def _measure_token_approx(tok: str) -> float:
+        total = 0.0
+        for ch in tok:
+            key = (ch, font_size_pt)
+            cached = char_cache.get(key)
+            if cached is None:
+                if ja_font is not None:
+                    sel = _select_char_font(ch, "F_JA", ja_font, math_tag, math_font)
+                    tag, fobj = sel if sel is not None else ("F_JA", ja_font)
+                    w = float(fobj.text_length(ch, fontsize=font_size_pt))
+                    cached = (tag, fobj, w)
+                else:
+                    w = (
+                        font_size_pt * 0.56
+                        if (ord(ch) < 128 or (0x1D400 <= ord(ch) <= 0x1D7FF))
+                        else font_size_pt * 1.02
+                    )
+                    cached = ("F_JA", None, w)
+                char_cache[key] = cached
+            total += cached[2]
+        return total
+
+    active_math_ctxs = [
+        m.context_text
+        for m in (inline_math_spans or [])
+        if not m.ambiguous and m.role != "standalone_var" and m.context_text and m.target_text
+    ]
 
     # Tokenize so URLs, space-containing inline math spans (e.g. `𝑃abc i`), radical
     # expressions `√(...)`, or contiguous math sequences stay together without splitting.
@@ -5288,6 +6015,8 @@ def wrap_japanese_kinsoku(
     token_pattern = "|".join(span_ctx_alts + [base_token_pattern]) if span_ctx_alts else base_token_pattern
     tokens = re.findall(token_pattern, norm_text)
     cur_tokens: list[str] = []
+    cur_tok_widths: list[float] = []
+    cur_width = 0.0
 
     for tok in tokens:
         if tok == "\n":
@@ -5295,12 +6024,28 @@ def wrap_japanese_kinsoku(
             if cur_joined:
                 lines.append(cur_joined)
             cur_tokens = []
+            cur_tok_widths = []
+            cur_width = 0.0
             continue
         if not cur_tokens and tok.isspace():
             continue
 
-        cand_line = "".join(cur_tokens) + tok
-        cand_w = _measure_str(cand_line)
+        tok_w = _measure_token_approx(tok)
+        approx_w = cur_width + tok_w
+        if active_math_ctxs:
+            cand_line = "".join(cur_tokens) + tok
+            has_math_hit = any(ctx in cand_line for ctx in active_math_ctxs)
+        else:
+            cand_line = ""
+            has_math_hit = False
+
+        if has_math_hit or approx_w > max_width_pt - 1.0:
+            if not cand_line:
+                cand_line = "".join(cur_tokens) + tok
+            cand_w = _measure_str(cand_line)
+        else:
+            cand_w = approx_w
+
         if cur_tokens and (cand_w > max_width_pt):
             cur_joined = "".join(cur_tokens)
             # Kinsoku line-start check (追い出し without exceeding max_width_pt):
@@ -5315,22 +6060,43 @@ def wrap_japanese_kinsoku(
                     prefix = "".join(cur_tokens[:-1]).rstrip()
                     if prefix and _measure_str(prefix) <= max_width_pt + 1e-3:
                         lines.append(prefix)
-                        cur_tokens = [cur_tokens[-1], tok]
+                        carry_tok = cur_tokens[-1]
+                        carry_w = cur_tok_widths[-1]
+                        cur_tokens = [carry_tok, tok]
+                        cur_tok_widths = [carry_w, tok_w]
+                        cur_width = carry_w + tok_w
                         continue
             # Kinsoku line-end check: if cur_tokens ends with an opening bracket, push it to next line
             if len(cur_tokens) >= 2 and cur_tokens[-1] in KINSOKU_LINE_END_PROHIBITED:
                 carry = cur_tokens[-1]
+                carry_w = cur_tok_widths[-1]
                 prefix = "".join(cur_tokens[:-1]).rstrip()
                 if prefix:
                     lines.append(prefix)
-                cur_tokens = [carry] if tok.isspace() else [carry, tok]
+                if tok.isspace():
+                    cur_tokens = [carry]
+                    cur_tok_widths = [carry_w]
+                    cur_width = carry_w
+                else:
+                    cur_tokens = [carry, tok]
+                    cur_tok_widths = [carry_w, tok_w]
+                    cur_width = carry_w + tok_w
                 continue
 
             if cur_joined.rstrip():
                 lines.append(cur_joined.rstrip())
-            cur_tokens = [] if tok.isspace() else [tok]
+            if tok.isspace():
+                cur_tokens = []
+                cur_tok_widths = []
+                cur_width = 0.0
+            else:
+                cur_tokens = [tok]
+                cur_tok_widths = [tok_w]
+                cur_width = tok_w
         else:
             cur_tokens.append(tok)
+            cur_tok_widths.append(tok_w)
+            cur_width = approx_w
 
     cur_joined = "".join(cur_tokens).rstrip()
     if cur_joined:
@@ -5372,6 +6138,9 @@ def fit_japanese_text_in_bbox(
     if candidate_sizes and candidate_sizes[-1] > min_font_size + 1e-6:
         candidate_sizes.append(min_font_size)
 
+    char_cache: dict[tuple[str, float], tuple[str, pymupdf.Font | None, float]] = {}
+    min_size_lines: list[str] | None = None
+
     for sz in candidate_sizes:
         lines = wrap_japanese_kinsoku(
             text,
@@ -5380,7 +6149,10 @@ def fit_japanese_text_in_bbox(
             ja_font=ja_font,
             math_font=math_font,
             inline_math_spans=inline_math_spans,
+            _char_cache=char_cache,
         )
+        if abs(sz - min_font_size) <= 1e-6:
+            min_size_lines = lines
         line_h = sz * 1.32
         extra_bottom = 0.0
         if lines and inline_math_spans:
@@ -5392,6 +6164,7 @@ def fit_japanese_text_in_bbox(
                 math_font_tag="F_MATH" if math_font is not None else None,
                 math_font=math_font,
                 inline_math_spans=inline_math_spans,
+                _char_cache=char_cache,
             )
             if last_bot_em > 0.25:
                 extra_bottom = (last_bot_em - 0.22) * sz
@@ -5404,6 +6177,7 @@ def fit_japanese_text_in_bbox(
                 ja_font=ja_font,
                 math_font=math_font,
                 inline_math_spans=inline_math_spans,
+                _char_cache=char_cache,
             )
             <= box_w + 1e-3
             for line in lines
@@ -5412,12 +6186,17 @@ def fit_japanese_text_in_bbox(
             return round(sz, 2), lines, True
 
     # Even at min_font_size it overflows vertically or horizontally
-    min_lines = wrap_japanese_kinsoku(
-        text,
-        box_w,
-        min_font_size,
-        ja_font=ja_font,
-        math_font=math_font,
-        inline_math_spans=inline_math_spans,
+    min_lines = (
+        min_size_lines
+        if min_size_lines is not None
+        else wrap_japanese_kinsoku(
+            text,
+            box_w,
+            min_font_size,
+            ja_font=ja_font,
+            math_font=math_font,
+            inline_math_spans=inline_math_spans,
+            _char_cache=char_cache,
+        )
     )
     return round(min_font_size, 2), min_lines, False
