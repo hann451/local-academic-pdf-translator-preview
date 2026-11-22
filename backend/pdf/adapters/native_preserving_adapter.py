@@ -1766,7 +1766,100 @@ def _find_unrenderable_chars(
     return missing
 
 _ISOLATED_FORMULA_LINE_RE = re.compile(
-    r"^\s*(?:[A-Za-zα-ωΑ-Ω0-9_^\(\)\[\]{}+*/.,\s|′″'-]*[=<>≤≥≈≠±∑∏∫∂∇∞∈]+\s*[A-Za-zα-ωΑ-Ω0-9_^\(\)\[\]{}+*/.,\s|′″'-]+)\s*(?:\(\d+(?:\.\d+)*\))?\s*$"
+    r"^\s*(?:[A-Za-zα-ωΑ-Ω\U0001d400-\U0001d7ff0-9_^\(\)\[\]{}+*−×÷·⋅/.,\s|∥′″'ˆ˜~√∗…-]*[=<>≤≥≈≠±∑∏∫∬∭∮∂∇∞∈∉⊂⊆∪∩∀∃≡∝∼≃≅≪≫]+\s*[A-Za-zα-ωΑ-Ω\U0001d400-\U0001d7ff0-9_^\(\)\[\]{}+*−×÷·⋅/.,\s|∥′″'ˆ˜~√∗…-]+)\s*(?:\(\s*\d+(?:\.\d+)*[A-Za-z]?\s*\))?\s*$"
+)
+_DISPLAY_MATH_FUNC_WORDS: frozenset[str] = frozenset(
+    {
+        "mean",
+        "median",
+        "mode",
+        "std",
+        "var",
+        "cov",
+        "corr",
+        "norm",
+        "max",
+        "min",
+        "argmax",
+        "argmin",
+        "sup",
+        "inf",
+        "lim",
+        "exp",
+        "log",
+        "ln",
+        "lg",
+        "sin",
+        "cos",
+        "tan",
+        "cot",
+        "sec",
+        "csc",
+        "sinh",
+        "cosh",
+        "tanh",
+        "arcsin",
+        "arccos",
+        "arctan",
+        "sqrt",
+        "det",
+        "dim",
+        "ker",
+        "rank",
+        "diag",
+        "sgn",
+        "sign",
+        "erf",
+        "prob",
+        "pr",
+        "mse",
+        "mae",
+        "rmse",
+        "bce",
+        "kl",
+        "iou",
+        "softmax",
+        "sigmoid",
+        "relu",
+        "abs",
+        "sum",
+        "prod",
+        "mod",
+        "gcd",
+        "lcm",
+        "trace",
+        "tr",
+        "span",
+        "proj",
+        "grad",
+        "div",
+        "curl",
+        "fft",
+        "ifft",
+        "dft",
+    }
+)
+_MATH_FONT_KEYWORDS: tuple[str, ...] = (
+    "cmmi",
+    "cmsy",
+    "cmex",
+    "math",
+    "symbol",
+    "txsys",
+    "txexs",
+    "txmia",
+)
+_STRONG_MATH_OP_RE = re.compile(
+    r"[=<>≤≥≈≠±∑∏∫∬∭∮∂∇∞∈∉⊂⊆∪∩∀∃≡∝∼≃≅≪≫√+−×÷*/·⋅^_∥]"
+)
+_MATH_ALPHA_SYMBOL_RE = re.compile(r"[α-ωΑ-Ω\U0001d400-\U0001d7ff]")
+_TRAILING_EQ_NUM_RE = re.compile(r"\(\s*\d+(?:\.\d+)*[A-Za-z]?\s*\)\s*$")
+_PROSE_SENTENCE_VERB_RE = re.compile(
+    r"\b(?:where|which|that|when|while|if|then|here|this|these|those|is|are|was|were|be|can|may|will|should|would|could|has|have|had|remains|converges|represents|denotes|defined|identified|exceeds|obtained|follows|shows|indicates|means|expressed|calculated|determined|used|satisfies|propose|demonstrate)\b",
+    re.IGNORECASE,
+)
+_PROSE_LHS_STARTER_RE = re.compile(
+    r"^\s*(?:In|We|The|This|These|Those|If|When|Where|While|Here|Let|As|For|From|Note|Thus|Therefore|However)\b"
 )
 _HEADING_RE = re.compile(
     r"^(?:Abstract|Introduction|Related Work|Background|Method(?:ology|s)?|Experiments?|Experimental Results|Results|Discussion|Conclusion(?:s)?|References|Bibliography|Acknowledgments?|Appendix(?:\s+[A-Z0-9]+)?|\d+(?:\.\d+)*\.?\s+[A-Z][A-Za-z0-9\ufb00-\ufb06\s,:;()'’/–-]{2,75})$"
@@ -1832,6 +1925,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
         page_manual: list[ProtectionRegion],
         cfg: TranslationJobConfig,
         spatial_fraction_equation: bool = False,
+        grouped_display_equation: bool = False,
         token_inventory: DocumentTokenInventory | None = None,
         split_spec_id: str | None = None,
         split_role: BlockSplitRole | None = None,
@@ -1878,6 +1972,13 @@ class NativePreservingAdapter(PdfEngineAdapter):
             semantic_cat = "formula"
             prot_reason = "自動：分数線・上下テキスト・式番号の幾何構造"
             prot_rule_id = "RULE_SPATIAL_FRACTION_EQUATION"
+            prot_conf = "high"
+            is_uncertain = False
+        elif grouped_display_equation and split_role is None:
+            kind = BlockKind.ISOLATED_FORMULA
+            semantic_cat = "formula"
+            prot_reason = "自動：独立数式"
+            prot_rule_id = "RULE_ISOLATED_FORMULA"
             prot_conf = "high"
             is_uncertain = False
 
@@ -1963,6 +2064,40 @@ class NativePreservingAdapter(PdfEngineAdapter):
                     )
         return build_document_token_inventory(doc_line_texts)
 
+    def _prepare_page_raw_blocks(
+        self,
+        raw_blocks: list[dict],
+        drawings: list[dict],
+        *,
+        p_idx: int,
+        page_w: float,
+        page_h: float,
+        body_font_size: float,
+    ) -> tuple[list[dict], list[list[float]], float]:
+        """Run raw-block splitting, prose coalescing, spatial fractions, and formula grouping."""
+        prepared = self._preprocess_page_raw_blocks(
+            raw_blocks,
+            p_idx=p_idx,
+            page_w=page_w,
+        )
+        prepared = self._group_spatial_fraction_equations(prepared, drawings)
+        drawing_boxes = self._cluster_vector_drawings(drawings, page_w, page_h)
+        frontmatter_end_y = (
+            self._find_page1_frontmatter_boundary_y(prepared, page_h, body_font_size)
+            if p_idx == 0
+            else 0.0
+        )
+        prepared = self._group_fragmented_display_equations(
+            prepared,
+            p_idx=p_idx,
+            page_w=page_w,
+            page_h=page_h,
+            body_font_size=body_font_size,
+            frontmatter_end_y=frontmatter_end_y,
+            drawing_boxes=drawing_boxes,
+        )
+        return prepared, drawing_boxes, frontmatter_end_y
+
     def parse_and_extract_blocks(
         self,
         document: Document,
@@ -2003,24 +2138,17 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 page_splits = splits_by_page.get(p_idx, [])
 
                 raw_dict = mpage.get_text("dict")
-                raw_blocks = self._preprocess_page_raw_blocks(
+                drawings = mpage.get_drawings()
+                raw_blocks, drawing_boxes, frontmatter_end_y = self._prepare_page_raw_blocks(
                     raw_dict.get("blocks", []),
+                    drawings,
                     p_idx=p_idx,
                     page_w=page_w,
+                    page_h=page_h,
+                    body_font_size=body_font_size,
                 )
-                drawings = mpage.get_drawings()
-                raw_blocks = self._group_spatial_fraction_equations(raw_blocks, drawings)
 
                 page_candidates: list[Block] = []
-
-                frontmatter_end_y = (
-                    self._find_page1_frontmatter_boundary_y(raw_blocks, page_h, body_font_size)
-                    if p_idx == 0
-                    else 0.0
-                )
-
-                # Extract vector drawing clusters as figure/table protection candidates
-                drawing_boxes = self._cluster_vector_drawings(drawings, page_w, page_h)
                 raw_candidates = build_raw_page_candidates(
                     document_id=document.id,
                     page_index=p_idx,
@@ -2156,6 +2284,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
                         page_manual=page_manual,
                         cfg=cfg,
                         spatial_fraction_equation=bool(b_item.get("_spatial_fraction_equation")),
+                        grouped_display_equation=bool(b_item.get("_grouped_display_equation")),
                         token_inventory=token_inventory,
                     )
                     if blk is not None:
@@ -2242,14 +2371,15 @@ class NativePreservingAdapter(PdfEngineAdapter):
             page_w = float(mpage.cropbox.width)
             page_h = float(mpage.cropbox.height)
             raw_dict = mpage.get_text("dict")
-            raw_blocks = self._preprocess_page_raw_blocks(
+            drawings = mpage.get_drawings()
+            raw_blocks, drawing_boxes, _ = self._prepare_page_raw_blocks(
                 raw_dict.get("blocks", []),
+                drawings,
                 p_idx=page_index,
                 page_w=page_w,
+                page_h=page_h,
+                body_font_size=body_font_size,
             )
-            drawings = mpage.get_drawings()
-            raw_blocks = self._group_spatial_fraction_equations(raw_blocks, drawings)
-            drawing_boxes = self._cluster_vector_drawings(drawings, page_w, page_h)
             candidates = build_raw_page_candidates(
                 document_id=document.id,
                 page_index=page_index,
@@ -2643,7 +2773,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 flags = int(s.get("flags", 0))
                 sizes.append(sz)
 
-                if any(k in font_name for k in ("cmmi", "cmsy", "cmex", "math", "symbol", "txsys", "txexs", "txmia")):
+                if any(k in font_name for k in _MATH_FONT_KEYWORDS):
                     has_math_font = True
                 if (flags & 1) or (sz < max_line_size * 0.78 and len(t.strip()) <= 4):
                     has_sub_super = True
@@ -2655,14 +2785,327 @@ class NativePreservingAdapter(PdfEngineAdapter):
         avg_size = sum(sizes) / len(sizes) if sizes else 10.0
         return text_lines, avg_size, has_math_font, has_sub_super
 
+    @staticmethod
+    def _same_column_for_math(
+        a_bbox: list[float], b_bbox: list[float], page_w: float
+    ) -> bool:
+        mid_x = page_w / 2.0
+        if a_bbox[2] <= mid_x + 12.0 and b_bbox[0] >= mid_x - 12.0:
+            return False
+        if b_bbox[2] <= mid_x + 12.0 and a_bbox[0] >= mid_x - 12.0:
+            return False
+        return True
+
+    @staticmethod
+    def _compute_lines_union_bbox(lines: list[dict]) -> list[float]:
+        boxes = [
+            [float(x) for x in ln["bbox"]]
+            for ln in lines
+            if isinstance(ln.get("bbox"), (list, tuple)) and len(ln["bbox"]) == 4
+        ]
+        if not boxes:
+            return [0.0, 0.0, 0.0, 0.0]
+        return [
+            min(b[0] for b in boxes),
+            min(b[1] for b in boxes),
+            max(b[2] for b in boxes),
+            max(b[3] for b in boxes),
+        ]
+
+    @staticmethod
+    def _is_pure_math_delimiter_block(lines: list[dict]) -> bool:
+        """Return True for raw blocks containing only math-font delimiter glyphs (e.g. CMEX10 brackets)."""
+        if not lines or len(lines) > 2:
+            return False
+        raw_texts: list[str] = []
+        for ln in lines:
+            for sp in ln.get("spans", []):
+                txt = str(sp.get("text", "")).replace("\xa0", " ")
+                if not txt:
+                    continue
+                font_lower = str(sp.get("font", "")).lower()
+                if not any(k in font_lower for k in _MATH_FONT_KEYWORDS):
+                    return False
+                raw_texts.append(txt)
+        if not raw_texts:
+            return False
+        joined = "".join(raw_texts).strip()
+        if not joined:
+            return True
+        return len(joined) <= 3 and not re.search(r"[A-Za-z0-9]", joined)
+
+    @staticmethod
+    def _extract_block_non_func_alpha_words(text: str) -> list[str]:
+        return [
+            w
+            for w in re.findall(r"[A-Za-z]{4,}", text)
+            if w.lower() not in _DISPLAY_MATH_FUNC_WORDS
+        ]
+
+    @staticmethod
+    def _is_labeled_display_equation(
+        stripped: str,
+        line_count: int,
+        has_math_font: bool,
+        has_sub_super: bool,
+    ) -> bool:
+        """Return True for short display equations with descriptive multi-word LHS or math functions."""
+        if not stripped or line_count > 3 or len(stripped) >= 220:
+            return False
+        if (
+            _EMAIL_RE.search(stripped)
+            or _CAPTION_RE.match(stripped)
+            or _HEADING_RE.match(stripped)
+            or _REFERENCE_ITEM_RE.match(stripped)
+        ):
+            return False
+        if re.search(r"[A-Za-z]{2,}\.\s*$", stripped):
+            return False
+        if _PROSE_SENTENCE_VERB_RE.search(stripped):
+            return False
+        rel_m = re.search(r"(?::=|[=≈≤≥≠≡∝])", stripped)
+        if not rel_m:
+            return False
+        lhs = stripped[: rel_m.start()].strip()
+        rhs = stripped[rel_m.end() :].strip()
+        if not lhs or not rhs or _PROSE_LHS_STARTER_RE.match(lhs):
+            return False
+        lhs_words = re.findall(r"[A-Za-z]{2,}", lhs)
+        if len(lhs_words) > 4:
+            return False
+        rhs_body = _TRAILING_EQ_NUM_RE.sub("", rhs).strip()
+        if not rhs_body:
+            return False
+        rhs_long_prose = [
+            w
+            for w in re.findall(r"[A-Za-z]{4,}", rhs_body)
+            if w.lower() not in _DISPLAY_MATH_FUNC_WORDS
+        ]
+        rhs_short_prose = [
+            w
+            for w in re.findall(r"[A-Za-z]{3,}", rhs_body)
+            if w.lower() not in _DISPLAY_MATH_FUNC_WORDS
+        ]
+        if len(rhs_long_prose) > 2 or len(rhs_short_prose) > 3:
+            return False
+        has_math_evidence = (
+            has_math_font
+            or has_sub_super
+            or bool(_TRAILING_EQ_NUM_RE.search(stripped))
+            or bool(_MATH_ALPHA_SYMBOL_RE.search(stripped))
+            or bool(re.search(r"[+−×÷*/∑∏∫√^_∥]", rhs_body))
+        )
+        return has_math_evidence
+
+    def _looks_like_display_equation_candidate(
+        self,
+        text: str,
+        line_count: int,
+        has_math_font: bool,
+        has_sub_super: bool,
+    ) -> bool:
+        """Return True if a short raw block looks like a standalone display equation (not prose)."""
+        stripped = text.strip()
+        if not stripped or line_count > 4 or len(stripped) >= 220:
+            return False
+        if (
+            _EMAIL_RE.search(stripped)
+            or _CAPTION_RE.match(stripped)
+            or _HEADING_RE.match(stripped)
+            or _REFERENCE_ITEM_RE.match(stripped)
+        ):
+            return False
+        if self._is_labeled_display_equation(stripped, line_count, has_math_font, has_sub_super):
+            return True
+        if _PROSE_SENTENCE_VERB_RE.search(stripped):
+            return False
+        non_func_words = self._extract_block_non_func_alpha_words(stripped)
+        if len(non_func_words) > 2:
+            return False
+        if _ISOLATED_FORMULA_LINE_RE.match(stripped):
+            return True
+        if (
+            has_math_font
+            and not re.search(r"[A-Za-z]{2,}\.\s*$", stripped)
+            and (bool(_STRONG_MATH_OP_RE.search(stripped)) or bool(_TRAILING_EQ_NUM_RE.search(stripped)))
+        ):
+            return True
+        return False
+
+    def _split_mixed_math_font_display_block(
+        self, raw_block: dict, page_w: float
+    ) -> list[dict]:
+        """Split a single raw block that mixes prose with a math-font display equation row.
+
+        Leaves plain text/non-math-font fixtures untouched so manual drag-split workflows still apply.
+        """
+        _ = page_w
+        lines = raw_block.get("lines", [])
+        if len(lines) < 2:
+            return [raw_block]
+
+        line_entries: list[dict] = []
+        for ln in lines:
+            lb = ln.get("bbox")
+            spans = ln.get("spans", [])
+            if not lb or len(lb) != 4 or not spans:
+                continue
+            lb_f = [float(v) for v in lb]
+            szs = [float(s.get("size", 10.0)) for s in spans if str(s.get("text", "")).strip()]
+            max_sz = max(szs) if szs else 10.0
+            line_entries.append(
+                {
+                    "line": ln,
+                    "bbox": lb_f,
+                    "mid_y": (lb_f[1] + lb_f[3]) / 2.0,
+                    "max_sz": max_sz,
+                }
+            )
+        if len(line_entries) < 2:
+            return [raw_block]
+
+        # Group primary host lines first, then attach small script/subscript lines vertically close
+        host_entries = [e for e in line_entries if e["max_sz"] > 8.0] or list(line_entries)
+        script_entries = [e for e in line_entries if e not in host_entries]
+        host_entries.sort(key=lambda e: (round(e["mid_y"], 2), round(e["bbox"][0], 2)))
+
+        row_groups: list[list[dict]] = []
+        for e in host_entries:
+            placed = False
+            for grp in row_groups:
+                grp_mid_y = sum(item["mid_y"] for item in grp) / len(grp)
+                grp_max_sz = max(item["max_sz"] for item in grp)
+                if abs(e["mid_y"] - grp_mid_y) <= max(grp_max_sz, e["max_sz"], 8.0) * 0.45:
+                    grp.append(e)
+                    placed = True
+                    break
+            if not placed:
+                row_groups.append([e])
+
+        for sc in script_entries:
+            best_idx = 0
+            best_dist = float("inf")
+            for idx, grp in enumerate(row_groups):
+                grp_mid_y = sum(item["mid_y"] for item in grp) / len(grp)
+                dist = abs(sc["mid_y"] - grp_mid_y)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = idx
+            if best_dist <= 9.0:
+                row_groups[best_idx].append(sc)
+            else:
+                row_groups.append([sc])
+
+        row_groups.sort(
+            key=lambda grp: (
+                round(min(item["bbox"][1] for item in grp), 2),
+                round(min(item["bbox"][0] for item in grp), 2),
+            )
+        )
+
+        rows: list[dict] = []
+        for grp in row_groups:
+            grp_lines = [item["line"] for item in grp]
+            txt_lines, _, has_math_font, has_sub_super = self._extract_lines_and_style(grp_lines)
+            row_text = " ".join(t.strip() for t in txt_lines if t.strip()).strip()
+            if not row_text:
+                continue
+            row_bbox = self._compute_lines_union_bbox(grp_lines)
+            is_eq_num_only = bool(_EQUATION_NUM_ONLY_RE.match(row_text))
+            is_math_eq = has_math_font and self._looks_like_display_equation_candidate(
+                row_text,
+                len(txt_lines),
+                True,
+                has_sub_super,
+            )
+            is_prose = (
+                not is_math_eq
+                and not is_eq_num_only
+                and (
+                    len(re.findall(r"[A-Za-z]{3,}", row_text)) >= 3
+                    or bool(_PROSE_SENTENCE_VERB_RE.search(row_text))
+                )
+            )
+            rows.append(
+                {
+                    "lines": grp_lines,
+                    "bbox": row_bbox,
+                    "text": row_text,
+                    "is_eq_num_only": is_eq_num_only,
+                    "is_math_eq": is_math_eq,
+                    "is_prose": is_prose,
+                }
+            )
+
+        if not any(r["is_prose"] for r in rows):
+            return [raw_block]
+        prose_min_x0 = min(r["bbox"][0] for r in rows if r["is_prose"])
+
+        qualified_eq_indices: set[int] = set()
+        consumed_eq_num_indices: set[int] = set()
+        for idx, r in enumerate(rows):
+            if not r["is_math_eq"]:
+                continue
+            has_inline_num = bool(_TRAILING_EQ_NUM_RE.search(r["text"]))
+            has_next_num = (
+                idx + 1 < len(rows)
+                and rows[idx + 1]["is_eq_num_only"]
+                and rows[idx + 1]["bbox"][0] > prose_min_x0 + 40.0
+                and rows[idx + 1]["bbox"][1] <= r["bbox"][3] + 16.0
+            )
+            is_indented = r["bbox"][0] >= prose_min_x0 + 4.0
+            if has_inline_num or has_next_num or is_indented:
+                qualified_eq_indices.add(idx)
+                if has_next_num:
+                    consumed_eq_num_indices.add(idx + 1)
+
+        if not qualified_eq_indices:
+            return [raw_block]
+
+        sub_blocks: list[dict] = []
+        pending_prose_lines: list[dict] = []
+
+        def _flush_prose() -> None:
+            if not pending_prose_lines:
+                return
+            sub_blocks.append(
+                {
+                    "type": 0,
+                    "bbox": self._compute_lines_union_bbox(pending_prose_lines),
+                    "lines": list(pending_prose_lines),
+                }
+            )
+            pending_prose_lines.clear()
+
+        for idx, r in enumerate(rows):
+            if idx in consumed_eq_num_indices:
+                continue
+            if idx in qualified_eq_indices:
+                _flush_prose()
+                eq_lines = list(r["lines"])
+                if idx + 1 in consumed_eq_num_indices:
+                    eq_lines.extend(rows[idx + 1]["lines"])
+                sub_blocks.append(
+                    {
+                        "type": 0,
+                        "bbox": self._compute_lines_union_bbox(eq_lines),
+                        "lines": eq_lines,
+                    }
+                )
+            else:
+                pending_prose_lines.extend(r["lines"])
+        _flush_prose()
+
+        return sub_blocks if len(sub_blocks) >= 2 else [raw_block]
+
     def _preprocess_page_raw_blocks(
         self, raw_blocks: list[dict], p_idx: int, page_w: float
     ) -> list[dict]:
-        """1. On Page 1 (p_idx == 0), split any single raw block that mixes front-matter lines
-              with an `Abstract` or `Keywords` line at the exact line boundary.
-           2. Across all pages, coalesce vertically overlapping prose blocks that were split
-              by PyMuPDF due to inline prime symbols (`N` + `′′(f)`) or inline fraction
-              denominators (`H = y` + `x.`).
+        """1. Split raw blocks mixing Page 1 front-matter with Abstract/Keywords or mixing
+              math-font display equations with prose rows at the exact row boundary.
+           2. Across all pages, re-attach flush-right equation numbers dropped onto the start
+              of a following prose block, and coalesce vertically overlapping prose blocks
+              split at inline prime/fraction boundaries.
         """
         split_blocks: list[dict] = []
         for b in raw_blocks:
@@ -2685,17 +3128,19 @@ class NativePreservingAdapter(PdfEngineAdapter):
                         sub_lines = lines[s_i:e_i]
                         if not sub_lines:
                             continue
-                        sub_bbox = [
-                            min(float(l["bbox"][0]) for l in sub_lines),
-                            min(float(l["bbox"][1]) for l in sub_lines),
-                            max(float(l["bbox"][2]) for l in sub_lines),
-                            max(float(l["bbox"][3]) for l in sub_lines),
-                        ]
-                        split_blocks.append({"type": 0, "bbox": sub_bbox, "lines": sub_lines})
+                        sub_bbox = self._compute_lines_union_bbox(sub_lines)
+                        split_blocks.extend(
+                            self._split_mixed_math_font_display_block(
+                                {"type": 0, "bbox": sub_bbox, "lines": sub_lines},
+                                page_w=page_w,
+                            )
+                        )
                     continue
-            split_blocks.append(b)
+            split_blocks.extend(
+                self._split_mixed_math_font_display_block(b, page_w=page_w)
+            )
 
-        # Pass 2: Coalesce vertically split prose paragraphs
+        # Pass 2: Attach dropped flush-right equation numbers and coalesce split prose paragraphs
         coalesced: list[dict] = []
         for b in split_blocks:
             if b.get("type", 0) != 0 or not coalesced or coalesced[-1].get("type", 0) != 0:
@@ -2709,7 +3154,9 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 coalesced.append(b)
                 continue
 
-            prev_txt_lines, _, _, _ = self._extract_lines_and_style(prev_lines)
+            prev_txt_lines, _, prev_has_math_font, prev_has_sub_super = (
+                self._extract_lines_and_style(prev_lines)
+            )
             cur_txt_lines, _, _, _ = self._extract_lines_and_style(cur_lines)
             prev_text = " ".join(t.strip() for t in prev_txt_lines if t.strip()).strip()
             cur_text = " ".join(t.strip() for t in cur_txt_lines if t.strip()).strip()
@@ -2719,6 +3166,60 @@ class NativePreservingAdapter(PdfEngineAdapter):
 
             p_bbox = [float(x) for x in prev.get("bbox", [0, 0, 0, 0])]
             c_bbox = [float(x) for x in b.get("bbox", [0, 0, 0, 0])]
+            prev_is_display_eq = self._looks_like_display_equation_candidate(
+                prev_text,
+                len(prev_txt_lines),
+                prev_has_math_font,
+                prev_has_sub_super,
+            )
+            first_cur_line = cur_txt_lines[0].strip() if cur_txt_lines else ""
+            first_cur_is_eq_num = bool(_EQUATION_NUM_ONLY_RE.match(first_cur_line))
+
+            # Case 0a: Leading flush-right equation number `(N)` attached to following prose block
+            if (
+                prev_is_display_eq
+                and not _TRAILING_EQ_NUM_RE.search(prev_text)
+                and first_cur_is_eq_num
+                and len(cur_lines) >= 2
+            ):
+                l0_bbox = [float(x) for x in cur_lines[0].get("bbox", [0, 0, 0, 0])]
+                rest_lines = cur_lines[1:]
+                rest_bbox = self._compute_lines_union_bbox(rest_lines)
+                if (
+                    self._same_column_for_math(p_bbox, l0_bbox, page_w)
+                    and l0_bbox[0] >= p_bbox[0] + max(40.0, (p_bbox[2] - p_bbox[0]) * 0.45)
+                    and l0_bbox[0] <= p_bbox[2] + 95.0
+                    and l0_bbox[0] > rest_bbox[0] + 40.0
+                    and l0_bbox[1] <= p_bbox[3] + 16.0
+                    and l0_bbox[3] >= p_bbox[1] - 4.0
+                ):
+                    prev["lines"] = list(prev_lines) + [cur_lines[0]]
+                    prev["bbox"] = self._compute_lines_union_bbox(prev["lines"])
+                    coalesced.append(
+                        {
+                            **b,
+                            "bbox": rest_bbox,
+                            "lines": rest_lines,
+                        }
+                    )
+                    continue
+
+            # Case 0b: Standalone flush-right equation number `(N)` block following a display equation
+            if (
+                prev_is_display_eq
+                and not _TRAILING_EQ_NUM_RE.search(prev_text)
+                and len(cur_lines) == 1
+                and first_cur_is_eq_num
+                and self._same_column_for_math(p_bbox, c_bbox, page_w)
+                and c_bbox[0] >= p_bbox[0] + max(40.0, (p_bbox[2] - p_bbox[0]) * 0.45)
+                and c_bbox[0] <= p_bbox[2] + 95.0
+                and c_bbox[1] <= p_bbox[3] + 16.0
+                and c_bbox[3] >= p_bbox[1] - 4.0
+            ):
+                prev["lines"] = list(prev_lines) + [cur_lines[0]]
+                prev["bbox"] = self._compute_lines_union_bbox(prev["lines"])
+                continue
+
             y_overlap = min(p_bbox[3], c_bbox[3]) - max(p_bbox[1], c_bbox[1])
             x_overlap = min(p_bbox[2], c_bbox[2]) - max(p_bbox[0], c_bbox[0])
 
@@ -2727,14 +3228,16 @@ class NativePreservingAdapter(PdfEngineAdapter):
 
             # Case A: Prose block split at inline prime/superscript (`N` + `′′(f)` or `N` + `′′ D(f)`)
             if (
-                len(prev_prose_words) >= 4
+                not prev_is_display_eq
+                and not first_cur_is_eq_num
+                and len(prev_prose_words) >= 4
                 and not prev_ends_sentence
                 and y_overlap >= 3.0
                 and x_overlap >= 15.0
                 and re.match(r"^[′″'_^\(\)]", cur_text)
+                and not re.match(r"^\(\s*\d+(?:\.\d+)*[A-Za-z]?\s*\)", cur_text)
             ):
                 # Join prime/sub/superscript directly onto the last line of prev while preserving span objects
-                first_cur_line = cur_txt_lines[0].strip() if cur_txt_lines else ""
                 if (
                     len(cur_txt_lines) >= 2
                     and re.match(r"^[′″']+$", first_cur_line)
@@ -2766,7 +3269,9 @@ class NativePreservingAdapter(PdfEngineAdapter):
 
             # Case B: Prose block with an embedded inline fraction denominator at the end (`H = y` + `x.`)
             if (
-                len(prev_prose_words) >= 4
+                not prev_is_display_eq
+                and not first_cur_is_eq_num
+                and len(prev_prose_words) >= 4
                 and not prev_ends_sentence
                 and len(cur_text) <= 8
                 and (
@@ -2799,6 +3304,222 @@ class NativePreservingAdapter(PdfEngineAdapter):
             coalesced.append(b)
 
         return coalesced
+
+    def _group_fragmented_display_equations(
+        self,
+        raw_blocks: list[dict],
+        *,
+        p_idx: int,
+        page_w: float,
+        page_h: float,
+        body_font_size: float,
+        frontmatter_end_y: float,
+        drawing_boxes: list[list[float]],
+    ) -> list[dict]:
+        """Merge spatially adjacent raw blocks belonging to one multi-part display equation."""
+        if len(raw_blocks) < 2:
+            return raw_blocks
+
+        eligible: dict[int, dict] = {}
+        blocker_boxes: list[list[float]] = [list(d_box) for d_box in drawing_boxes]
+
+        for idx, b in enumerate(raw_blocks):
+            b_box = [float(x) for x in b.get("bbox", [0, 0, 0, 0])]
+            if len(b_box) != 4:
+                continue
+            if b.get("type", 0) != 0 or b.get("_spatial_fraction_equation"):
+                blocker_boxes.append(b_box)
+                continue
+            if b_box[3] < page_h * 0.075 or b_box[1] > page_h * 0.935:
+                blocker_boxes.append(b_box)
+                continue
+            if p_idx == 0 and b_box[1] < frontmatter_end_y - 1.0:
+                blocker_boxes.append(b_box)
+                continue
+            if any(bbox_intersection_ratio(b_box, d_box) >= 0.50 for d_box in drawing_boxes):
+                blocker_boxes.append(b_box)
+                continue
+
+            lines = b.get("lines", [])
+            if self._is_pure_math_delimiter_block(lines):
+                eligible[idx] = {
+                    "idx": idx,
+                    "bbox": b_box,
+                    "tag": "F1",
+                    "has_eq_num": False,
+                }
+                continue
+
+            txt_lines, avg_sz, has_math_font, has_sub_super = self._extract_lines_and_style(lines)
+            full_text = " ".join(t.strip() for t in txt_lines if t.strip()).strip()
+            if (
+                not full_text
+                or _CAPTION_RE.match(full_text)
+                or _HEADING_RE.match(full_text)
+                or _REFERENCE_ITEM_RE.match(full_text)
+                or _EMAIL_RE.search(full_text)
+                or _ABSTRACT_START_RE.match(full_text)
+                or _KEYWORDS_START_RE.match(full_text)
+            ):
+                blocker_boxes.append(b_box)
+                continue
+
+            if _EQUATION_NUM_ONLY_RE.match(full_text):
+                eligible[idx] = {
+                    "idx": idx,
+                    "bbox": b_box,
+                    "tag": "F2",
+                    "has_eq_num": True,
+                }
+                continue
+
+            non_func_words = self._extract_block_non_func_alpha_words(full_text)
+            is_frag = (
+                len(lines) <= 4
+                and len(full_text) < 160
+                and not _PROSE_SENTENCE_VERB_RE.search(full_text)
+                and not re.search(r"[A-Za-z]{2,}\.\s*$", full_text)
+                and (
+                    len(non_func_words) <= 2
+                    or self._is_labeled_display_equation(
+                        full_text, len(txt_lines), has_math_font, has_sub_super
+                    )
+                )
+                and (
+                    has_math_font
+                    or has_sub_super
+                    or bool(_STRONG_MATH_OP_RE.search(full_text))
+                    or bool(_MATH_ALPHA_SYMBOL_RE.search(full_text))
+                    or (
+                        len(full_text) <= 10
+                        and avg_sz <= body_font_size * 0.85
+                        and bool(re.search(r"[0-9A-Za-z]", full_text))
+                    )
+                )
+            )
+            if is_frag:
+                eligible[idx] = {
+                    "idx": idx,
+                    "bbox": b_box,
+                    "tag": "F3",
+                    "has_eq_num": bool(_TRAILING_EQ_NUM_RE.search(full_text)),
+                }
+            else:
+                blocker_boxes.append(b_box)
+
+        if len(eligible) < 2:
+            return raw_blocks
+
+        parent: dict[int, int] = {i: i for i in eligible}
+        comp_has_eq_num: dict[int, bool] = {i: bool(eligible[i]["has_eq_num"]) for i in eligible}
+
+        def _find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def _can_link(idx_a: int, idx_b: int) -> bool:
+            a, b = eligible[idx_a], eligible[idx_b]
+            ba, bb = a["bbox"], b["bbox"]
+            if not self._same_column_for_math(ba, bb, page_w):
+                return False
+
+            v_gap = max(0.0, bb[1] - ba[3], ba[1] - bb[3])
+            y_ov = min(ba[3], bb[3]) - max(ba[1], bb[1])
+            h_gap = max(0.0, bb[0] - ba[2], ba[0] - bb[2])
+            mid_y_diff = abs((ba[1] + ba[3]) / 2.0 - (bb[1] + bb[3]) / 2.0)
+
+            horiz_band_match = (y_ov >= 4.0 or mid_y_diff <= 10.0) and (
+                h_gap <= 32.0
+                or ((a["tag"] == "F2" or b["tag"] == "F2") and h_gap <= 95.0)
+            )
+            stacked_match = v_gap <= 10.0 and h_gap <= 22.0
+            if not (horiz_band_match or stacked_match):
+                return False
+
+            # Reject linking if a non-formula blocker sits vertically between ba and bb
+            if ba[3] < bb[1]:
+                gap_y0, gap_y1 = ba[3], bb[1]
+            elif bb[3] < ba[1]:
+                gap_y0, gap_y1 = bb[3], ba[1]
+            else:
+                gap_y0, gap_y1 = 0.0, 0.0
+            if gap_y1 > gap_y0:
+                pair_x0 = min(ba[0], bb[0])
+                pair_x1 = max(ba[2], bb[2])
+                for nb in blocker_boxes:
+                    nb_x_ov = min(pair_x1, nb[2]) - max(pair_x0, nb[0])
+                    nb_mid_y = (nb[1] + nb[3]) / 2.0
+                    if nb_x_ov > 4.0 and gap_y0 < nb_mid_y < gap_y1:
+                        return False
+            return True
+
+        eligible_indices = sorted(eligible)
+        for pos, idx_a in enumerate(eligible_indices):
+            for idx_b in eligible_indices[pos + 1 :]:
+                ra, rb = _find(idx_a), _find(idx_b)
+                if ra == rb:
+                    continue
+                if comp_has_eq_num[ra] and comp_has_eq_num[rb]:
+                    continue
+                if _can_link(idx_a, idx_b):
+                    parent[rb] = ra
+                    comp_has_eq_num[ra] = comp_has_eq_num[ra] or comp_has_eq_num[rb]
+
+        components: dict[int, list[int]] = {}
+        for idx in eligible_indices:
+            components.setdefault(_find(idx), []).append(idx)
+
+        merged_blocks_by_start: dict[int, dict] = {}
+        absorbed_indices: set[int] = set()
+        for members in components.values():
+            if len(members) < 2:
+                continue
+            if not any(eligible[m]["tag"] == "F3" for m in members):
+                continue
+            member_boxes = [eligible[m]["bbox"] for m in members]
+            union_bbox = [
+                min(bx[0] for bx in member_boxes),
+                min(bx[1] for bx in member_boxes),
+                max(bx[2] for bx in member_boxes),
+                max(bx[3] for bx in member_boxes),
+            ]
+            if union_bbox[3] - union_bbox[1] > 120.0:
+                continue
+            if any(bbox_intersection_ratio(nb, union_bbox) >= 0.15 for nb in blocker_boxes):
+                continue
+
+            combined_lines: list[dict] = []
+            for m in members:
+                combined_lines.extend(raw_blocks[m].get("lines", []))
+            combined_lines.sort(
+                key=lambda ln: (
+                    round(float(ln["bbox"][1]), 1),
+                    round(float(ln["bbox"][0]), 1),
+                )
+            )
+            start_idx = min(members)
+            merged_blocks_by_start[start_idx] = {
+                "type": 0,
+                "bbox": union_bbox,
+                "lines": combined_lines,
+                "_grouped_display_equation": True,
+            }
+            for m in members:
+                if m != start_idx:
+                    absorbed_indices.add(m)
+
+        if not merged_blocks_by_start:
+            return raw_blocks
+
+        result: list[dict] = []
+        for idx, b in enumerate(raw_blocks):
+            if idx in merged_blocks_by_start:
+                result.append(merged_blocks_by_start[idx])
+            elif idx not in absorbed_indices:
+                result.append(b)
+        return result
 
     def _find_page1_frontmatter_boundary_y(
         self, raw_blocks: list[dict], page_h: float, body_font_size: float
@@ -2898,14 +3619,23 @@ class NativePreservingAdapter(PdfEngineAdapter):
             and line_count <= 2
             and avg_font_size <= min(body_font_size - 1.4, body_font_size * 0.86)
         )
+        has_custom_ctrl_glyph = any(ord(c) < 0x20 and c not in "\t\n\r" for c in stripped)
+        is_ctrl_drawing_label = (
+            has_custom_ctrl_glyph
+            and not _CAPTION_RE.match(stripped)
+            and len(stripped) <= 32
+            and line_count == 1
+            and avg_font_size < body_font_size
+        )
         for d_box in drawing_boxes:
             inside_drawing = bbox_intersection_ratio(bbox, d_box) >= 0.65
             near_drawing_label = False
-            if is_small_drawing_label and not inside_drawing:
+            if (is_small_drawing_label or is_ctrl_drawing_label) and not inside_drawing:
                 gap_x = max(0.0, d_box[0] - bbox[2], bbox[0] - d_box[2])
                 gap_y = max(0.0, d_box[1] - bbox[3], bbox[1] - d_box[3])
-                near_drawing_label = (gap_x == 0.0 and gap_y <= 5.0) or (
-                    gap_y == 0.0 and gap_x <= 5.0
+                max_gap = 8.0 if is_ctrl_drawing_label else 5.0
+                near_drawing_label = (gap_x == 0.0 and gap_y <= max_gap) or (
+                    gap_y == 0.0 and gap_x <= max_gap
                 )
             if (inside_drawing and not _CAPTION_RE.match(stripped)) or near_drawing_label:
                 return (
@@ -3059,10 +3789,14 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 )
 
         # 7. Isolated equation check (excluding emails and prose sentences)
+        cleaned_for_math_tokens = re.sub(r"(?<=[A-Za-z])-(?=[A-Za-z])", " ", stripped)
         math_Tokens = len(
-            re.findall(r"[=<>≤≥≈≠±∑∏∫∂∇∞∈∉⊂⊆∪∩∀∃α-ωΑ-Ω_^\(\)\[\]{}+*/|′″'-]", stripped)
+            re.findall(
+                r"[=<>≤≥≈≠±∑∏∫∂∇∞∈∉⊂⊆∪∩∀∃≡∝∼α-ωΑ-Ω\U0001d400-\U0001d7ff_^\(\)\[\]{}+*\-/|∥′″'−×÷·⋅ˆ…∗]",
+                cleaned_for_math_tokens,
+            )
         )
-        alpha_words = re.findall(r"[A-Za-z]{4,}", stripped)
+        non_func_alpha_words = self._extract_block_non_func_alpha_words(stripped)
         prose_clause_words = re.findall(
             r"\b(?:where|which|that|with|from|into|given|by|is|are|can|be|obtained|represents|denotes|follows)\b",
             stripped,
@@ -3079,7 +3813,7 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 in_references_section,
             )
         if (
-            len(alpha_words) <= 2
+            len(non_func_alpha_words) <= 2
             and len(prose_clause_words) < 2
             and not _EMAIL_RE.search(stripped)
             and _ISOLATED_FORMULA_LINE_RE.match(stripped)
@@ -3094,11 +3828,32 @@ class NativePreservingAdapter(PdfEngineAdapter):
                 in_references_section,
             )
 
+        if self._is_labeled_display_equation(
+            stripped, line_count, has_math_font, has_sub_super
+        ):
+            return (
+                BlockKind.ISOLATED_FORMULA,
+                "formula",
+                "自動：独立数式",
+                "RULE_ISOLATED_FORMULA",
+                "high",
+                False,
+                in_references_section,
+            )
+
         # High symbol density check for multi-part display equations (e.g. fractions, integrals, matrices)
+        has_strong_math_cue = (
+            has_math_font
+            or has_sub_super
+            or bool(_STRONG_MATH_OP_RE.search(cleaned_for_math_tokens))
+            or bool(_MATH_ALPHA_SYMBOL_RE.search(stripped))
+            or bool(_TRAILING_EQ_NUM_RE.search(stripped))
+        )
         if (
-            len(alpha_words) <= 2
+            len(non_func_alpha_words) <= 2
             and len(prose_clause_words) < 2
             and not _EMAIL_RE.search(stripped)
+            and has_strong_math_cue
             and (math_Tokens >= max(3, int(len(stripped) * 0.22)) or has_math_font)
             and len(stripped) < 180
         ):
