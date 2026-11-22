@@ -2,134 +2,138 @@
 
 > **名称に関する注記:** 本公開プレビュー版リポジトリの名称は `local-academic-pdf-translator-preview`（基本プロジェクト名: `local-academic-pdf-translator`）です。UI表示、パッケージ名（`paperbridge-local`）、環境変数（`PAPERBRIDGE_*`）、ローカル保存先（`%LOCALAPPDATA%\PaperBridgeLocal`）、認証ヘッダー（`X-PaperBridge-Token`）等に残る `PaperBridge Local` / `PaperBridge` は開発中の内部仮称です。学術論文翻訳・閲覧分野には同名の別プロジェクトが複数存在しますが、本リポジトリとは無関係です（商標・法的安全性の確認は未完了です。[公開向け制約](docs/PUBLIC_LIMITATIONS.md)を参照）。
 
-Windows向けのローカル学術論文PDF翻訳アプリ（**Windows向け・ソース導入型プレビュー版**）です。原本PDFのSHA-256不変性を検査し、数式・図・参照番号の保持、検証失敗の警告、ブラウザー上での確認・手動修正を重視します。PDF.jsを使う4画面のReact UIと、ローカルFastAPIバックエンドを備えます。
+Windows向けの**ローカル完結・数式保護優先の学術論文PDF翻訳アプリ**（ソース導入型プレビュー版）です。原本PDFのSHA-256の不変性を検査し、数式・図・表・参照番号の保持、検証失敗の警告、ブラウザー上での確認・手動修正を重視します。PDF.jsを使う4画面のReact UIとローカルFastAPIバックエンドを備え、国産ローカルLLM「PLaMo 3 Translate」を外部サーバーへPDFを送信せずWindows PC上で完結して動かせます。
 
-## デモ動画（機能紹介・初回セットアップ手順）
+---
 
-### 1. 機能紹介・翻訳＆モデル切替デモ（50秒）
+## デモ GIF
 
-- ワンクリック起動 → PDF プリフライト → **画面2「ドラッグ操作での数式ブロック分割」＆「ブロック単位での翻訳／非翻訳切替」** → **見開き対訳 PDF（数式・レイアウト保持）** → **Web UI からの推論モデル（2B ⇔ 0.8B）自動再起動切替** までの一連の流れを紹介しています。
+> 従来の MP4 動画から軽量 GIF へ変更したため、**スマートフォン版 GitHub（iOS / Android）を含め、スマホ・PC どちらでもそのまま再生**できます。
 
-https://github.com/user-attachments/assets/d06d75cf-016e-472b-b1c4-cb4d64351581
+### 1. 翻訳進行（％・残り時間表示）＆ 刷新 UI デモ
 
+* 36ページの英語論文でも、全体の**進捗率（％）**・処理中のページ数・経過時間・EWMAベースの**予測残り時間（ETA）**・4ステップの進行を一目で確認できます。
 
-### 2. GitHub からの ZIP ダウンロード 〜 初回自動セットアップ手順（40秒）
+![翻訳進行と残り時間表示の刷新UIデモ](https://raw.githubusercontent.com/hann451/local-academic-pdf-translator-preview/docs/qiita-v03-assets/01_hero_new_ui_progress.gif)
 
-- GitHub の **`<> Code` → `Download ZIP`** からの取得 → ZIP 展開 → **`初回セットアップ.bat`** 実行 → 初回自動セットアップ確認画面（モデル選択・ライセンス同意） → ツール＆モデル自動構築完了 → デスクトップからの起動までの手順を解説しています。
+### 2. GitHub からの ZIP ダウンロード 〜 初回自動セットアップ手順
 
-https://github.com/user-attachments/assets/d4449f91-663c-42a6-985a-7f4fa6f71555
+* **`<> Code` → `Download ZIP`** → すべて展開 → **`初回セットアップ.bat`** → モデル選択（既定は軽量な **0.8B**）・利用条件への同意 → ツール＆モデルの自動構築 → デスクトップからの起動まで、コマンド入力なしで完了します。
 
+![ZIP取得から初回セットアップ・起動までの流れ](https://raw.githubusercontent.com/hann451/local-academic-pdf-translator-preview/docs/qiita-v03-assets/08_zip_setup_walkthrough.gif)
 
-## 配布形態と導入方法の位置づけ
+### 3. ショートカット起動時の進捗ウィンドウ
 
-- **配布形態（ソース導入型プレビュー）:** 本リポジトリは開発履歴を含まない公開用ソーススナップショットを提供します。従来の手動セットアップ手順に加え、**ソース ZIP ＋ 初回自動セットアップ方式（試験導入）**を追加しています（古い `v0.1.0-preview.2` タグのアーカイブには自動セットアップ機能は含まれません。新機能を利用する場合は、`main` ブランチまたは本機能を含む新しいリリース版から取得してください）。
-- **非同梱物（別途取得が必要）:** 翻訳モデル本体（PLaMo 3 Translate GGUF）、推論サーバー実行ファイル（`llama.cpp`）、利用者文書（PDF）、およびローカルSQLiteデータベースは同梱していません。**実際の翻訳には、本アプリ（FastAPI + UI）と推論サーバー（`llama-server`）の両方を起動する必要があります。**
-- **制限および未対応範囲の概要:**
-  - 文字レイヤーのないスキャンPDFのOCR、暗号化・破損PDFの翻訳は未対応です。
-  - 段・ページ境界の文脈補助はプロンプトへの近傍文脈付与のみであり、複数ブロックを結合する**連結翻訳（訳文の結合・再配分）は未実装**です。
-  - **本文中のインライン数式・数学用記号の扱い（改善範囲と残存制限）:**
-    - 数学用イタリック・ギリシャ文字・演算子等を含むインライン数式をプレースホルダ（`{v1}` 等）で保護し、計測・描画・埋め込み時のフォールバックフォント（例: Windows の `Cambria` / `Segoe UI Symbol`）と `ToUnicode` 補正により、非ASCII数学記号や補助平面文字（`U+10000`〜`U+10FFFF`、数学用英数字記号 `U+1D400`〜`U+1D7FF` を含む）の文字欠落・文字化け（`.notdef` / 空白化 / サロゲートペア未変換）を軽減しています。
-    - 構造化された上付き・下付き添字、合成アクセント（ハット等）、および根号上線ベクトルなど、検証済みパターンのインライン要素を保持して日本語文と混在組版できます。
-    - 一方で、縦積み分数、数式の途中で複数ブロックに分割され深く重複している段落（`TRANSLATED_BLOCK_OVERLAP_FALLBACK`）、最小フォントサイズ（`8.0pt`）でも元の枠に収まらない狭小・高密度段落（`TYPESETTING_OVERFLOW_FALLBACK`）、同一ブロック内で同一変数表記に上付き・下付き・通常表記等の競合や分割曖昧性がある段落（`AMBIGUOUS_INLINE_MATH_FALLBACK`）、独立した数式ブロックや式番号周辺の一部（`PROTECTED_SKIP` / `PROTECTED_REGION_OVERLAP_FALLBACK`）、および複雑な多段数式や環境依存の特殊グリフは日本語へ再組版できず、元の英語表記を安全に保持（原文フォールバック＋警告記録）するか翻訳対象外となります。すべての数式表現やレイアウトが維持されるわけではありません。
-  - 記録された従来の手動検証例（Windows 11 x64、CPython 3.13.13、uv 0.11.15、Node.js 22.20.0 / npm 10.9.3、AMD Radeon RX 7600、llama.cpp Vulkan版）も 1 つの実機確認例であり、最低ハードウェア要件の確定は未検証です（Python許容範囲は `pyproject.toml` 上 `>=3.12,<3.14`）。詳細は[Windowsセットアップガイド](docs/SETUP_WINDOWS.md)、[公開向け制約](docs/PUBLIC_LIMITATIONS.md)、[公開向け検証状況](docs/VERIFICATION.md)を参照してください。
+* 起動時のGGUF検証をC#の高速スキップで **約 23.9 秒 → 約 0.29 秒（約 82 倍）** に短縮し、**0〜100% の起動進捗ウィンドウ**を追加しました。ショートカットからは約 7.1 秒で起動します。
 
-## モデル選択・導入機能・推論サーバー自動切替（変更概要）
+![起動進捗ウィンドウGIF](https://raw.githubusercontent.com/hann451/local-academic-pdf-translator-preview/docs/qiita-v03-assets/03_startup_progress_window.gif)
 
-翻訳モデルの選択・導入、および Web UI からの推論サーバー自動再起動切替に対応しています。
+---
 
-- カタログ（PLaMo 3 Translate 0.8B / 2B / 8B、Q4_K_M）からの選択、ライセンス確認・同意を伴うダウンロード、ダウンロード済み GGUF のファイル参照登録（再ダウンロード不要）、SHA-256・GGUF 形式・互換性の検証、使用モデルの選択。
-- 選択モデルと稼働中の `llama-server` が一致しない場合は翻訳開始を拒否し、不一致警告バナーを表示します。
-- **Web UI からの推論サーバー自動再起動切替:** 画面1・画面4の不一致警告バナーにある **「このモデルで推論サーバーを再起動して切り替える」** ボタンから、稼働中ジョブがないことを確認のうえ既存の `llama-server.exe` を安全に停止・ポート解放待機し、選択中モデルで再起動して `matched` 状態へ自動で切り替えます（`2B ⇔ 0.8B` の往復切替を分離実機検証済み）。
-- **初回既定モデルは 0.8B（約 0.57 GB）** です（初回ダウンロード容量を抑えて初期構築を高速化）。より高精度な翻訳が必要な場合は導入後に Web UI から **2B（約 1.81 GB・実機検証済み）** へ切り替えられます。**8B はカタログに収録されていますが、実機では未検証**です。
-- **ワンクリック自己アップデート:** 画面4「用語集管理・システム診断」の「ソフトウェア更新」カードから GitHub の最新版を確認し、翻訳ジョブ非実行時にボタン一発でコードを上書き更新・自動再起動できます（`%LOCALAPPDATA%\PaperBridgeLocal` のユーザーデータ・GGUF モデル・`.env`・`uat-artifacts/` は保護されます）。
-- 行末ハイフンの正規化と、高確信度の単文字数式変数の保護（補助警告つき）も追加しています。保護できない変数があるなど、制約があります。
+## 主な特徴と最新アップデートの見どころ
 
-詳細は [モデル選択・導入機能の概要](docs/MODEL_SELECTION.md)、検証記録は [公開向け検証状況](docs/VERIFICATION.md)、制約は [公開向け制約](docs/PUBLIC_LIMITATIONS.md) を参照してください。
+| 改善項目 | 従来 | 最新版 (`main`) |
+| --- | --- | --- |
+| **起動時のモデル検証（GGUF解析）** | 約 14〜24 秒（単体実測 23.9 秒） | **約 0.29 秒（約 82 倍高速化）** |
+| **アプリ起動完了までの時間** | 約 17〜25 秒（無表示） | **約 7.1 秒（0〜100% 進捗ウィンドウ付き）** |
+| **日本語組版の折り返し（650文字段落）** | 12.592 秒 | **0.0145 秒（約 868 倍高速化）** |
+| **視覚保持検証（36ページ論文）** | 6.61 秒 | **2.845 秒（約 2.3 倍高速化）** |
+| **36ページ論文のフォールバック件数** | 592 件 | **22 件（96.3% 削減）** |
+| **特定PDFの1ページ目白紙化** | Edge/Chrome/PDF.js で白紙 | **原本と同等に復元（2,808文字）** |
 
-## 初回自動セットアップについて
+![実機ベンチマーク：速度と出力品質のビフォー／アフター](https://raw.githubusercontent.com/hann451/local-academic-pdf-translator-preview/docs/qiita-v03-assets/02_speedup_benchmark_chart.png)
 
-本機能は、Windows x64向けの試験導入機能です。
+### ① 画面デザインの刷新 ＆ 進捗（％）・予測残り時間（ETA）表示
 
-Python、uv、Node.js、llama.cppなどを利用者が事前に
-個別インストールする必要はありません。
-「初回セットアップ.bat」が、必要な実行環境と依存ライブラリの
-取得・構築を行います。
+* 画面全体をライト基調へ整理し、13ステージの詳細や診断ログを折りたたみドロワーへ収納しました。画面3には進捗状況カードを新設し、進捗（％）・経過時間・予測残り時間・ページ数をリアルタイムで表示します。実行中のPDF重複再取得や `0/36` の張り付きも解消しました。
+
+![UI刷新・進捗表示のビフォー／アフター](https://raw.githubusercontent.com/hann451/local-academic-pdf-translator-preview/docs/qiita-v03-assets/01_ui_before_after.png)
+
+### ② 出力 PDF の品質不具合の修正
+
+* リダクション後に `/Separation /Black`（`/CS1 cs`）直後の `1 scn` / `1 SCN` オペレータが脱落して1ページ目が白紙になっていた問題を、自動復元で解消しました。
+* 独立数式を自動認識するようにし、次段落の先頭へ落ちた式番号 `(4)` / `(6)` によって本文と結合した箇所を自動で分離し、複数パートに分断された数式も1ブロックへ統合しました（手動分割も併用できます）。
+* ACM系数式の文字化け（`☒`）・表・ランニングヘッダ保護: `txex` / `txsy` / `rtxmi` 等の数学フォント対応・制御文字の除外・`underbrace` の一括保護に加え、格子表・Booktabs表の `TABLE` 自動保護と `46:3` 形式のヘッダ保護で誤翻訳フォールバックを大幅に削減しました。
+
+<details>
+<summary>出力PDF修正のビフォー／アフター画像を見る（1ページ目白紙化・ACM数式文字化け・式番号自動分離）</summary>
+
+![1ページ目白紙化修正のビフォー／アフター](https://raw.githubusercontent.com/hann451/local-academic-pdf-translator-preview/docs/qiita-v03-assets/04_pdf_fix_page1_blank_before_after.png)
+
+![ヘッダ・ACM数式文字化け修正のビフォー／アフター](https://raw.githubusercontent.com/hann451/local-academic-pdf-translator-preview/docs/qiita-v03-assets/05_pdf_fix_math_header_before_after.png)
+
+![式番号落下による数式＋本文結合の自動分離](https://raw.githubusercontent.com/hann451/local-academic-pdf-translator-preview/docs/qiita-v03-assets/06_math_separation_before_after.png)
+
+</details>
+
+### ③ モデル選択・推論サーバー自動切替 ＆ ワンクリック自己アップデート
+
+* **初回既定モデルは 0.8B（約 0.57 GB）** で初期構築が高速です。高精度な翻訳が必要な場合は、導入後に Web UI（PLaMo 3 Translate 0.8B / 2B / 8B カタログ）から **2B（約 1.81 GB・実機検証済み）** 等へワンクリックで自動再起動して切り替えられます（**8B はカタログに収録していますが、実機では未検証です**）。
+* 選択したモデルと稼働中の `llama-server` が一致しない場合、本アプリは翻訳の開始を拒否します。不一致警告バナーから稼働中ジョブがないことを確認して再起動・切替できます。
+* 画面4「用語集・診断」の **「ソフトウェア更新」** から GitHub 最新版を取得し、進捗ウィンドウを表示しながら自己アップデート・自動再起動できます（`%LOCALAPPDATA%\PaperBridgeLocal` のユーザーデータ・GGUF モデル・`.env`・`uat-artifacts/` は保護されます）。
+
+詳細は [モデル選択・導入機能の概要](docs/MODEL_SELECTION.md) を参照してください。
+
+### ④ レイアウト・数式崩れを防ぐ 4 つの自動回帰検証指標
+
+* ジョブごとに `report.json` および専用 CLI（`scripts/check_layout_regression.py`）で「数式ブロック数一致・桁区切り/単位保持・欄順単調性・非翻訳ブロック座標維持」の4指標を自動検査できます。
+
+![4つの機械的回帰検証指標図解](https://raw.githubusercontent.com/hann451/local-academic-pdf-translator-preview/docs/qiita-v03-assets/07_four_regression_metrics_diagram.png)
+
+---
+
+## かんたん導入方法
+
+Windows 環境では自動セットアップによる導入を推奨しています。Python、uv、Node.js、llama.cpp などを利用者が事前に個別インストールする必要はありません。`初回セットアップ.bat` が必要な実行環境と依存ライブラリの取得・構築をすべて行います。
 
 ### 使い方
 
-1. 自動セットアップ機能を含む版のソースZIPをダウンロードする。
-2. ZIPをすべて展開する。
-3. 「初回セットアップ.bat」をダブルクリックする。
-4. 取得内容と利用条件を確認し、モデルの準備方法を選んで開始する。
-5. 完了後は、デスクトップの「PaperBridge Local」から起動する。
+1. リポジトリの [ダウンロードリンク（ZIP）](https://github.com/hann451/local-academic-pdf-translator-preview/archive/refs/heads/main.zip) から最新版 ZIP をダウンロードします（`<> Code` → `Download ZIP`）。
+2. ZIP ファイルを右クリックして **「すべて展開」** で通常使うフォルダーに展開します。ZIP内から直接実行せず、必ず展開してから利用してください。また、セットアップ後の移動は避けてください。
+3. 展開先フォルダーにある **`初回セットアップ.bat`** をダブルクリックします。
+4. 取得内容と利用条件（`PLaMo` ライセンス）を確認し、同意したうえで「同意して開始」を押します（既定は軽量な 0.8B モデルです）。
+5. 完了後、デスクトップの **`PaperBridge Local`** から起動します。
 
-ZIP内から直接実行せず、必ず展開してから使用してください。
-展開先は通常利用する場所に決め、セットアップ後の移動は避けてください。
+> **すでに旧バージョンをご利用の場合:** 画面4の「ソフトウェア更新」から更新できます（ただし更新機能修正（PR #9）より前に取得した旧版では Windows 上で更新プロセスが起動しない不具合があったため、初回のみ最新版 ZIP の上書き展開または `git pull origin main` で手動更新してください。取り込み後は進捗ウィンドウ付きのワンクリック更新を利用できます）。
 
 ### 必要な環境・通信
 
-- 対象はWindows x64です。すべてのWindows・CPU・GPU構成での
-  動作を保証するものではありません。
-- 初回セットアップにはインターネット接続が必要です。
-- 既定の 0.8B モデル（約 0.57 GB）を新規取得する場合、通信量の目安は合計約 0.8〜0.9 GB です。
-  選択モデル（0.8B 約0.57GB / 2B 約1.81GB / 8B 約5.28GB）や既存GGUFの参照登録、パッケージ更新や再試行などにより変動します。
-- 空き容量は5GB以上を目安にしてください。
-  利用するPDFや成果物に応じて追加容量が必要です。
-- GPUが利用できない場合に備えてCPUモードを用意しています。
-  CPUでの翻訳は時間がかかる場合があります。
+* 対象は **Windows x64** です（すべての Windows・CPU・GPU 構成での動作を保証するものではありません）。
+* 初回セットアップにはインターネット接続が必要です。
+* 既定の 0.8B モデル（約 0.57 GB）を新規取得する場合、通信量の目安は合計約 0.8〜0.9 GB です（0.8B 約0.57GB / 2B 約1.81GB / 8B 約5.28GB といったモデルや、既存GGUFの参照登録などにより変動します）。
+* 空き容量は **5GB 以上** を目安にしてください（利用するPDFや成果物に応じて追加容量が必要です）。
+* GPU が利用できない場合に備えて **CPUモード（`CPUモードで起動.bat`）** を用意しています（CPUでの翻訳は時間がかかる場合があります）。
 
-### 既存のPython環境について
+### 既存 Python 環境の保護とトラブル時の対応
 
-アプリ用の実行環境と仮想環境を使用し、
-既存のPythonや他プロジェクトのライブラリを変更しない設計です。
-PC全体のPATH変更やPythonのレジストリ登録は行わない設計ですが、
-Condaや独自の環境変数を含むすべての既存環境との組み合わせを
-検証したものではありません。
+* アプリ用の実行環境と仮想環境を使用し、既存のシステム Python や他プロジェクトのライブラリ、環境変数 PATH、レジストリは変更しない設計です（ただしすべての既存環境との組み合わせを検証したものではありません。既存 PaperBridge を併用する場合は初回設定でデータ保存先とアイコン名を分けてください）。
+* SmartScreen、ウイルス対策、企業プロキシ/TLS検査等により実行・取得できない場合があります（セキュリティ機能や認証を無効化して回避しないでください）。
+* ポート `8000`・`8080` が使用中の場合は起動を中断します（無関係なプロセスを強制終了しないでください）。
+* 起動できない場合は **`起動診断用コンソール.bat`** を使用してください。ログを提出する際はユーザー名・ファイルパス等を確認してマスキングし、認証トークンや個人PDFを公開Issueへ投稿しないでください。
 
-既存のPaperBridgeを利用している場合は、初回設定で
-データ保存先とデスクトップアイコン名を分けてください。
+詳細は [Windowsセットアップガイド](docs/SETUP_WINDOWS.md) を参照してください。
 
-### 制限とトラブル時の対応
+---
 
-- SmartScreen、ウイルス対策、組織の実行制限、
-  プロキシやTLS検査などにより実行・取得できない場合があります。
-- セキュリティ機能や認証を無効化して回避しないでください。
-- ポート8000・8080が使用中の場合は起動を中断します。
-  無関係なプロセスを終了しないでください。
-- 起動できない場合は「起動診断用コンソール.bat」を使用してください。
-- ログにはユーザー名・ファイルパスなどが含まれる場合があります。
-  提出前に確認・マスキングし、認証トークンや個人PDFを
-  公開Issueへ投稿しないでください。
+## 配布形態・制限および未対応範囲の概要
 
-### 検証状況
+* 配布形態（ソース導入型プレビュー）: 本リポジトリは公開用ソーススナップショットを提供します（古い `v0.1.0-preview.2` タグのアーカイブには自動セットアップ機能は含まれません）。
+* 非同梱物（別途取得が必要）: 翻訳モデル本体（PLaMo 3 Translate GGUF）、推論サーバー実行ファイル（`llama.cpp`）、利用者文書（PDF）、およびローカル SQLite データベースは同梱していません。**実際の翻訳には本アプリ（FastAPI + UI）と推論サーバー（`llama-server`）の両方を起動する必要があります。**
+* 制限および未対応範囲:
+  * 文字レイヤーのないスキャン PDF の OCR、暗号化・破損 PDF の翻訳は未対応です。
+  * 段・ページ境界の文脈補助はプロンプトへ近傍文脈を付与するのみであり、複数ブロックを結合する**連結翻訳（訳文の結合・再配分）は未実装**です。
+  * インライン数式・数学記号の扱い: 数学用イタリック・ギリシャ文字・補助平面文字（`U+1D400`〜`U+1D7FF` 等）を `{v1}` 等で保護し、Windows の `Cambria` / `Segoe UI Symbol` 等のフォールバックと `ToUnicode` 補正で混在組版できます。一方、縦積み分数、分割重複ブロック（`TRANSLATED_BLOCK_OVERLAP_FALLBACK`）、狭小・高密度段落（`TYPESETTING_OVERFLOW_FALLBACK`）、曖昧な同一変数競合（`AMBIGUOUS_INLINE_MATH_FALLBACK`）、独立数式や式番号周辺（`PROTECTED_SKIP`）、複雑な多段数式等は原文保持（フォールバック＋警告）または翻訳対象外となり、すべての数式やレイアウトの保持は保証されません。
+* 検証状況: 開発環境および手動環境（Windows 11 x64、Python 3.13、AMD Radeon RX 7600、llama.cpp Vulkan版等）での検証実績に基づいていますが、未検証環境での動作は保証しません。詳細は [公開向け検証状況](docs/VERIFICATION.md) と [公開向け制約](docs/PUBLIC_LIMITATIONS.md) を参照してください。
 
-開発環境内での自動セットアップ、GPU・CPUによる実翻訳、
-PDF出力、通常終了を確認しています。
-作者による手動操作でも正常動作の報告があります。
+---
 
-ただし、開発ツール未導入の別Windows PC、すべてのGUI操作、
-モデルの全量ネットワーク取得、GPU失敗時の自動CPU切り替えなどは、
-実施済みの範囲を検証記録で確認してください。
-未検証の構成での動作は保証しません。
+## 開発者・手動セットアップ手順
 
-### ライセンスと成果物
-
-本体のAGPL-3.0-onlyと、PLaMoモデルの利用条件は別です。
-モデル取得前に公式の利用条件を確認してください。
-また、元PDFの翻訳・配布・公表に必要な許諾は利用者が確認してください。
-
-数式・図表・レイアウト・翻訳内容の完全な保持や正確性は保証しません。
-原本を保存し、出力PDFを目視確認してください。
-
-バッチ一覧・ログ確認先などの詳細は [Windowsセットアップガイド](docs/SETUP_WINDOWS.md) を参照してください。
-
-## 従来の手動セットアップ手順（Windowsで始める）
-
-詳細な前提条件、モデル・推論バイナリの配置、フォント、エラー対処は[Windowsセットアップガイド](docs/SETUP_WINDOWS.md)を参照してください。
+Windows で Git クローンから手動でセットアップする手順です。詳細な前提条件・推論サーバー単体起動コマンド・フォント設定は [Windowsセットアップガイド](docs/SETUP_WINDOWS.md) を参照してください。
 
 ### 1. 前提ツールの確認
 
-PowerShellを開き、[Git](https://git-scm.com/download/win)、[Python 3.13（または3.12）](https://www.python.org/downloads/windows/)、[uv](https://docs.astral.sh/uv/getting-started/installation/)、[Node.js / npm](https://nodejs.org/en/download/) が利用できることを確認します。
+PowerShell で [Git](https://git-scm.com/download/win)、[Python 3.13（または3.12）](https://www.python.org/downloads/windows/)、[uv](https://docs.astral.sh/uv/getting-started/installation/)、[Node.js / npm](https://nodejs.org/en/download/) が使えることを確認します。
 
 ```powershell
 git --version
@@ -139,23 +143,13 @@ node --version
 npm --version
 ```
 
-### 2. ソースコードの取得
-
-空の作業用ディレクトリへクローンして移動します（リポジトリがPrivateの間は読み取り権限のあるアカウントでのGitHub認証が必要です。認証情報をURLやコマンドへ埋め込まないでください）。
+### 2. クローンとロックファイルによる依存導入・ビルド
 
 ```powershell
 git clone --branch main --single-branch https://github.com/hann451/local-academic-pdf-translator-preview.git PaperBridgeLocal
 Set-Location .\PaperBridgeLocal
 git rev-parse HEAD
-```
 
-（※本リポジトリは公開用スナップショットであり、開発用Privateリポジトリの過去コミット履歴は含みません。開発版での検証履歴は[公開向け検証状況](docs/VERIFICATION.md)を参照してください。）
-
-### 3. ロックファイルによる依存導入とUIビルド
-
-検証済みのPython版（例: `3.13`）とロックファイル（`uv.lock` / `frontend/package-lock.json`）を使ってPython仮想環境とフロントエンドをビルドします（初回はパッケージ取得のためインターネット通信が発生し得ます）。
-
-```powershell
 uv sync --python 3.13 --locked --extra dev
 Push-Location .\frontend
 npm ci
@@ -163,51 +157,40 @@ npm run build
 Pop-Location
 ```
 
-`npm run build` により `frontend\dist\index.html` と静的アセットが生成され、FastAPIからUIを配信できるようになります。
+### 3. 推論サーバーとアプリ本体の起動・接続確認
 
-### 4. 推論サーバーとモデルの起動（実機翻訳を行う場合）
-
-実機翻訳を行うには、本アプリとは別プロセスで `llama-server.exe`（既定 `127.0.0.1:8000`）と、選択したモデルの GGUF（初回既定は `plamo-3-translate-0.8b-Q4_K_M.gguf`、高精度推奨は `plamo-3-translate-2b-Q4_K_M.gguf`）を起動しておく必要があります。モデルの選択・導入・既存 GGUF の登録は[モデル選択・導入機能の概要](docs/MODEL_SELECTION.md)を参照してください（ランチャー経由で起動している場合、Web UI 上で別モデルへ切り替えた際は画面1・画面4の不一致警告バナーにある「このモデルで推論サーバーを再起動して切り替える」ボタンから推論サーバーを再起動・自動一致できます）。取得元・配置パス・GPU/CPU別の起動コマンドは[Windowsセットアップガイドの「7. 実機モデルと推論サーバー」節](docs/SETUP_WINDOWS.md)を参照し、**推論サーバー用ターミナル（ターミナル1）** で起動したままにしてください（実行ファイルとモデル本体はGitに含めないでください）。
-
-### 5. アプリ本体の起動とブラウザー接続
-
-プロジェクトルートで **アプリ用ターミナル（ターミナル2）** を開き、次を起動します（起動中はターミナルを開いたままにします）。
+1. ターミナル1（推論サーバー）: [Windowsセットアップガイドの「7. 実機モデルと推論サーバー」節](docs/SETUP_WINDOWS.md) を参照し `llama-server.exe`（既定 `127.0.0.1:8000`）を起動したままにします。
+2. ターミナル2（アプリ本体）: 次を実行し、ブラウザーで **[http://127.0.0.1:8080/](http://127.0.0.1:8080/)** を開きます（`Origin` 制約により原則 `127.0.0.1:8080` を使用してください）。
 
 ```powershell
 uv run uvicorn backend.api.app:app --host 127.0.0.1 --port 8080
 ```
 
-ブラウザーで推奨URL **<http://127.0.0.1:8080/>** を開きます。
-- **ブラウザー推奨URLとOrigin制約:** バックエンドの `allowed_origins` は既定で `http://127.0.0.1:8080`、`http://localhost:8080`、`http://127.0.0.1:5173`、`http://localhost:5173` のみを許可しています。Uvicornの `--port` 引数だけを別ポートへ変更してブラウザーから開くと、初期画面表示（`GET`）は通っても、ジョブ開始等の `POST` / `PUT` / `DELETE` が `Origin` 検証で拒否（HTTP `403`）され得ます。ブラウザーからは原則 `http://127.0.0.1:8080/` を使用してください。
+* 疎通確認 / 中断再開: 画面4の「🔌 推論サーバ疎通確認 (`probe_llama=true`)」で疎通を確認できます。推論サーバーが未起動のまま開始して中断（`interrupted`）した場合は、推論サーバー起動後に画面3「▶ 中断箇所からジョブを再開 (Resume)」で再開できます。
+* モック推論（実翻訳ではありません）: モデル未導入でUIや組版動作のみ試す場合は画面1で「モック推論」を明示的に選択してください（`is_mock_translation: true` が記録されます）。
+* 停止・保護: 各ターミナルで `Ctrl+C` により停止してください。`Stop-Process -Name python,llama-server` による一括終了や `%LOCALAPPDATA%\PaperBridgeLocal` の無断削除は行わないでください。
 
-### 6. モデル未接続時の対処とモック試用の区別
-
-- **疎通確認（翻訳リクエスト非送信）:** ブラウザーで画面が開くことと、推論サーバーが接続されていることは別です。推論サーバーの接続状態は、画面4「用語集管理・システム診断」の **「🔌 推論サーバ疎通確認 (`probe_llama=true`)」** ボタンで確認できます。この確認は `GET /v1/models` の軽量確認のみを行い、接続確認のために翻訳リクエストは送信しません。
-- **未接続のまま開始した場合の対処:** 画面1の初期選択は「実機推論」です。推論サーバー未起動のまま開始すると、接続エラーにより画面3でジョブが中断（`interrupted`）状態になります。その場合は別ターミナルで推論サーバーを起動し、画面4で疎通確認後に画面3の **「▶ 中断箇所からジョブを再開 (Resume)」** を押してください。
-- **モック推論（実翻訳ではありません）:** モデル未導入の環境でUIの画面遷移やレイアウト処理だけを試す場合は、画面1の「推論エンジン」で **「モック推論」** を明示選択してから開始してください。モックはテスト用の決定論的な疑似翻訳であり、PLaMoによる実翻訳や翻訳品質の確認には使えません（成果物にも `is_mock_translation: true` が記録されます）。
-
-### 7. 通常の停止方法と安全な扱い
-
-- **通常の停止方法:** アプリ（`127.0.0.1:8080`）や推論サーバー（`127.0.0.1:8000`）を終了するときは、**それぞれを起動したターミナルで `Ctrl+C` を押して停止**してください。停止したサーバーは自動では再起動しません。
-- **既存プロセス・利用者DBの保護:** `Stop-Process -Name python,llama-server` などの名前指定でプロセスを一括強制終了しないでください（他の用途で稼働中のプロセスを巻き込む恐れがあります）。また、ローカル保存先（`%LOCALAPPDATA%\PaperBridgeLocal`）内の利用者データベースや過去ジョブ成果物を無断で削除しないでください。
+---
 
 ## ライセンスとモデル利用条件（Built with PLaMo）
 
-- **Built with PLaMo / 想定モデル:** 本ツールは翻訳モデルとして **PLaMo 3 Translate**（既定・推奨の 2B の公式配布元: [pfnet/plamo-3-translate-2b-GGUF](https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF)。0.8B・8B もカタログに収録）の使用を想定して設計されています（**Built with PLaMo**）。本ツールは Preferred Networks（PFN）の公式製品ではありません。
-- **ソースコードと直接依存:** アプリ本体の自作部分は [GNU AGPL version 3](LICENSE)（SPDX: `AGPL-3.0-only`）でライセンスします。適用範囲と著作権表示は [COPYRIGHT.md](COPYRIGHT.md)、直接依存パッケージの通知は [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) を参照してください。
-- **モデルの非同梱・独立したライセンスと契約条件の遵守（PLaMo 3 Translate）:** 本リポジトリは **PLaMo 3 Translate** モデル本体・派生モデル・翻訳生成物を同梱・再配布しません。ツール本体（`AGPL-3.0-only`）とモデルのライセンスは別であり、**PLaMo 3 Translate** にはPreferred Networks（PFN）が定める **PLaMoコミュニティライセンス契約**（公式条文URL: [日本語版](https://plamo.preferredai.jp/info/plamo-community-license-ja) / [英語版](https://plamo.preferredai.jp/info/plamo-community-license-en)）が別途適用されます。モデル非同梱であっても、利用者は公式リンク等で案内されるモデルの契約条件を確認・遵守する必要があります（`Built with PLaMo` の表示場所については、READMEやUIへの記載で足りる旨の回答に基づき、本READMEおよびアプリ画面1・画面4に記載しています。リンクは利用者がクリックしたときのみ開き、起動時に自動通信しません）。なお、以下は **PLaMo 3 Translate** に関して2026年11月9日改定のPLaMoコミュニティライセンス契約に基づきPFNから受領した回答要旨を反映した案内であり、公開条文ページの再照合記録や、過去のモデル取得時点（2026-11-06、revision `232fbd7916519edecddfdae0beae7e76fe70453f`）および改定前（2026-11-07 / 2026-11-08）の条文確認記録とは区別します（利用者は自身のモデル取得・利用時点における公式条文を確認してください）。
-- **PLaMo 3 Translate による翻訳PDFの提供・公表に関する条件と注意事項（PFN回答に基づく案内）:**
-  - **翻訳PDFの提供・公表と長文公表物の例外:** 書籍・論文などの独立した長文公表物に関する場合を除き、通常の翻訳PDFの提供・公表には、一律の出自表示や契約コピー・説明ファイルの添付は不要です。**ただし、書籍・論文などの独立した長文公表物の全部または実質的部分として公表する場合は、PLaMoを翻訳に利用した旨の明示が必要です。** この明示はPDFとは別のファイルではなく**PDF内に含める必要があり、PDF末尾の説明ページでも対応可能**です。本ツールは出力PDFへ説明ページや出自表示を自動追加しないため、該当する公表を行う場合は利用者自身でPDF内に明示を含めてください。
-  - **商用利用条件・原著作物の著作権との区別:** 商用・非商用の区分や生成物を用いたモデル学習等の条件は公式条文に従ってください。なお、モデルのライセンスおよびPFNの回答は **PLaMo 3 Translate** とその生成物の利用条件に関するものであり、**翻訳元となる原著作物（元の論文・書籍等）の翻訳・配布・公表に関する著作権上の許諾まで与えるものではありません**（詳細は[公開向け制約](docs/PUBLIC_LIMITATIONS.md)を参照）。
+* Built with PLaMo / 想定モデル: 本ツールは翻訳モデルとして **PLaMo 3 Translate**（初回既定は軽量な 0.8B、高精度推奨の 2B の公式配布元: [pfnet/plamo-3-translate-2b-GGUF](https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF)、8B もカタログ収録）の使用を想定して設計されています（**Built with PLaMo**）。本ツールは Preferred Networks（PFN）の公式製品ではありません。
+* ソースコードと直接依存: アプリ本体の自作部分は [GNU AGPL version 3](LICENSE)（SPDX: `AGPL-3.0-only`）でライセンスします。適用範囲と著作権表示は [COPYRIGHT.md](COPYRIGHT.md)、直接依存パッケージの通知は [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) を参照してください。
+* モデルの非同梱・独立したライセンスと契約条件の遵守（PLaMo 3 Translate）: 本リポジトリは **PLaMo 3 Translate** モデル本体・派生モデル・翻訳生成物を同梱・再配布しません。ツール本体（`AGPL-3.0-only`）とモデルのライセンスは別であり、**PLaMo 3 Translate** には Preferred Networks（PFN）が定める **PLaMoコミュニティライセンス契約**（公式条文URL: [日本語版](https://plamo.preferredai.jp/info/plamo-community-license-ja) / [英語版](https://plamo.preferredai.jp/info/plamo-community-license-en)）が別途適用されます。モデルを同梱していなくても、利用者は公式リンク等で案内されるモデルの契約条件を確認・遵守する必要があります（`Built with PLaMo` の表示場所については、READMEやUIへの記載で足りる旨の回答に基づき、本READMEおよびアプリ画面1・画面4に記載しています。リンクは利用者がクリックしたときのみ開き、起動時に自動通信しません）。なお、以下は **PLaMo 3 Translate** に関して2026年11月9日改定のPLaMoコミュニティライセンス契約に基づきPFNから受領した回答要旨を反映した案内であり、公開条文ページの再照合記録や、過去のモデル取得時点（2026-11-06、revision `232fbd7916519edecddfdae0beae7e76fe70453f`）および改定前（2026-11-07 / 2026-11-08）の条文確認記録とは区別します（利用者は自身のモデル取得・利用時点における公式条文を確認してください）。
+* PLaMo 3 Translate による翻訳PDFの提供・公表に関する条件と注意事項（PFN回答に基づく案内）:
+  * 翻訳PDFの提供・公表と長文公表物の例外: 書籍・論文などの独立した長文公表物に関する場合を除き、通常の翻訳PDFの提供・公表には、一律の出自表示や契約コピー・説明ファイルの添付は不要です。**ただし、書籍・論文などの独立した長文公表物の全部または実質的部分として公表する場合は、PLaMoを翻訳に利用した旨の明示が必要です。** この明示はPDFとは別のファイルではなく**PDF内に含める必要があり、PDF末尾の説明ページでも対応できます**。本ツールは出力PDFへ説明ページや出自表示を自動追加しないため、該当する公表を行う場合は利用者自身でPDF内に明示を含めてください。
+  * 商用利用条件・原著作物の著作権との区別: 商用・非商用の区分や生成物を用いたモデル学習等の条件は公式条文に従ってください。なお、モデルのライセンスおよびPFNの回答は **PLaMo 3 Translate** とその生成物の利用条件に関するものであり、**翻訳元となる原著作物（元の論文・書籍等）の翻訳・配布・公表に関する著作権上の許諾まで与えるものではありません**（詳細は[公開向け制約](docs/PUBLIC_LIMITATIONS.md)を参照）。
+
+---
 
 ## ドキュメント
 
-- [Windows環境セットアップ手順](docs/SETUP_WINDOWS.md)
-- [モデル選択・導入機能の概要](docs/MODEL_SELECTION.md)
-- [全体仕様書](docs/SPEC.md)
-- [アーキテクチャ設計](docs/ARCHITECTURE.md)
-- [API契約・座標・認証仕様書](docs/API_CONTRACT.md)
-- [公開向け検証状況](docs/VERIFICATION.md)
-- [公開向け制約](docs/PUBLIC_LIMITATIONS.md)
-- [第三者ライセンス通知](THIRD_PARTY_NOTICES.md)
-- ADR: [PDFエンジン](docs/adr/0001-pdf-engine-selection.md)、[PLaMo推論](docs/adr/0002-plamo-inference-and-pfml3.md)、[数式保護](docs/adr/0003-formula-preservation-and-validation.md)
+* [Windows環境セットアップ手順](docs/SETUP_WINDOWS.md)
+* [モデル選択・導入機能の概要](docs/MODEL_SELECTION.md)
+* [全体仕様書](docs/SPEC.md)
+* [アーキテクチャ設計](docs/ARCHITECTURE.md)
+* [API契約・座標・認証仕様書](docs/API_CONTRACT.md)
+* [公開向け検証状況](docs/VERIFICATION.md)
+* [公開向け制約](docs/PUBLIC_LIMITATIONS.md)
+* [第三者ライセンス通知](THIRD_PARTY_NOTICES.md)
+* ADR: [PDFエンジン](docs/adr/0001-pdf-engine-selection.md)、[PLaMo推論](docs/adr/0002-plamo-inference-and-pfml3.md)、[数式保護](docs/adr/0003-formula-preservation-and-validation.md)
