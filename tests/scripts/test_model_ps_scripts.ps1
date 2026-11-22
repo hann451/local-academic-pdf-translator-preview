@@ -93,7 +93,7 @@ try {
     New-Item -ItemType Directory -Path $tmpRoot -Force | Out-Null
 
     # 1. Encoding (UTF-8 BOM + CRLF) and PS 5.1 syntax verification on all production scripts
-    $psScripts = @("launcher.ps1", "model_registry_common.ps1", "model_setup.ps1", "setup_desktop_shortcut.ps1", "setup_wizard.ps1")
+    $psScripts = @("apply_update.ps1", "launcher.ps1", "model_registry_common.ps1", "model_setup.ps1", "setup_desktop_shortcut.ps1", "setup_wizard.ps1")
     foreach ($name in $psScripts) {
         $p = Join-Path $ScriptsDir $name
         Assert-True (Test-Path -LiteralPath $p) "Script exists: $name"
@@ -107,7 +107,7 @@ try {
         $null = [System.Management.Automation.Language.Parser]::ParseFile($p, [ref]$tokens, [ref]$errors)
         Assert-True ($errors.Count -eq 0) "$name must parse cleanly in PS 5.1 (errors: $($errors.Count))"
     }
-    Write-Output "[PASS] 1. Encoding (UTF-8 BOM + CRLF) & PS 5.1 syntax check passed for all 5 scripts."
+    Write-Output "[PASS] 1. Encoding (UTF-8 BOM + CRLF) & PS 5.1 syntax check passed for all 6 scripts."
 
     # 2. Dot-source shared helper & create synthetic GGUF payloads + isolated catalog
     . (Join-Path $ScriptsDir "model_registry_common.ps1")
@@ -281,6 +281,129 @@ try {
     $missingLabel = Get-PaperBridgeVerificationStageLabel -Verification $ps2Entry2.verification -FileExistsOverride (Test-Path -LiteralPath $f2CopySrc)
     Assert-True ($missingLabel -eq "未検証（ファイル欠損）") "Deleted file renders 未検証（ファイル欠損）"
     Write-Output "[PASS] 6. Four-stage verification lifecycle checks in PowerShell passed."
+
+    # 8. Production catalog default 0.8B dry-run checks on model_setup.ps1 & setup_wizard.ps1
+    $savedTestCat = $env:PAPERBRIDGE_MODEL_CATALOG_PATH
+    Remove-Item Env:\PAPERBRIDGE_MODEL_CATALOG_PATH -ErrorAction SilentlyContinue
+    try {
+        $dryModelOut = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptsDir "model_setup.ps1") -UserDataDir $cliRt -DryRun 2>&1) -join "`n"
+        Assert-True ($LASTEXITCODE -eq 0) "model_setup.ps1 -DryRun exited with 0"
+        Assert-True ($dryModelOut -match "DRY_RUN_MODEL_ID:plamo-3-translate-0\.8b-q4_k_m") "model_setup default model is 0.8B"
+        Assert-True ($dryModelOut -match "DRY_RUN_FILENAME:plamo-3-translate-0\.8b-Q4_K_M\.gguf") "model_setup default filename is 0.8B GGUF"
+        Assert-True ($dryModelOut -match "DRY_RUN_SIZE_BYTES:573126848") "model_setup default size matches 0.8B"
+        Assert-True ($dryModelOut -match "DRY_RUN_SIZE_TEXT:.*0\.57 GB") "model_setup size text displays 0.57 GB"
+        Assert-True ($dryModelOut -match "DRY_RUN_SHA256:70891ec70dc7ab4205745a38307867c2881b99239f20327927633abfe4bc9ec6") "model_setup SHA-256 matches 0.8B"
+        Assert-True ($dryModelOut -match "DRY_RUN_URL:https://huggingface\.co/pfnet/plamo-3-translate-0\.8b-GGUF/resolve/1cf96ae02133958a20074bfdfab76517bb737d00/plamo-3-translate-0\.8b-Q4_K_M\.gguf") "model_setup URL matches 0.8B"
+
+        $dryWizOut = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptsDir "setup_wizard.ps1") -UserDataDir $cliRt -DryRun 2>&1) -join "`n"
+        Assert-True ($LASTEXITCODE -eq 0) "setup_wizard.ps1 -DryRun exited with 0"
+        Assert-True ($dryWizOut -match "DRY_RUN_MODEL_ID:plamo-3-translate-0\.8b-q4_k_m") "setup_wizard default model is 0.8B"
+        Assert-True ($dryWizOut -match "DRY_RUN_SIZE_TEXT:.*0\.57 GB") "setup_wizard size text displays 0.57 GB"
+        Assert-True ($dryWizOut -match "DRY_RUN_SHA256:70891ec70dc7ab4205745a38307867c2881b99239f20327927633abfe4bc9ec6") "setup_wizard SHA-256 matches 0.8B"
+    } finally {
+        $env:PAPERBRIDGE_MODEL_CATALOG_PATH = $savedTestCat
+    }
+    Write-Output "[PASS] 7. Default 0.8B dry-run checks (model_setup.ps1 & setup_wizard.ps1) passed."
+
+    # 9. External updater (apply_update.ps1): port release polling, ZIP update protection, and Git pull update
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $updRt = Join-Path $tmpRoot "updater_userdata"
+    New-Item -ItemType Directory -Path $updRt -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $updRt "user_db_keep.txt"), "USER_DATA_SAFE")
+    [System.IO.File]::WriteAllText((Join-Path $updRt ".update_in_progress"), "{}")
+
+    # 9a. ZIP mode update + protected path preservation + live port release polling
+    $zipAppDir = Join-Path $tmpRoot "zip_app_target"
+    New-Item -ItemType Directory -Path (Join-Path $zipAppDir "uat-artifacts") -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $zipAppDir "models") -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $zipAppDir "README.md"), "OLD_README")
+    [System.IO.File]::WriteAllText((Join-Path $zipAppDir ".env"), "SECRET_KEEP=1")
+    [System.IO.File]::WriteAllText((Join-Path $zipAppDir "uat-artifacts\report.txt"), "KEEP_UAT_ARTIFACT")
+    [System.IO.File]::WriteAllText((Join-Path $zipAppDir "models\keep.gguf"), "KEEP_MODEL")
+
+    $zipSrcRoot = Join-Path $tmpRoot "zip_src\repo-main"
+    New-Item -ItemType Directory -Path (Join-Path $zipSrcRoot "uat-artifacts") -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $zipSrcRoot "backend") -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $zipSrcRoot "README.md"), "NEW_README_V2")
+    [System.IO.File]::WriteAllText((Join-Path $zipSrcRoot "backend\new_mod.py"), "VALUE = 2`n")
+    [System.IO.File]::WriteAllText((Join-Path $zipSrcRoot ".env"), "OVERWRITE_ATTEMPT")
+    [System.IO.File]::WriteAllText((Join-Path $zipSrcRoot "uat-artifacts\report.txt"), "OVERWRITE_UAT")
+    $testZip = Join-Path $tmpRoot "update_payload.zip"
+    [System.IO.Compression.ZipFile]::CreateFromDirectory((Join-Path $tmpRoot "zip_src"), $testZip)
+
+    # Pick an ephemeral free port, hold it briefly in a background process, then release it
+    $probeListener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    $probeListener.Start()
+    $ephemeralPort = ([System.Net.IPEndPoint]$probeListener.LocalEndpoint).Port
+    $probeListener.Stop()
+
+    $holderProc = Start-Process -FilePath "powershell.exe" -ArgumentList @(
+        "-NoProfile", "-Command",
+        "`$l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $ephemeralPort); `$l.Start(); Start-Sleep -Milliseconds 900; `$l.Stop()"
+    ) -WindowStyle Hidden -PassThru
+    Start-Sleep -Milliseconds 250
+
+    $updZipOut = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptsDir "apply_update.ps1") `
+        -ProjectRoot $zipAppDir -UserDataDir $updRt -BackendPort $ephemeralPort -LlamaPort 0 `
+        -LocalZipPath $testZip -TargetCommitSha "fe517c2b0f724785bd01fe6b1f9cbc45418ba2cc" `
+        -PortWaitTimeoutSec 15 -NoRebuild -NoRestart 2>&1) -join "`n"
+    if ($holderProc -and (-not $holderProc.HasExited)) { $holderProc.WaitForExit(5000) | Out-Null }
+
+    Assert-True ($LASTEXITCODE -eq 0) "apply_update.ps1 ZIP mode exited 0 (out: $updZipOut)"
+    Assert-True ($updZipOut -match "UPDATE_APPLY_SUCCESS") "apply_update.ps1 reported UPDATE_APPLY_SUCCESS"
+    Assert-True (([System.IO.File]::ReadAllText((Join-Path $zipAppDir "README.md"))) -eq "NEW_README_V2") "ZIP update replaced README.md"
+    Assert-True (Test-Path -LiteralPath (Join-Path $zipAppDir "backend\new_mod.py")) "ZIP update added new file"
+    Assert-True (([System.IO.File]::ReadAllText((Join-Path $zipAppDir ".env"))) -eq "SECRET_KEEP=1") ".env MUST be protected from overwrite"
+    Assert-True (([System.IO.File]::ReadAllText((Join-Path $zipAppDir "uat-artifacts\report.txt"))) -eq "KEEP_UAT_ARTIFACT") "uat-artifacts MUST be protected from overwrite"
+    Assert-True (([System.IO.File]::ReadAllText((Join-Path $zipAppDir "models\keep.gguf"))) -eq "KEEP_MODEL") "models/*.gguf MUST be protected"
+    Assert-True (([System.IO.File]::ReadAllText((Join-Path $updRt "user_db_keep.txt"))) -eq "USER_DATA_SAFE") "UserDataDir MUST be protected"
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $updRt ".update_in_progress"))) ".update_in_progress cleared after apply"
+    $verJson = [System.IO.File]::ReadAllText((Join-Path $zipAppDir ".paperbridge_version.json")) | ConvertFrom-Json
+    Assert-True ($verJson.short_sha -eq "fe517c2") "ZIP update recorded .paperbridge_version.json"
+
+    # 9b. Git mode update (local bare repo + clone)
+    $bareRepo = Join-Path $tmpRoot "origin_bare.git"
+    $seedRepo = Join-Path $tmpRoot "seed_repo"
+    $cloneRepo = Join-Path $tmpRoot "clone_repo"
+    $prevGitEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & git init --bare --initial-branch=main $bareRepo 2>&1 | Out-Null
+        & git clone $bareRepo $seedRepo 2>&1 | Out-Null
+        & git -C $seedRepo config user.email "test@example.com" 2>&1 | Out-Null
+        & git -C $seedRepo config user.name "Tester" 2>&1 | Out-Null
+        & git -C $seedRepo checkout -b main 2>&1 | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $seedRepo "app.txt"), "v1")
+        & git -C $seedRepo add app.txt 2>&1 | Out-Null
+        & git -C $seedRepo commit -m "v1" 2>&1 | Out-Null
+        & git -C $seedRepo push -u origin main 2>&1 | Out-Null
+
+        & git clone -b main $bareRepo $cloneRepo 2>&1 | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $cloneRepo ".env"), "LOCAL_GIT_ENV=keep")
+        New-Item -ItemType Directory -Path (Join-Path $cloneRepo "uat-artifacts") -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $cloneRepo "uat-artifacts\keep.txt"), "GIT_UAT_KEEP")
+
+        # Push v2 to bare origin
+        [System.IO.File]::WriteAllText((Join-Path $seedRepo "app.txt"), "v2")
+        & git -C $seedRepo add app.txt 2>&1 | Out-Null
+        & git -C $seedRepo commit -m "v2" 2>&1 | Out-Null
+        & git -C $seedRepo push origin main 2>&1 | Out-Null
+        $expectedGitSha = (& git -C $seedRepo rev-parse HEAD 2>$null).Trim()
+
+        $updGitOut = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ScriptsDir "apply_update.ps1") `
+            -ProjectRoot $cloneRepo -UserDataDir $updRt -BackendPort 0 -LlamaPort 0 `
+            -Branch "main" -NoRebuild -NoRestart 2>&1) -join "`n"
+        $updGitRc = $LASTEXITCODE
+        $actualGitSha = (& git -C $cloneRepo rev-parse HEAD 2>$null).Trim()
+    } finally {
+        $ErrorActionPreference = $prevGitEap
+    }
+    Assert-True ($updGitRc -eq 0) "apply_update.ps1 Git mode exited 0 (out: $updGitOut)"
+    Assert-True ($actualGitSha -eq $expectedGitSha) "Git mode pulled latest origin/main commit"
+    Assert-True (([System.IO.File]::ReadAllText((Join-Path $cloneRepo "app.txt"))) -eq "v2") "Git mode updated tracked file"
+    Assert-True (([System.IO.File]::ReadAllText((Join-Path $cloneRepo ".env"))) -eq "LOCAL_GIT_ENV=keep") "Git mode preserved .env"
+    Assert-True (([System.IO.File]::ReadAllText((Join-Path $cloneRepo "uat-artifacts\keep.txt"))) -eq "GIT_UAT_KEEP") "Git mode preserved uat-artifacts"
+    Write-Output "[PASS] 8. External updater (apply_update.ps1) port wait, ZIP protection & Git pull passed."
 
     Write-Output "ALL_PS_MODEL_TESTS_PASSED"
 } finally {

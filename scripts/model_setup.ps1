@@ -9,7 +9,8 @@ param(
     [string]$RegisterMode = "Reference",
     [switch]$NonInteractive = $false,
     [switch]$AcceptLicense = $false,
-    [string]$PreselectedPath = ""
+    [string]$PreselectedPath = "",
+    [switch]$DryRun = $false
 )
 
 $ErrorActionPreference = "Stop"
@@ -63,6 +64,26 @@ function Get-DestinationPathForModel {
         return (Join-Path $TargetModelDir ([string]$CatalogModel.filename))
     }
     return (Join-Path (Join-Path (Join-Path $UserDataDir "models") ([string]$CatalogModel.relative_subdir)) ([string]$CatalogModel.filename))
+}
+
+# 0. Dry-run resolution output (no network or disk mutation)
+if ($DryRun) {
+    $targetCat = Get-CatalogModelById -Catalog $Catalog -ModelId $ModelId
+    if (-not $targetCat) {
+        Write-Error "指定されたカタログモデルが見つかりません: $ModelId"
+        exit 1
+    }
+    $sizeTxt = Format-ModelSizeText -Bytes ([int64]$targetCat.known_size_bytes)
+    $destPath = Get-DestinationPathForModel -CatalogModel $targetCat
+    Write-Output "DRY_RUN_MODEL_ID:$($targetCat.model_id)"
+    Write-Output "DRY_RUN_DISPLAY_NAME:$($targetCat.display_name)"
+    Write-Output "DRY_RUN_FILENAME:$($targetCat.filename)"
+    Write-Output "DRY_RUN_SIZE_BYTES:$($targetCat.known_size_bytes)"
+    Write-Output "DRY_RUN_SIZE_TEXT:$sizeTxt"
+    Write-Output "DRY_RUN_SHA256:$($targetCat.known_sha256)"
+    Write-Output "DRY_RUN_URL:$($targetCat.download_url)"
+    Write-Output "DRY_RUN_DEST:$destPath"
+    exit 0
 }
 
 # 1. Non-interactive / CLI path for -PreselectedPath
@@ -228,7 +249,7 @@ $defaultIndex = 0
 for ($idx = 0; $idx -lt $catalogModels.Count; $idx++) {
     $cm = $catalogModels[$idx]
     $sizeTxt = Format-ModelSizeText -Bytes ([int64]$cm.known_size_bytes)
-    $recTag = if ($cm.is_default -eq $true) { "推奨・標準" } elseif ($cm.catalog_verification_status -eq "catalog_verified_runtime_unverified") { "候補・カタログ検証済" } else { "候補" }
+    $recTag = if ($cm.is_default -eq $true) { "初回既定・軽量" } elseif ($cm.catalog_verification_status -eq "verified_runtime") { "高精度・実機検証済" } else { "候補・カタログ検証済" }
     $cmbCatalog.Items.Add("$($cm.display_name)  [$recTag / $sizeTxt]") | Out-Null
     if (-not [string]::IsNullOrWhiteSpace($ModelId) -and $cm.model_id -eq $ModelId) {
         $defaultIndex = $idx

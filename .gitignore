@@ -47,5 +47,6 @@ tests/visual/diff_outputs/
 # Secrets & Environment
 .env
 .env.local
+.paperbridge_version.json
 *.key
 *.pem

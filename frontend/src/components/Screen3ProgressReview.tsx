@@ -369,7 +369,9 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
                   ? "[MOCK 疑似翻訳]"
                   : `[実機 ${
                       job.execution_provenance?.model_display_name ||
-                      (job.config.model_name === "plamo-3-translate-2b-Q4_K_M"
+                      (job.config.model_name === "plamo-3-translate-0.8b-Q4_K_M"
+                        ? "PLaMo 3 Translate 0.8B"
+                        : job.config.model_name === "plamo-3-translate-2b-Q4_K_M"
                         ? "PLaMo 3 Translate 2B"
                         : job.config.model_name)
                     }]`}

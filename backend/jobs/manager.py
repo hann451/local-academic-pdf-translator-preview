@@ -371,12 +371,12 @@ class JobManager:
                     or f"選択中のモデル「{target_reg.display_name}」は検証エラーまたはファイル欠落のため使用できません。"
                 )
             cat_m = catalog.get_model(target_reg.catalog_model_id)
-            default_stem = "plamo-3-translate-2b-Q4_K_M"
+            default_stems = {"plamo-3-translate-0.8b-Q4_K_M", "plamo-3-translate-2b-Q4_K_M"}
             if cat_m is not None:
                 cat_stem = (
                     cat_m.filename[:-5] if cat_m.filename.lower().endswith(".gguf") else cat_m.filename
                 )
-                if not resolved.model_id or resolved.model_name == default_stem:
+                if not resolved.model_id or resolved.model_name in default_stems:
                     resolved.model_name = cat_stem
                 resolved.model_id = cat_m.model_id
                 resolved.quantization = cat_m.quantization
@@ -393,7 +393,7 @@ class JobManager:
             cat_stem = (
                 cat_m.filename[:-5] if cat_m.filename.lower().endswith(".gguf") else cat_m.filename
             )
-            if resolved.model_name == "plamo-3-translate-2b-Q4_K_M":
+            if resolved.model_name in {"plamo-3-translate-0.8b-Q4_K_M", "plamo-3-translate-2b-Q4_K_M"}:
                 resolved.model_name = cat_stem
             resolved.quantization = cat_m.quantization
         return resolved

@@ -643,7 +643,7 @@ class TranslationJobConfig(BaseModel):
     target_lang: str = "ja"
     form: str = Field(default="plain", pattern="^(plain|polite)$")
     model_id: str | None = None
-    model_name: str = "plamo-3-translate-2b-Q4_K_M"
+    model_name: str = "plamo-3-translate-0.8b-Q4_K_M"
     model_sha256: str | None = None
     quantization: str = "Q4_K_M"
     context_length: int = Field(default=8192, ge=1024, le=32768)
@@ -752,3 +752,4 @@ class SystemDiagnostics(BaseModel):
     model_server_match_status: str = "unknown"
     model_server_match_message: str | None = None
     model_server_mismatch: bool = False
+    app_version: str | None = None

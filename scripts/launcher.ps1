@@ -48,6 +48,7 @@ if ([string]::IsNullOrWhiteSpace($UserDataDir)) {
 $LogsDir = Join-Path $UserDataDir "logs"
 $LauncherLogPath = Join-Path $LogsDir "launcher.log"
 $EdgeProfileDir = Join-Path $UserDataDir "edge_profile"
+$UpdateSignalPath = Join-Path $UserDataDir ".update_in_progress"
 
 foreach ($d in @($UserDataDir, $LogsDir, $EdgeProfileDir)) {
     if (-not (Test-Path -LiteralPath $d)) {
@@ -491,7 +492,10 @@ function Get-RunningProfileEdgeProcesses {
 }
 
 function Open-AppWindowAndWait {
-    param([string]$AppUrl)
+    param(
+        [string]$AppUrl,
+        [hashtable]$BackendServerInfo = $null
+    )
     $edgeExe = Find-EdgeExecutable
     if ($edgeExe) {
         $edgeArgs = "--user-data-dir=`"$EdgeProfileDir`" --app=`"$AppUrl`" --start-maximized --no-first-run --no-default-browser-check"
@@ -500,6 +504,10 @@ function Open-AppWindowAndWait {
         Start-Sleep -Milliseconds 1200
 
         while ($true) {
+            if ((Test-Path -LiteralPath $UpdateSignalPath) -and ($null -ne $BackendServerInfo) -and $BackendServerInfo.Process -and $BackendServerInfo.Process.HasExited) {
+                Write-LaunchLog "ソフトウェア更新によるアプリ終了シグナルを検出したため待機を終了します。"
+                break
+            }
             if (-not $edgeProc.HasExited) {
                 Start-Sleep -Milliseconds 600
                 continue
@@ -511,7 +519,7 @@ function Open-AppWindowAndWait {
             }
             break
         }
-        Write-LaunchLog "専用 Edge ウィンドウが閉じられました。"
+        Write-LaunchLog "専用 Edge ウィンドウの待機を終了しました。"
     } else {
         Write-LaunchLog "Microsoft Edge が見つからないため、既定ブラウザで開きます: $AppUrl" "WARN"
         Start-Process $AppUrl
@@ -746,7 +754,12 @@ try {
     } else {
         $checkJobsScript = Join-Path $ScriptDir "check_active_jobs.py"
         while ($true) {
-            Open-AppWindowAndWait -AppUrl $appUrl
+            Open-AppWindowAndWait -AppUrl $appUrl -BackendServerInfo $backendServer
+
+            if (Test-Path -LiteralPath $UpdateSignalPath) {
+                Write-LaunchLog "ソフトウェア更新中のため未完了ジョブ確認をスキップして終了します。"
+                break
+            }
 
             $env:PAPERBRIDGE_RUNTIME_DIR = $UserDataDir
             $jobOut = ""

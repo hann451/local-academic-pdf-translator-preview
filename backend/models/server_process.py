@@ -998,3 +998,49 @@ class LlamaServerProcessManager:
             )
         finally:
             self._switch_lock.release()
+
+    def stop_running_server(self) -> list[int]:
+        """Safely stop verified local llama-server process(es) listening on configured port."""
+        parsed = _parse_local_endpoint(self.config.llama_base_url)
+        if parsed is None:
+            return []
+        host, port = parsed
+        self._prune_exited_procs()
+
+        listening_pids = self._find_listening_pids_on_port(host, port)
+        proc_infos: list[ProcessInfo] = []
+        for pid in listening_pids:
+            info = self._inspect_process(pid)
+            if info is None:
+                continue
+            if not _is_llama_server_process(info):
+                continue
+            cmd_port = _extract_port_from_command_line(info.command_line)
+            if cmd_port is not None and cmd_port != port:
+                continue
+            proc_infos.append(info)
+
+        state = self._read_state_file()
+        if state and state.get("port") == port and isinstance(state.get("pid"), int):
+            state_pid = int(state["pid"])
+            if state_pid not in {p.pid for p in proc_infos}:
+                s_info = self._inspect_process(state_pid)
+                if s_info is not None and _is_llama_server_process(s_info):
+                    s_port = _extract_port_from_command_line(s_info.command_line)
+                    if s_port is None or s_port == port:
+                        proc_infos.append(s_info)
+
+        stopped: list[int] = []
+        for info in proc_infos:
+            try:
+                self._stop_llama_process(info, port)
+                stopped.append(info.pid)
+            except Exception:
+                continue
+
+        if stopped:
+            try:
+                self._wait_for_port_release(host, port, timeout_sec=min(self.port_release_timeout_sec, 8.0))
+            except Exception:
+                pass
+        return stopped

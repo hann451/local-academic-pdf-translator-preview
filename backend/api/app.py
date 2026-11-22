@@ -63,6 +63,13 @@ from backend.models.server_process import (
     LlamaServerSafetyError,
 )
 from backend.translation.adapters.llama_cpp_adapter import LlamaCppPlamoAdapter
+from backend.updater import (
+    SystemUpdater,
+    UpdateApplyResponse,
+    UpdateCheckResponse,
+    UpdateConflictError,
+    UpdateLaunchError,
+)
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 _ALLOWED_ARTIFACT_TYPES = {
@@ -309,6 +316,7 @@ def create_app(
     frontend_dist_dir: Path | None = None,
     model_download_manager: ModelDownloadManager | None = None,
     llama_server_manager: LlamaServerProcessManager | None = None,
+    system_updater: SystemUpdater | None = None,
 ) -> FastAPI:
     cfg = config or AppConfig()
     cfg.ensure_directories()
@@ -317,6 +325,10 @@ def create_app(
     srv_mgr = llama_server_manager or LlamaServerProcessManager(
         config=cfg,
         registry=mgr.model_registry,
+    )
+    updater = system_updater or SystemUpdater(
+        config=cfg,
+        llama_server_manager=srv_mgr,
     )
     active_token = session_token or secrets.token_urlsafe(32)
 
@@ -329,6 +341,7 @@ def create_app(
     app.state.job_manager = mgr
     app.state.model_download_manager = dl_mgr
     app.state.llama_server_manager = srv_mgr
+    app.state.system_updater = updater
     app.state.session_token = active_token
 
     # Section 4 & 16: Never allow wildcard '*' CORS
@@ -408,6 +421,40 @@ def create_app(
         _sec: None = Depends(verify_security_headers),
     ) -> SystemDiagnostics:
         return collect_system_diagnostics(config=cfg, probe_llama=probe_llama)
+
+    # --- Self-Update Endpoints ---
+    @app.get("/api/system/update/check", response_model=UpdateCheckResponse)
+    async def check_system_update_endpoint(
+        _sec: None = Depends(verify_security_headers),
+    ) -> UpdateCheckResponse:
+        return await anyio.to_thread.run_sync(updater.check_for_updates)
+
+    @app.post("/api/system/update/apply", response_model=UpdateApplyResponse)
+    async def apply_system_update_endpoint(
+        _sec: None = Depends(verify_security_headers),
+    ) -> UpdateApplyResponse:
+        if mgr.has_any_active_job():
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "UpdateConflict: 翻訳ジョブ実行中はアップデートを実行できません。"
+                    "進行中のジョブを完了または停止してから再試行してください。"
+                ),
+            )
+        has_active_dl = any(
+            d.status in ("downloading", "verifying") for d in dl_mgr.list_downloads()
+        )
+        try:
+            return await anyio.to_thread.run_sync(
+                lambda: updater.apply_update(
+                    has_active_job=mgr.has_any_active_job,
+                    has_active_download=has_active_dl,
+                )
+            )
+        except UpdateConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except UpdateLaunchError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     # --- Model Catalog & Local Registry Endpoints ---
     def _probe_llama_health_quick() -> dict[str, Any] | None:

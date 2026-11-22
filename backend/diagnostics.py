@@ -443,6 +443,14 @@ def collect_system_diagnostics(
     ram_mb = _query_windows_ram_mb()
     gpu_name, gpu_vram_mb, gpu_driver = _query_windows_gpu_info()
 
+    app_ver: str | None = None
+    try:
+        from backend.updater.manager import get_local_version
+
+        app_ver, _, _ = get_local_version()
+    except Exception:
+        app_ver = None
+
     return SystemDiagnostics(
         os_name=f"{platform.system()} {platform.release()}",
         os_version=platform.version(),
@@ -477,4 +485,5 @@ def collect_system_diagnostics(
         model_server_match_status=match_status_out,
         model_server_match_message=match_res.message_ja if (probe_llama or active_status != "usable") else None,
         model_server_mismatch=is_mismatch,
+        app_version=app_ver,
     )
