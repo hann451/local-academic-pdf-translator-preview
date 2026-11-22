@@ -13,6 +13,8 @@ import type {
   RegisterLocalModelRequest,
   StartModelDownloadRequest,
   SystemDiagnostics,
+  SystemUpdateApplyResponse,
+  SystemUpdateCheckResponse,
 } from "../types/api";
 import { parseGlossaryInput, type GlossaryParseReport } from "../utils/glossaryParser";
 import { ModelLicenseNotice, resolveActiveCatalogModel } from "./ModelLicenseNotice";
@@ -51,6 +53,13 @@ export interface Screen4Props {
   onDeleteGlossary: (glossaryId: string) => Promise<void>;
   onPurgeTempData: () => Promise<string>;
   onRotateToken: () => Promise<void>;
+  updateCheckResult?: SystemUpdateCheckResponse | null;
+  isCheckingUpdate?: boolean;
+  isApplyingUpdate?: boolean;
+  updateApplyingMessage?: string | null;
+  updateError?: string | null;
+  onCheckUpdate?: () => Promise<SystemUpdateCheckResponse | void>;
+  onApplyUpdate?: () => Promise<SystemUpdateApplyResponse | void>;
 }
 
 export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
@@ -78,6 +87,13 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
   onDeleteGlossary,
   onPurgeTempData,
   onRotateToken,
+  updateCheckResult = null,
+  isCheckingUpdate = false,
+  isApplyingUpdate = false,
+  updateApplyingMessage = null,
+  updateError = null,
+  onCheckUpdate,
+  onApplyUpdate,
 }) => {
   const [selectedGlossaryId, setSelectedGlossaryId] = useState<string | null>(
     glossaries[0]?.id || null
@@ -102,6 +118,8 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
   const [isSavingGlossary, setIsSavingGlossary] = useState<boolean>(false);
   const [systemActionFeedback, setSystemActionFeedback] = useState<string | null>(null);
   const [diagSwitchError, setDiagSwitchError] = useState<string | null>(null);
+  const [showUpdateConfirmModal, setShowUpdateConfirmModal] = useState<boolean>(false);
+  const [localUpdateError, setLocalUpdateError] = useState<string | null>(null);
 
   const selectGlossary = (g: Glossary | null) => {
     if (!g) {
@@ -260,9 +278,230 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
       onStartModelDownload &&
       onCancelModelDownload
   );
+  const currentVersionDisplay =
+    updateCheckResult?.current_version || diagnostics?.app_version || "未取得";
+  const hasActiveJobForUpdate = Boolean(modelsOverview?.has_active_translation_job);
+  const displayedUpdateError = localUpdateError || updateError;
+
+  const handleCheckUpdateClick = async () => {
+    if (!onCheckUpdate) return;
+    setLocalUpdateError(null);
+    try {
+      await onCheckUpdate();
+    } catch (err) {
+      setLocalUpdateError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleConfirmApplyUpdate = async () => {
+    setShowUpdateConfirmModal(false);
+    if (!onApplyUpdate) return;
+    setLocalUpdateError(null);
+    try {
+      await onApplyUpdate();
+    } catch (err) {
+      setLocalUpdateError(err instanceof Error ? err.message : String(err));
+    }
+  };
 
   return (
     <div className="screen-container" data-testid="screen4-glossary-diagnostics">
+      {/* Software Update Card */}
+      <section
+        className="card"
+        data-testid="software-update-card"
+        style={{ marginBottom: "16px" }}
+      >
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            flexWrap: "wrap",
+            gap: "10px",
+            marginBottom: "10px",
+          }}
+        >
+          <div>
+            <h2 className="card-title" style={{ margin: 0 }}>
+              ソフトウェア更新
+            </h2>
+            <div style={{ fontSize: "13px", color: "#475569", marginTop: "4px" }}>
+              現在のバージョン:{" "}
+              <code data-testid="update-current-version" style={{ fontWeight: 700, color: "#0f172a" }}>
+                {currentVersionDisplay}
+              </code>
+              {updateCheckResult?.latest_version && (
+                <>
+                  {" "}
+                  / 最新バージョン:{" "}
+                  <code data-testid="update-latest-version" style={{ fontWeight: 700, color: "#0f172a" }}>
+                    {updateCheckResult.latest_version}
+                  </code>
+                </>
+              )}
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+            <button
+              type="button"
+              className="btn btn-secondary"
+              data-testid="check-update-btn"
+              disabled={isCheckingUpdate || isApplyingUpdate || !onCheckUpdate}
+              onClick={() => void handleCheckUpdateClick()}
+            >
+              {isCheckingUpdate ? "確認中..." : "🔄 更新を確認"}
+            </button>
+          </div>
+        </div>
+
+        {displayedUpdateError && (
+          <div
+            role="alert"
+            data-testid="update-error-banner"
+            className="alert alert-error"
+            style={{ marginBottom: "10px", fontSize: "13px" }}
+          >
+            <strong>更新エラー:</strong> {displayedUpdateError}
+          </div>
+        )}
+
+        {updateCheckResult && updateCheckResult.update_available && (
+          <div
+            data-testid="update-available-banner"
+            className="alert alert-info"
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              flexWrap: "wrap",
+              gap: "12px",
+              fontSize: "13px",
+            }}
+          >
+            <div>
+              <div>
+                <strong>新しいバージョンが利用可能です</strong>
+                {updateCheckResult.latest_version && (
+                  <span className="badge badge-info" style={{ marginLeft: "8px" }}>
+                    {updateCheckResult.latest_version}
+                  </span>
+                )}
+              </div>
+              <div style={{ marginTop: "4px" }}>{updateCheckResult.message}</div>
+              {updateCheckResult.latest_commit_message && (
+                <div style={{ fontSize: "12px", color: "#334155", marginTop: "2px" }}>
+                  最新コミット: {updateCheckResult.latest_commit_message}
+                </div>
+              )}
+              {hasActiveJobForUpdate && (
+                <div style={{ fontSize: "12px", color: "#b45309", marginTop: "4px" }}>
+                  翻訳ジョブ実行中はアップデートを実行できません。完了または停止後に再試行してください。
+                </div>
+              )}
+            </div>
+            <button
+              type="button"
+              className="btn btn-primary"
+              data-testid="apply-update-btn"
+              disabled={isApplyingUpdate || hasActiveJobForUpdate || !onApplyUpdate}
+              onClick={() => setShowUpdateConfirmModal(true)}
+            >
+              今すぐアップデートして再起動
+            </button>
+          </div>
+        )}
+
+        {updateCheckResult && !updateCheckResult.update_available && (
+          <div
+            data-testid="update-status-banner"
+            className={`alert ${
+              updateCheckResult.status === "rate_limited" ||
+              updateCheckResult.status === "offline_or_error"
+                ? "alert-warning"
+                : "alert-success"
+            }`}
+            style={{ fontSize: "13px" }}
+          >
+            {updateCheckResult.message}
+          </div>
+        )}
+
+        {!updateCheckResult && !displayedUpdateError && (
+          <div style={{ fontSize: "12px", color: "#475569" }}>
+            「🔄 更新を確認」を押すと GitHub の最新版と比較し、利用可能なアップデートがある場合はワンクリックで更新・再起動できます（モデル GGUF・ユーザーデータ・ローカル設定は保持されます）。
+          </div>
+        )}
+      </section>
+
+      {/* Update Confirmation Modal */}
+      {showUpdateConfirmModal && (
+        <div
+          className="modal-backdrop"
+          data-testid="update-confirm-modal"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="update-confirm-modal-title"
+        >
+          <div className="modal-dialog">
+            <h3 id="update-confirm-modal-title" style={{ margin: "0 0 10px 0", fontSize: "16px" }}>
+              アップデートの確認
+            </h3>
+            <p style={{ margin: "0 0 10px 0", fontSize: "14px", color: "#0f172a" }}>
+              アプリを更新して再起動します。よろしいですか？
+            </p>
+            <p style={{ margin: "0 0 16px 0", fontSize: "12px", color: "#475569" }}>
+              ダウンロード済みの翻訳モデル（GGUF）、用語集・履歴などのユーザーデータ（
+              <code>%LOCALAPPDATA%\PaperBridgeLocal</code>）、ローカル設定（<code>.env</code>
+              ）は保持されます。
+            </p>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: "8px" }}>
+              <button
+                type="button"
+                className="btn btn-secondary"
+                data-testid="update-confirm-cancel-btn"
+                onClick={() => setShowUpdateConfirmModal(false)}
+              >
+                キャンセル
+              </button>
+              <button
+                type="button"
+                className="btn btn-primary"
+                data-testid="update-confirm-ok-btn"
+                onClick={() => void handleConfirmApplyUpdate()}
+              >
+                更新して再起動する
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Fullscreen Loading Overlay During Update Apply */}
+      {isApplyingUpdate && (
+        <div
+          className="loading-overlay"
+          data-testid="system-update-loading-overlay"
+          role="status"
+          aria-live="assertive"
+          aria-busy="true"
+        >
+          <div className="loading-card">
+            <div className="loading-spinner" aria-hidden="true" />
+            <h3 style={{ margin: "12px 0 8px 0", fontSize: "17px" }}>
+              ソフトウェアを更新して再起動しています...
+            </h3>
+            <p style={{ margin: "0 0 6px 0", fontSize: "13px", color: "#334155" }}>
+              {updateApplyingMessage ||
+                "最新版の取得・適用とサーバーの再起動を行っています。この画面のまましばらくお待ちください。"}
+            </p>
+            <p style={{ margin: 0, fontSize: "12px", color: "#64748b" }}>
+              再起動が完了すると自動的に再接続・再読み込みを試行します。
+            </p>
+          </div>
+        </div>
+      )}
       {hasModelActions &&
         onRefreshModels &&
         onBrowseLocalModelFile &&

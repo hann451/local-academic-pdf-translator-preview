@@ -758,8 +758,12 @@ export const ModelSelectionPanel: React.FC<ModelSelectionPanelProps> = ({
           >
             {catalog.map((c) => {
               const tag =
-                c.catalog_verification_status === "verified_runtime"
-                  ? "標準推奨・カタログ実機確認済"
+                c.is_default && c.catalog_verification_status === "verified_runtime"
+                  ? "初回既定・カタログ実機確認済"
+                  : c.is_default
+                  ? "初回既定・カタログ検証済・実機未検証"
+                  : c.catalog_verification_status === "verified_runtime"
+                  ? "高精度推奨・カタログ実機確認済"
                   : "カタログ検証済・実機未検証";
               return (
                 <option key={c.model_id} value={c.model_id}>
@@ -914,7 +918,7 @@ export const ModelSelectionPanel: React.FC<ModelSelectionPanelProps> = ({
               type="text"
               data-testid="local-model-path-input"
               className="form-input"
-              placeholder="C:\path\to\plamo-3-translate-2b-Q4_K_M.gguf"
+              placeholder="C:\path\to\plamo-3-translate-0.8b-Q4_K_M.gguf"
               value={localFilePath}
               onChange={(ev) => setLocalFilePath(ev.target.value)}
               style={{ flex: "1 1 280px" }}

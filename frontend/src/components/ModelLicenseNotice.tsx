@@ -18,16 +18,19 @@ export function formatBytesHuman(bytes: number): string {
   if (bytes <= 0) return "0 B";
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1000 * 1000 * 1000) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes < 500 * 1000 * 1000) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   return `${(bytes / 1000000000).toFixed(2)} GB`;
 }
 
 export function resolveActiveCatalogModel(
   overview: ModelsOverviewResponse | null | undefined
 ): CatalogModel | null {
-  if (!overview || !overview.active_model) return null;
-  const activeCatId = overview.active_model.catalog_model_id;
-  return overview.catalog.find((c) => c.model_id === activeCatId) ?? null;
+  if (!overview) return null;
+  if (overview.active_model) {
+    const activeCatId = overview.active_model.catalog_model_id;
+    return overview.catalog.find((c) => c.model_id === activeCatId) ?? null;
+  }
+  return overview.catalog.find((c) => c.is_default) ?? overview.catalog[0] ?? null;
 }
 
 interface EffectiveNoticeData {
@@ -41,19 +44,19 @@ interface EffectiveNoticeData {
 }
 
 const DEFAULT_FALLBACK_NOTICE_DATA: EffectiveNoticeData = {
-  displayName: "PLaMo 3 Translate",
-  shortName: "PLaMo 3 Translate",
+  displayName: "PLaMo 3 Translate 0.8B (Q4_K_M)",
+  shortName: "PLaMo 3 Translate 0.8B",
   provider: "Preferred Networks, Inc.",
   family: "plamo-3-translate",
-  sourceRepo: "pfnet/plamo-3-translate-2b-GGUF",
-  modelCardUrl: "https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF",
+  sourceRepo: "pfnet/plamo-3-translate-0.8b-GGUF",
+  modelCardUrl: "https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF",
   license: {
     id: "plamo-community-license",
     name: "PLaMoコミュニティライセンス契約",
     tagline: "Built with PLaMo",
     url_ja: "https://plamo.preferredai.jp/info/plamo-community-license-ja",
     url_en: "https://plamo.preferredai.jp/info/plamo-community-license-en",
-    model_card_url: "https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF",
+    model_card_url: "https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF",
     summary_ja:
       "アプリ本体のライセンス（GNU AGPL v3 / AGPL-3.0-only）とモデルのライセンス（PLaMoコミュニティライセンス契約）は別です。モデル本体（GGUF）と推論サーバ（llama.cpp）は同梱せず別途取得する構成です。",
     disclosure_note_ja:

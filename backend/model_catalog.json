@@ -10,7 +10,7 @@
       "family": "plamo-3-translate",
       "parameter_size": "0.8B",
       "quantization": "Q4_K_M",
-      "is_default": false,
+      "is_default": true,
       "source_repo": "pfnet/plamo-3-translate-0.8b-GGUF",
       "source_repo_type": "huggingface",
       "pinned_revision": "1cf96ae02133958a20074bfdfab76517bb737d00",
@@ -44,7 +44,7 @@
         "extra_args": ["--jinja", "--no-prefill-assistant"]
       },
       "catalog_verification_status": "catalog_verified_runtime_unverified",
-      "hardware_note_ja": "約 0.57 GB（573 MB）。軽量候補。Hugging Face メタデータ・SHA-256 確認済みですが、本アプリ実機での翻訳検証は未実施です。",
+      "hardware_note_ja": "約 0.57 GB（573 MB）。初回既定・軽量モデル（ダウンロード容量を抑えて初期構築を高速化）。Hugging Face メタデータ・SHA-256 確認済み。より高精度な翻訳が必要な場合は導入後に Web UI から 2B（約 1.81 GB）へ切替可能です。",
       "license": {
         "id": "plamo-community-license",
         "name": "PLaMoコミュニティライセンス契約",
@@ -65,7 +65,7 @@
       "family": "plamo-3-translate",
       "parameter_size": "2B",
       "quantization": "Q4_K_M",
-      "is_default": true,
+      "is_default": false,
       "source_repo": "pfnet/plamo-3-translate-2b-GGUF",
       "source_repo_type": "huggingface",
       "pinned_revision": "4f672106b847200bfdc0f6af6c321cd94eba1aed",
@@ -105,7 +105,7 @@
         "extra_args": ["--jinja", "--no-prefill-assistant"]
       },
       "catalog_verification_status": "verified_runtime",
-      "hardware_note_ja": "約 1.81 GB。標準・推奨モデル（8GB VRAM Vulkan GPU 環境および本アプリ実機での翻訳動作を確認済み）。",
+      "hardware_note_ja": "約 1.81 GB。高精度・推奨モデル（8GB VRAM Vulkan GPU 環境および本アプリ実機での翻訳動作を確認済み）。",
       "license": {
         "id": "plamo-community-license",
         "name": "PLaMoコミュニティライセンス契約",

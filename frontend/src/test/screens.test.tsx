@@ -199,7 +199,7 @@ describe("Screen 1: Home, Preflight & Job Configuration (Section 5)", () => {
     expect(notice).toHaveTextContent("原著作物の翻訳・配布・公表の許諾まで与えるものではありません");
     expect(screen.getByTestId("screen1-link-plamo-model")).toHaveAttribute(
       "href",
-      "https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF"
+      "https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF"
     );
     expect(screen.getByTestId("screen1-link-plamo-license-ja")).toHaveAttribute(
       "href",
@@ -1068,7 +1068,7 @@ describe("Screen 4: Glossary CRUD, TSV Import Preview & Dynamic Diagnostics (Sec
     expect(licensePanel).toHaveTextContent("原著作物の翻訳・配布・公表の許諾まで与えるものではありません");
     expect(screen.getByTestId("link-plamo-model-repo")).toHaveAttribute(
       "href",
-      "https://huggingface.co/pfnet/plamo-3-translate-2b-GGUF"
+      "https://huggingface.co/pfnet/plamo-3-translate-0.8b-GGUF"
     );
     expect(screen.getByTestId("link-plamo-license-ja")).toHaveAttribute(
       "href",

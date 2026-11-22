@@ -5,9 +5,11 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ApiHttpError,
+  applySystemUpdate,
   browseLocalModelFile,
   cancelModelDownload,
   cancelTranslationJob,
+  checkSystemUpdate,
   createBlockSplit,
   createGlossary,
   createProtectionRegion,
@@ -71,6 +73,8 @@ import type {
   RegisteredModel,
   StartModelDownloadRequest,
   SystemDiagnostics,
+  SystemUpdateApplyResponse,
+  SystemUpdateCheckResponse,
   TranslationJobConfig,
   ValidationIssue,
 } from "./types/api";
@@ -83,7 +87,7 @@ const DEFAULT_JOB_CONFIG: TranslationJobConfig = {
   source_lang: "en",
   target_lang: "ja",
   form: "plain",
-  model_name: "plamo-3-translate-2b-Q4_K_M",
+  model_name: "plamo-3-translate-0.8b-Q4_K_M",
   quantization: "Q4_K_M",
   context_length: 8192,
   translate_captions: true,
@@ -161,18 +165,41 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
   const [isLoadingDiagnostics, setIsLoadingDiagnostics] = useState<boolean>(false);
   const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
 
+  const [updateCheckResult, setUpdateCheckResult] = useState<SystemUpdateCheckResponse | null>(
+    null
+  );
+  const [isCheckingUpdate, setIsCheckingUpdate] = useState<boolean>(false);
+  const [isApplyingUpdate, setIsApplyingUpdate] = useState<boolean>(false);
+  const [updateApplyingMessage, setUpdateApplyingMessage] = useState<string | null>(null);
+  const [updateError, setUpdateError] = useState<string | null>(null);
+
   const syncJobConfigWithOverview = useCallback((overview: ModelsOverviewResponse) => {
     const active = overview.active_model;
-    if (!active) return;
-    const cat = overview.catalog.find((c) => c.model_id === active.catalog_model_id);
-    setJobConfig((prev) => ({
-      ...prev,
-      model_id: active.catalog_model_id,
-      model_name: active.file_name || active.display_name || prev.model_name,
-      model_sha256: active.measured_sha256 || null,
-      quantization: active.quantization || prev.quantization,
-      context_length: cat?.context_length_default ?? prev.context_length,
-    }));
+    if (active) {
+      const cat = overview.catalog.find((c) => c.model_id === active.catalog_model_id);
+      setJobConfig((prev) => ({
+        ...prev,
+        model_id: active.catalog_model_id,
+        model_name: active.file_name || active.display_name || prev.model_name,
+        model_sha256: active.measured_sha256 || null,
+        quantization: active.quantization || prev.quantization,
+        context_length: cat?.context_length_default ?? prev.context_length,
+      }));
+      return;
+    }
+    const defaultCat = overview.catalog.find((c) => c.is_default) ?? overview.catalog[0];
+    if (defaultCat) {
+      const stem = defaultCat.filename.toLowerCase().endsWith(".gguf")
+        ? defaultCat.filename.slice(0, -5)
+        : defaultCat.filename;
+      setJobConfig((prev) => ({
+        ...prev,
+        model_id: prev.model_id ?? defaultCat.model_id,
+        model_name: stem || prev.model_name,
+        quantization: defaultCat.quantization || prev.quantization,
+        context_length: defaultCat.context_length_default ?? prev.context_length,
+      }));
+    }
   }, []);
 
   const refreshModelsOverview = useCallback(
@@ -891,6 +918,74 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
     await rotateSessionToken();
   };
 
+  const handleCheckSystemUpdate = async (): Promise<SystemUpdateCheckResponse> => {
+    setIsCheckingUpdate(true);
+    setUpdateError(null);
+    try {
+      const res = await checkSystemUpdate();
+      setUpdateCheckResult(res);
+      return res;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setUpdateError(msg);
+      throw err;
+    } finally {
+      setIsCheckingUpdate(false);
+    }
+  };
+
+  const handleApplySystemUpdate = async (): Promise<SystemUpdateApplyResponse> => {
+    setUpdateError(null);
+    setIsApplyingUpdate(true);
+    setUpdateApplyingMessage("アップデートを要求しています...");
+    try {
+      const res = await applySystemUpdate();
+      setUpdateApplyingMessage(
+        res.message || "アップデートを適用して再起動しています。しばらくお待ちください..."
+      );
+      return res;
+    } catch (err) {
+      setIsApplyingUpdate(false);
+      setUpdateApplyingMessage(null);
+      const msg =
+        err instanceof ApiHttpError && err.status === 409
+          ? `実行中の処理があるため更新できません (409 Conflict): ${err.detail}`
+          : err instanceof Error
+          ? err.message
+          : String(err);
+      setUpdateError(msg);
+      throw err;
+    }
+  };
+
+  // While updating, poll session endpoint after brief grace period to reload once restarted
+  useEffect(() => {
+    if (!isApplyingUpdate) return;
+    let cancelled = false;
+    let pollTimer: number | null = null;
+    const startTimer = window.setTimeout(() => {
+      pollTimer = window.setInterval(async () => {
+        if (cancelled) return;
+        try {
+          const resp = await fetch("/api/auth/session", { method: "GET" });
+          if (resp.ok && !cancelled) {
+            window.location.reload();
+          }
+        } catch {
+          // Server is restarting; keep waiting
+        }
+      }, 2000);
+    }, 4500);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(startTimer);
+      if (pollTimer !== null) {
+        window.clearInterval(pollTimer);
+      }
+    };
+  }, [isApplyingUpdate]);
+
   return (
     <div data-testid="paperbridge-app">
       {/* Global Navigation Header */}
@@ -1111,6 +1206,13 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
             onDeleteGlossary={handleDeleteGlossary}
             onPurgeTempData={handlePurgeTempData}
             onRotateToken={handleRotateToken}
+            updateCheckResult={updateCheckResult}
+            isCheckingUpdate={isCheckingUpdate}
+            isApplyingUpdate={isApplyingUpdate}
+            updateApplyingMessage={updateApplyingMessage}
+            updateError={updateError}
+            onCheckUpdate={handleCheckSystemUpdate}
+            onApplyUpdate={handleApplySystemUpdate}
           />
         )}
       </main>

@@ -33,6 +33,8 @@ import type {
   RetypesetJobResponse,
   StartModelDownloadRequest,
   SystemDiagnostics,
+  SystemUpdateApplyResponse,
+  SystemUpdateCheckResponse,
   TranslationJobConfig,
   ValidationIssue,
 } from "../types/api";
@@ -715,5 +717,18 @@ export async function restartLlamaServerForActiveModel(
   return apiRequest<ModelServerRestartResponse>("/api/models/server/restart", {
     method: "POST",
     body: JSON.stringify(payload),
+  });
+}
+
+// --- Self-Update ---
+export async function checkSystemUpdate(): Promise<SystemUpdateCheckResponse> {
+  return apiRequest<SystemUpdateCheckResponse>("/api/system/update/check", {
+    method: "GET",
+  });
+}
+
+export async function applySystemUpdate(): Promise<SystemUpdateApplyResponse> {
+  return apiRequest<SystemUpdateApplyResponse>("/api/system/update/apply", {
+    method: "POST",
   });
 }

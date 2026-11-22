@@ -116,9 +116,18 @@ def test_production_catalog_contains_curated_plamo_models_with_accurate_metadata
     ]
     default = catalog.get_default_model()
     assert default is not None
-    assert default.model_id == "plamo-3-translate-2b-q4_k_m"
-    assert default.catalog_verification_status == "verified_runtime"
-    assert len(default.all_accepted_artifacts()) == 2  # current + legacy 2B artifact hashes
+    assert default.model_id == "plamo-3-translate-0.8b-q4_k_m"
+    assert default.filename == "plamo-3-translate-0.8b-Q4_K_M.gguf"
+    assert default.known_size_bytes == 573126848
+    assert default.known_sha256 == "70891ec70dc7ab4205745a38307867c2881b99239f20327927633abfe4bc9ec6"
+    assert default.download_url.endswith("/plamo-3-translate-0.8b-Q4_K_M.gguf")
+    assert default.is_default is True
+
+    m2 = catalog.get_model("plamo-3-translate-2b-q4_k_m")
+    assert m2 is not None
+    assert m2.is_default is False
+    assert m2.catalog_verification_status == "verified_runtime"
+    assert len(m2.all_accepted_artifacts()) == 2  # current + legacy 2B artifact hashes
 
     m08 = catalog.get_model("plamo-3-translate-0.8b-q4_k_m")
     m8 = catalog.get_model("plamo-3-translate-8b-q4_k_m")

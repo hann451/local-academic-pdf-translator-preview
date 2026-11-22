@@ -548,6 +548,10 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
           {/* Active Model Quick Card & Selector */}
           {(() => {
             const activeModel = modelsOverview?.active_model ?? null;
+            const defaultCatalogModel =
+              modelsOverview?.catalog.find((c) => c.is_default) ??
+              modelsOverview?.catalog[0] ??
+              null;
             const activeCatalogModel = resolveActiveCatalogModel(modelsOverview);
             const serverMatch = modelsOverview?.server_match ?? null;
             const usableRegistered = (modelsOverview?.registered ?? []).filter(
@@ -838,7 +842,11 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
                 <div className="form-group">
                   <label className="form-label" htmlFor="inference-mode-select">
                     推論エンジン（選択中：
-                    {activeModel ? activeModel.display_name : "PLaMo 3 Translate 2B"}）
+                    {activeModel
+                      ? activeModel.display_name
+                      : defaultCatalogModel
+                      ? defaultCatalogModel.display_name
+                      : "PLaMo 3 Translate 0.8B"}）
                   </label>
                   <select
                     id="inference-mode-select"
@@ -856,7 +864,9 @@ export const Screen1HomePreflight: React.FC<Screen1Props> = ({
                       実機推論（llama.cpp +{" "}
                       {activeModel
                         ? `${activeModel.display_name} ${activeModel.quantization}`
-                        : "PLaMo 3 Translate 2B Q4_K_M"}{" "}
+                        : defaultCatalogModel
+                        ? `${defaultCatalogModel.display_name} ${defaultCatalogModel.quantization}`
+                        : "PLaMo 3 Translate 0.8B Q4_K_M"}{" "}
                       {endpointDisplay ? `@ ${endpointDisplay}` : "/ 設定済みllama-server"}）
                     </option>
                     <option value="mock">

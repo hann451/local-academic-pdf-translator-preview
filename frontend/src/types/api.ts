@@ -400,6 +400,26 @@ export interface SystemDiagnostics {
   model_server_match_status?: string | null;
   model_server_match_message?: string | null;
   model_server_mismatch?: boolean;
+  app_version?: string | null;
+}
+
+export interface SystemUpdateCheckResponse {
+  update_available: boolean;
+  current_version: string;
+  latest_version: string | null;
+  message: string;
+  status?: "up_to_date" | "update_available" | "offline_or_error" | "rate_limited";
+  is_git_repo?: boolean;
+  latest_commit_message?: string | null;
+  latest_commit_date?: string | null;
+  checked_at?: string;
+}
+
+export interface SystemUpdateApplyResponse {
+  status: "updating";
+  message: string;
+  updater_pid?: number | null;
+  log_path?: string | null;
 }
 
 export interface CatalogArtifact {

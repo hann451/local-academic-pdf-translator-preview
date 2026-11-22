@@ -14,7 +14,7 @@ function ConvertTo-SafeSlug {
 function Format-ModelSizeText {
     param([int64]$Bytes)
     if ($Bytes -le 0) { return "不明" }
-    if ($Bytes -ge 1000000000L) {
+    if ($Bytes -ge 500000000L) {
         return ("約 {0:N2} GB" -f ($Bytes / 1000000000.0))
     }
     return ("約 {0:N1} MB" -f ($Bytes / 1000000.0))

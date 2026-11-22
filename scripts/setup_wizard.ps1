@@ -10,7 +10,8 @@ param(
     [switch]$SkipShortcut = $false,
     [switch]$ForceReinstallTools = $false,
     [string]$UserDataDir = "",
-    [string]$ShortcutName = ""
+    [string]$ShortcutName = "",
+    [switch]$DryRun = $false
 )
 
 $ErrorActionPreference = "Stop"
@@ -66,6 +67,21 @@ $SetupLogPath = Join-Path $LogsDir "setup.log"
 
 $Catalog = Get-PaperBridgeModelCatalog -ProjectRoot $ProjectRoot
 $InitialCatalogModel = Get-CatalogModelById -Catalog $Catalog -ModelId $ModelId
+
+if ($DryRun) {
+    if (-not $InitialCatalogModel) {
+        Write-Error "既定または指定のカタログモデルが見つかりません: $ModelId"
+        exit 1
+    }
+    $szText = Format-ModelSizeText -Bytes ([int64]$InitialCatalogModel.known_size_bytes)
+    Write-Output "DRY_RUN_MODEL_ID:$($InitialCatalogModel.model_id)"
+    Write-Output "DRY_RUN_FILENAME:$($InitialCatalogModel.filename)"
+    Write-Output "DRY_RUN_SIZE_BYTES:$($InitialCatalogModel.known_size_bytes)"
+    Write-Output "DRY_RUN_SIZE_TEXT:$szText"
+    Write-Output "DRY_RUN_SHA256:$($InitialCatalogModel.known_sha256)"
+    Write-Output "DRY_RUN_URL:$($InitialCatalogModel.download_url)"
+    exit 0
+}
 
 # Pinned Tool Specifications (Matches docs/SETUP_WINDOWS.md and verified upstream digests)
 $PINNED_TOOLS = @{
@@ -544,7 +560,7 @@ function Show-ConsentDialog {
     for ($i = 0; $i -lt $catalogModels.Count; $i++) {
         $cm = $catalogModels[$i]
         $sz = Format-ModelSizeText -Bytes ([int64]$cm.known_size_bytes)
-        $tag = if ($cm.is_default -eq $true) { "推奨・実機検証済" } else { "候補・カタログ検証済" }
+        $tag = if ($cm.is_default -eq $true) { "初回既定・軽量" } elseif ($cm.catalog_verification_status -eq "verified_runtime") { "高精度・実機検証済" } else { "候補・カタログ検証済" }
         $cmbModelChoice.Items.Add("$($cm.display_name)  [$tag / $sz]") | Out-Null
         if ($InitialCatalogModel -and $cm.model_id -eq $InitialCatalogModel.model_id) {
             $defaultCatIdx = $i
