@@ -53,6 +53,9 @@ from backend.pdf.inline_math_vars import (
     INLINE_MASK_VERSION_LEGACY,
     INLINE_MASK_VERSION_STANDALONE_VAR,
 )
+from backend.pdf.validation.layout_regression_metrics import (
+    evaluate_document_layout_regression,
+)
 from backend.pdf.validation.preflight import (
     compute_sha256,
     inspect_pdf_preflight,
@@ -1245,6 +1248,28 @@ class JobManager:
         )
         return adapter
 
+    @staticmethod
+    def _compute_layout_regression_report(
+        *,
+        doc: Document,
+        blocks: list[Block],
+        page_indices: list[int],
+        mono_pdf_path: Path | None,
+        dual_pdf_path: Path | None,
+    ) -> dict[str, Any] | None:
+        if not Path(doc.safe_storage_path).exists():
+            return None
+        report = evaluate_document_layout_regression(
+            original_pdf_path=doc.safe_storage_path,
+            blocks=blocks,
+            page_indices=page_indices,
+            mono_pdf_path=mono_pdf_path,
+            dual_pdf_path=dual_pdf_path,
+            document_id=doc.id,
+            original_filename=doc.original_filename,
+        )
+        return report.model_dump()
+
     def run_job(
         self,
         job_id: str,
@@ -1850,6 +1875,23 @@ class JobManager:
                 )
             )
             self.db.replace_validation_issues_for_job(job.id, issues)
+            mono_for_metrics = (
+                final_dir / f"{doc.id}.ja.pdf"
+                if work_mono and (final_dir / f"{doc.id}.ja.pdf").exists()
+                else work_mono
+            )
+            dual_for_metrics = (
+                final_dir / f"{doc.id}.dual.pdf"
+                if work_dual and (final_dir / f"{doc.id}.dual.pdf").exists()
+                else work_dual
+            )
+            layout_regression_metrics = self._compute_layout_regression_report(
+                doc=doc,
+                blocks=blocks,
+                page_indices=page_indices,
+                mono_pdf_path=mono_for_metrics if (mono_for_metrics and mono_for_metrics.exists()) else None,
+                dual_pdf_path=dual_for_metrics if (dual_for_metrics and dual_for_metrics.exists()) else None,
+            )
             report_path = final_dir / f"{doc.id}.report.json"
             report_payload = {
                 "job_id": job.id,
@@ -1874,6 +1916,7 @@ class JobManager:
                 "validation_issues_count": len(issues),
                 "validation_issues": [i.model_dump() for i in issues],
                 "visual_preservation_reports": visual_reports,
+                "layout_regression_metrics": layout_regression_metrics,
             }
             report_path.write_text(
                 json.dumps(report_payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -2274,6 +2317,13 @@ class JobManager:
             job.execution_provenance = prov
 
             staging_report = staging_dir / f"{doc.id}.report.json"
+            layout_regression_metrics = self._compute_layout_regression_report(
+                doc=doc,
+                blocks=working_blocks,
+                page_indices=page_indices,
+                mono_pdf_path=staging_mono if (staging_mono and staging_mono.exists()) else None,
+                dual_pdf_path=staging_dual if (staging_dual and staging_dual.exists()) else None,
+            )
             report_payload = {
                 "job_id": job.id,
                 "document_id": doc.id,
@@ -2304,6 +2354,7 @@ class JobManager:
                 "validation_issues_count": len(issues),
                 "validation_issues": [i.model_dump() for i in issues],
                 "visual_preservation_reports": visual_reports,
+                "layout_regression_metrics": layout_regression_metrics,
             }
             staging_report.write_text(
                 json.dumps(report_payload, ensure_ascii=False, indent=2), encoding="utf-8"

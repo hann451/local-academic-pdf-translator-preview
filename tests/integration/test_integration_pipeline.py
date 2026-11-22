@@ -370,3 +370,47 @@ def test_security_blocks_external_translation_host_and_untrusted_origin(
     assert ok_resp.status_code == 200
     data = ok_resp.json()
     assert data["loopback_only_enforced"] is True
+
+
+def test_job_report_json_includes_layout_regression_metrics_for_run_and_retypeset(
+    generated_pdfs: dict[str, Path],
+    isolated_config: AppConfig,
+) -> None:
+    """Verify doc-*.report.json includes structured 4-metric layout_regression_metrics after run_job and retypeset."""
+    import json
+    from backend.domain.models import LayoutRegressionReport
+
+    mgr = JobManager(config=isolated_config)
+    doc = mgr.register_document(generated_pdfs["two_col_figures_tables_2p"])
+    job = mgr.create_job(
+        doc.id,
+        TranslationJobConfig(
+            use_mock_translator=True,
+            output_mono_pdf=True,
+            output_dual_pdf=True,
+        ),
+    )
+    done = mgr.run_job(job.id)
+    assert done.state in (JobState.COMPLETED, JobState.COMPLETED_WITH_WARNINGS)
+
+    artifacts = mgr.db.list_export_artifacts(job.id)
+    report_art = next(a for a in artifacts if a.artifact_type == "validation_report_json")
+    report_data = json.loads(Path(report_art.file_path).read_text(encoding="utf-8"))
+    assert "layout_regression_metrics" in report_data
+    reg_report = LayoutRegressionReport.model_validate(report_data["layout_regression_metrics"])
+    assert reg_report.total_pages_evaluated == 2
+    assert len(reg_report.pages) == 2
+    assert reg_report.pages[0].column_order.detected_column_count == 2
+    assert reg_report.pages[0].column_order.is_monotonic is True
+    assert reg_report.pages[0].protected_alignment is not None
+    assert set(reg_report.pages[0].protected_alignment.checked_targets) == {"mono", "dual"}
+
+    # Also verify retypeset_job emits layout_regression_metrics without altering validation_issues_count contract
+    rt_res = mgr.retypeset_job(job.id)
+    rt_report_art = next(
+        a for a in rt_res["artifacts"] if a.artifact_type == "validation_report_json"
+    )
+    rt_report_data = json.loads(Path(rt_report_art.file_path).read_text(encoding="utf-8"))
+    assert "layout_regression_metrics" in rt_report_data
+    rt_reg_report = LayoutRegressionReport.model_validate(rt_report_data["layout_regression_metrics"])
+    assert rt_reg_report.total_pages_evaluated == 2
