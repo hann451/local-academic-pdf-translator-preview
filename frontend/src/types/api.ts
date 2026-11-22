@@ -274,6 +274,25 @@ export interface ExportArtifact {
   created_at: string;
 }
 
+export interface SaveArtifactAsResponse {
+  canceled: boolean;
+  saved_path: string | null;
+  filename: string | null;
+  byte_size: number;
+  sha256_hash: string | null;
+}
+
+export type ArtifactSaveMethod = "file_picker" | "native_dialog" | "blob_download";
+
+export interface ArtifactSaveResult {
+  canceled: boolean;
+  filename: string;
+  savedPath: string | null;
+  byteSize: number;
+  method: ArtifactSaveMethod;
+  revokedUrl: boolean;
+}
+
 export interface TranslationJobConfig {
   page_range_spec: string | null;
   source_lang: string;

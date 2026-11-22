@@ -537,3 +537,15 @@ body {
   gap: 12px;
   margin-top: 12px;
 }
+
+.artifact-card-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.btn-compact {
+  padding: 5px 10px;
+  font-size: 11px;
+}

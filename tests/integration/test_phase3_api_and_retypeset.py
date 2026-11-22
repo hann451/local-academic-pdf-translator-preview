@@ -17,7 +17,9 @@ Covers Section 3, 4, 5, 6, 7, 8, 9, 11 of the Phase 3 specification:
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 import json
+import subprocess
 import uuid
 
 import pymupdf
@@ -1118,3 +1120,151 @@ def test_http_retypeset_protection_change_and_unrelated_block_guard(
         ("iss-b2-untrans", b2.id, "UNTRANSLATED_SOURCE_RETURNED")
     ]
     assert rt.json()["job"]["warning_count"] == 1
+
+
+def test_save_artifact_as_native_dialog_success_cancel_guards_and_auth(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    isolated_config: AppConfig,
+    generated_pdfs: dict[str, Path],
+) -> None:
+    """Verify POST /api/jobs/{job_id}/artifacts/{artifact_type}/save-as:
+    - Enforces auth (401), safe ID/type validation (400/404).
+    - Passes dynamic filename/initial_dir safely via env (never interpolated into PowerShell script).
+    - Atomically copies artifact to Japanese user-chosen path, remembers last save dir, and leaves original untouched.
+    - Handles user cancel cleanly (`canceled=True`).
+    - Refuses overwriting original uploaded PDF, internal artifact, or runtime uploads/db directories (400).
+    - Returns 501 on non-Windows OS so frontend falls back cleanly.
+    """
+    mgr = JobManager(config=isolated_config, translation_adapter=MockPlamoAdapter())
+    app = create_app(config=isolated_config, job_manager=mgr, session_token="test-tok")
+    client = TestClient(app)
+    headers = {"X-PaperBridge-Token": "test-tok"}
+
+    src_pdf = generated_pdfs["single_col_math"]
+    orig_sha = compute_sha256(src_pdf)
+    with open(src_pdf, "rb") as f:
+        doc = client.post(
+            "/api/documents/upload",
+            files={"file": ("single_col_math.pdf", f, "application/pdf")},
+            headers=headers,
+        ).json()
+    job = client.post(
+        f"/api/documents/{doc['id']}/jobs",
+        json=TranslationJobConfig(use_mock_translator=True).model_dump(),
+        headers=headers,
+    ).json()
+    job_id = job["id"]
+    artifacts = client.get(f"/api/jobs/{job_id}/artifacts", headers=headers).json()
+    mono_art = next(a for a in artifacts if a["artifact_type"] == "mono_ja_pdf")
+
+    # 1. Auth & validation errors
+    assert (
+        client.post(f"/api/jobs/{job_id}/artifacts/mono_ja_pdf/save-as").status_code
+        == 401
+    )
+    assert (
+        client.post(
+            f"/api/jobs/{job_id}/artifacts/invalid_type/save-as", headers=headers
+        ).status_code
+        == 400
+    )
+    assert (
+        client.post(
+            "/api/jobs/bad$id!/artifacts/mono_ja_pdf/save-as", headers=headers
+        ).status_code
+        == 400
+    )
+    assert (
+        client.post(
+            "/api/jobs/job-missing/artifacts/mono_ja_pdf/save-as", headers=headers
+        ).status_code
+        == 404
+    )
+
+    monkeypatch.setattr("backend.api.app._is_windows", lambda: True)
+    captured_calls: list[dict[str, Any]] = []
+    queued_outputs: list[str] = []
+
+    def fake_subprocess_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured_calls.append({"args": args, "env": dict(kwargs.get("env") or {})})
+        out = queued_outputs.pop(0) if queued_outputs else ""
+        return subprocess.CompletedProcess(
+            args=["powershell.exe"], returncode=0, stdout=out, stderr=""
+        )
+
+    monkeypatch.setattr("backend.api.app.subprocess.run", fake_subprocess_run)
+
+    # 2. Successful save to Japanese folder & filename
+    out_dir1 = tmp_path / "保存先 フォルダ (日本語)"
+    dest1 = out_dir1 / "翻訳済み論文.ja.pdf"
+    queued_outputs.append(str(dest1))
+    res1 = client.post(
+        f"/api/jobs/{job_id}/artifacts/mono_ja_pdf/save-as",
+        headers=headers,
+    )
+    assert res1.status_code == 200, res1.text
+    body1 = res1.json()
+    assert body1["canceled"] is False
+    assert Path(body1["saved_path"]) == dest1.resolve()
+    assert body1["filename"] == "翻訳済み論文.ja.pdf"
+    assert body1["byte_size"] == dest1.stat().st_size
+    assert body1["sha256_hash"] == mono_art["sha256_hash"]
+    assert compute_sha256(dest1) == mono_art["sha256_hash"]
+    assert verify_original_unchanged(src_pdf, orig_sha)
+
+    env1 = captured_calls[-1]["env"]
+    assert env1["PB_SAVE_FILENAME"] == "single_col_math.ja.pdf"
+    assert env1["PB_SAVE_DEFAULT_EXT"] == "pdf"
+    assert "*.pdf" in env1["PB_SAVE_FILTER"]
+    # Dynamic values are passed via env and never interpolated into the PowerShell script text
+    ps_cmd = captured_calls[-1]["args"][0][-1]
+    assert "single_col_math.ja.pdf" not in ps_cmd
+    assert "$env:PB_SAVE_FILENAME" in ps_cmd
+
+    # 3. Second save remembers previous folder (`out_dir1`) and supports JSON report
+    dest2 = out_dir1 / "レポート.report.json"
+    queued_outputs.append(str(dest2))
+    res2 = client.post(
+        f"/api/jobs/{job_id}/artifacts/validation_report_json/save-as",
+        headers=headers,
+    )
+    assert res2.status_code == 200, res2.text
+    env2 = captured_calls[-1]["env"]
+    assert Path(env2["PB_SAVE_INITIAL_DIR"]).resolve() == out_dir1.resolve()
+    assert env2["PB_SAVE_FILENAME"] == "single_col_math.report.json"
+    assert env2["PB_SAVE_DEFAULT_EXT"] == "json"
+    assert dest2.is_file()
+    assert "validation_issues_count" in json.loads(dest2.read_text(encoding="utf-8"))
+
+    # 4. User cancel
+    queued_outputs.append("")
+    res_cancel = client.post(
+        f"/api/jobs/{job_id}/artifacts/mono_ja_pdf/save-as",
+        headers=headers,
+    )
+    assert res_cancel.status_code == 200
+    assert res_cancel.json()["canceled"] is True
+    assert res_cancel.json()["saved_path"] is None
+
+    # 5. Overwrite protection guards (original uploaded PDF, internal artifact, uploads/, db/)
+    for forbidden in (
+        doc["safe_storage_path"],
+        mono_art["file_path"],
+        str(isolated_config.runtime_dir / "uploads" / "forbidden.pdf"),
+        str(isolated_config.runtime_dir / "db" / "forbidden.pdf"),
+    ):
+        queued_outputs.append(forbidden)
+        guard_resp = client.post(
+            f"/api/jobs/{job_id}/artifacts/mono_ja_pdf/save-as",
+            headers=headers,
+        )
+        assert guard_resp.status_code == 400
+
+    # 6. Non-Windows returns 501 Not Implemented cleanly
+    monkeypatch.setattr("backend.api.app._is_windows", lambda: False)
+    non_win = client.post(
+        f"/api/jobs/{job_id}/artifacts/mono_ja_pdf/save-as",
+        headers=headers,
+    )
+    assert non_win.status_code == 501

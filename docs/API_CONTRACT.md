@@ -98,6 +98,7 @@
 | `GET /api/jobs/{job_id}/issues` | 既存 | パス `job_id` | `list[ValidationIssue]` | `401`, `404` |
 | `GET /api/jobs/{job_id}/artifacts` | 既存 | パス `job_id` | `list[ExportArtifact]` | `401`, `404` |
 | `GET /api/jobs/{job_id}/artifacts/{artifact_type}/download` | **新設** | パス `job_id`, `artifact_type` (`mono_ja_pdf` \| `dual_bilingual_pdf` \| `roundtrip_pdf` \| `validation_report_json`) | ファイルバイナリ (`application/pdf` または `application/json`) | `400`, `401`, `404` |
+| `POST /api/jobs/{job_id}/artifacts/{artifact_type}/save-as` | **拡張** | パス `job_id`, `artifact_type`（Windows ローカル `SaveFileDialog` を開き、ユーザ選択先へ安全に原子コピー。保存先パスをリクエストから受け付けない） | `SaveArtifactAsResponse { canceled, saved_path, filename, byte_size, sha256_hash }` | `400`, `401`, `404`, `408`, `500`, `501` |
 
 ### 3.4 用語集（Glossary）管理
 | メソッド & パス | 区分 | リクエスト | レスポンス | エラー |
@@ -138,3 +139,9 @@
 - `use_as_context=true` の高確信候補だけ、隣接する本文をマスク済み・長さ制限付きのPFML3文脈として使う。これは連結翻訳ではない。物理Block、bbox、翻訳・検証・キャッシュ・手動編集単位は引き続き個別で、複数領域へ訳文を分配しない。
 - 見出し、参考文献、キャプション、図表、独立数式、候補を分断する全幅コンテンツ、手動編集・保護との衝突、非連続ページ、段組変更は候補から除外する。一般脚注専用の分類はなく、脚注除外を完全には保証しない。利用者向け候補の承認・解除UIは未実装である。
 - `Job.total_blocks` / `processed_blocks` は従来どおり物理ブロック数であり、論理翻訳単位数ではない。
+
+### 成果物「名前を付けて保存（保存先選択）」（2026-11-22）
+- 画面3の「💾 保存先を選んで保存」では 3 段フォールバック方式を採用する：
+  1. ブラウザの File System Access API（`window.showSaveFilePicker`）をユーザー操作の同期コンテキスト内で起動し、選択された書き込みハンドルへ `GET /api/jobs/{job_id}/artifacts/{artifact_type}/download` の取得結果を書き込む。`AbortError`（キャンセル）時はフォールバックせず中断する。
+  2. `showSaveFilePicker` が利用不可またはポリシー等でブロックされた場合、`POST /api/jobs/{job_id}/artifacts/{artifact_type}/save-as` でローカル Windows ネイティブ `SaveFileDialog` を開き、原本PDF・作業成果物・`runtime_dir/uploads`・`runtime_dir/db` への上書きを拒否した上で原子的にコピーする。
+  3. 非 Windows 環境等で `501`/`405` が返った場合、および「⬇ 既定フォルダへダウンロード」ボタンを押した場合は、認証付き `fetch` ＋一時 `Blob` URL 経由の既定フォルダダウンロードを使用する。

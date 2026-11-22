@@ -11,6 +11,7 @@ Security enforcement:
 
 from __future__ import annotations
 
+import os
 import re
 import secrets
 import shutil
@@ -72,6 +73,7 @@ from backend.updater import (
 )
 
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+_INVALID_FILENAME_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _ALLOWED_ARTIFACT_TYPES = {
     "mono_ja_pdf",
     "dual_bilingual_pdf",
@@ -194,6 +196,113 @@ class ModelsOverviewResponse(BaseModel):
     managed_models_dir: str
     downloads: list[ModelDownloadJob] = Field(default_factory=list)
     server_match: ModelServerMatchResult | None = None
+
+
+class SaveArtifactAsResponse(BaseModel):
+    canceled: bool
+    saved_path: str | None = None
+    filename: str | None = None
+    byte_size: int = 0
+    sha256_hash: str | None = None
+
+
+def _sanitize_download_filename(filename: str, fallback: str) -> str:
+    base = filename.replace("\\", "/").split("/")[-1]
+    cleaned = _INVALID_FILENAME_CHARS_RE.sub("_", base).strip(" .")
+    return cleaned or fallback
+
+
+def _build_artifact_download_filename(
+    original_filename: str | None,
+    document_id: str,
+    artifact_type: str,
+    fallback_name: str,
+) -> str:
+    safe_orig = _sanitize_download_filename(original_filename or "", document_id)
+    base_stem = Path(safe_orig).stem or document_id
+    suffix_map = {
+        "mono_ja_pdf": f"{base_stem}.ja.pdf",
+        "dual_bilingual_pdf": f"{base_stem}.dual.pdf",
+        "roundtrip_pdf": f"{base_stem}.roundtrip.pdf",
+        "validation_report_json": f"{base_stem}.report.json",
+    }
+    candidate = suffix_map.get(artifact_type, fallback_name)
+    return _sanitize_download_filename(candidate, fallback_name)
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _open_windows_save_file_dialog(
+    default_filename: str,
+    file_filter: str,
+    default_ext: str,
+    title: str,
+    initial_dir: Path | None = None,
+) -> str | None:
+    """Open a native Windows SaveFileDialog on localhost via PowerShell STA."""
+    if not _is_windows():
+        raise NotImplementedError("Windows SaveFileDialog is only supported on Windows.")
+
+    env = os.environ.copy()
+    env["PB_SAVE_TITLE"] = title
+    env["PB_SAVE_FILTER"] = file_filter
+    env["PB_SAVE_DEFAULT_EXT"] = default_ext
+    env["PB_SAVE_FILENAME"] = default_filename
+    env["PB_SAVE_INITIAL_DIR"] = (
+        str(initial_dir) if initial_dir and initial_dir.exists() and initial_dir.is_dir() else ""
+    )
+
+    ps_script = (
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+        "$OutputEncoding = [System.Text.Encoding]::UTF8; "
+        "Add-Type -AssemblyName System.Windows.Forms; "
+        "Add-Type -AssemblyName System.Drawing; "
+        "$owner = New-Object System.Windows.Forms.Form; "
+        "$owner.TopMost = $true; "
+        "$owner.ShowInTaskbar = $false; "
+        "$owner.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedToolWindow; "
+        "$owner.Opacity = 0; "
+        "$owner.Size = New-Object System.Drawing.Size(1, 1); "
+        "$owner.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen; "
+        "$dlg = New-Object System.Windows.Forms.SaveFileDialog; "
+        "$dlg.Title = $env:PB_SAVE_TITLE; "
+        "$dlg.Filter = $env:PB_SAVE_FILTER; "
+        "$dlg.DefaultExt = $env:PB_SAVE_DEFAULT_EXT; "
+        "$dlg.FileName = $env:PB_SAVE_FILENAME; "
+        "$dlg.AddExtension = $true; "
+        "$dlg.OverwritePrompt = $true; "
+        "$dlg.ValidateNames = $true; "
+        "$dlg.RestoreDirectory = $true; "
+        "if (-not [string]::IsNullOrWhiteSpace($env:PB_SAVE_INITIAL_DIR) -and (Test-Path -LiteralPath $env:PB_SAVE_INITIAL_DIR)) { "
+        "$dlg.InitialDirectory = $env:PB_SAVE_INITIAL_DIR; "
+        "}; "
+        "try { "
+        "$owner.Show(); "
+        "$owner.Activate(); "
+        "if ($dlg.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dlg.FileName } "
+        "} finally { "
+        "$dlg.Dispose(); "
+        "$owner.Close(); "
+        "$owner.Dispose(); "
+        "}"
+    )
+    proc = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-STA", "-Command", ps_script],
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=300,
+        check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if proc.returncode != 0:
+        err_msg = (proc.stderr or "").strip() or f"SaveFileDialog exited with code {proc.returncode}"
+        raise RuntimeError(err_msg)
+    chosen = (proc.stdout or "").strip()
+    return chosen or None
 
 
 def _open_windows_gguf_file_dialog(initial_dir: Path | None = None) -> str | None:
@@ -343,6 +452,7 @@ def create_app(
     app.state.llama_server_manager = srv_mgr
     app.state.system_updater = updater
     app.state.session_token = active_token
+    app.state.last_artifact_save_dir = None
 
     # Section 4 & 16: Never allow wildcard '*' CORS
     app.add_middleware(
@@ -1205,14 +1315,10 @@ def create_app(
         _validate_safe_id(job_id, "job_id")
         return mgr.db.list_export_artifacts(job_id)
 
-    @app.get("/api/jobs/{job_id}/artifacts/{artifact_type}/download")
-    def download_job_artifact(
+    def _resolve_finalized_artifact(
         job_id: str,
         artifact_type: str,
-        request: Request,
-        inline: bool = False,
-        _sec: None = Depends(verify_security_headers),
-    ) -> Response:
+    ) -> tuple[Job, ExportArtifact, Path, Document | None, str]:
         _validate_safe_id(job_id, "job_id")
         if artifact_type not in _ALLOWED_ARTIFACT_TYPES:
             raise HTTPException(
@@ -1223,7 +1329,10 @@ def create_app(
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
         artifacts = mgr.db.list_export_artifacts(job_id)
-        art = next((a for a in artifacts if a.artifact_type == artifact_type and a.is_finalized), None)
+        art = next(
+            (a for a in artifacts if a.artifact_type == artifact_type and a.is_finalized),
+            None,
+        )
         if not art:
             raise HTTPException(
                 status_code=404,
@@ -1231,13 +1340,25 @@ def create_app(
             )
         safe_path = _ensure_within_runtime_dir(Path(art.file_path), cfg.runtime_dir)
         doc = mgr.db.get_document(job.document_id)
-        base_stem = Path(doc.original_filename).stem if doc and doc.original_filename else job.document_id
-        suffix_map = {
-            "mono_ja_pdf": f"{base_stem}.ja.pdf",
-            "dual_bilingual_pdf": f"{base_stem}.dual.pdf",
-            "roundtrip_pdf": f"{base_stem}.roundtrip.pdf",
-            "validation_report_json": f"{base_stem}.report.json",
-        }
+        default_filename = _build_artifact_download_filename(
+            doc.original_filename if doc else None,
+            job.document_id,
+            artifact_type,
+            safe_path.name,
+        )
+        return job, art, safe_path, doc, default_filename
+
+    @app.get("/api/jobs/{job_id}/artifacts/{artifact_type}/download")
+    def download_job_artifact(
+        job_id: str,
+        artifact_type: str,
+        request: Request,
+        inline: bool = False,
+        _sec: None = Depends(verify_security_headers),
+    ) -> Response:
+        _job, _art, safe_path, _doc, default_filename = _resolve_finalized_artifact(
+            job_id, artifact_type
+        )
         media_type = (
             "application/json; charset=utf-8"
             if artifact_type == "validation_report_json"
@@ -1247,8 +1368,128 @@ def create_app(
             request=request,
             file_path=safe_path,
             media_type=media_type,
-            download_filename=suffix_map.get(artifact_type, safe_path.name),
+            download_filename=default_filename,
             inline=inline,
+        )
+
+    @app.post(
+        "/api/jobs/{job_id}/artifacts/{artifact_type}/save-as",
+        response_model=SaveArtifactAsResponse,
+    )
+    async def save_job_artifact_as(
+        job_id: str,
+        artifact_type: str,
+        _sec: None = Depends(verify_security_headers),
+    ) -> SaveArtifactAsResponse:
+        _job, art, safe_path, doc, default_filename = _resolve_finalized_artifact(
+            job_id, artifact_type
+        )
+        last_dir = getattr(app.state, "last_artifact_save_dir", None)
+        if isinstance(last_dir, Path) and last_dir.exists() and last_dir.is_dir():
+            initial_dir: Path | None = last_dir
+        else:
+            downloads_dir = Path.home() / "Downloads"
+            documents_dir = Path.home() / "Documents"
+            if downloads_dir.exists() and downloads_dir.is_dir():
+                initial_dir = downloads_dir
+            elif documents_dir.exists() and documents_dir.is_dir():
+                initial_dir = documents_dir
+            else:
+                initial_dir = Path.home()
+
+        if artifact_type == "validation_report_json":
+            file_filter = "JSON レポート (*.json)|*.json|すべてのファイル (*.*)|*.*"
+            default_ext = "json"
+            dialog_title = "検証レポート JSON の保存先を選択してください"
+        else:
+            file_filter = "PDF 文書 (*.pdf)|*.pdf|すべてのファイル (*.*)|*.*"
+            default_ext = "pdf"
+            dialog_title = "翻訳成果物 PDF の保存先を選択してください"
+
+        try:
+            chosen = await anyio.to_thread.run_sync(
+                lambda: _open_windows_save_file_dialog(
+                    default_filename=default_filename,
+                    file_filter=file_filter,
+                    default_ext=default_ext,
+                    title=dialog_title,
+                    initial_dir=initial_dir,
+                )
+            )
+        except NotImplementedError as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise HTTPException(
+                status_code=408,
+                detail="保存先選択ダイアログがタイムアウトしました。再度お試しください。",
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"保存先選択ダイアログを開けませんでした: {exc}",
+            ) from exc
+
+        if not chosen:
+            return SaveArtifactAsResponse(canceled=True)
+
+        dest_path = Path(chosen).resolve()
+        if dest_path == safe_path.resolve():
+            raise HTTPException(
+                status_code=400,
+                detail="内部作業用成果物ファイル自体は保存先として選択できません。別の保存先を指定してください。",
+            )
+        if doc and doc.safe_storage_path and dest_path == Path(doc.safe_storage_path).resolve():
+            raise HTTPException(
+                status_code=400,
+                detail="原本PDFファイルを上書きすることはできません。別のファイル名またはフォルダを指定してください。",
+            )
+        uploads_root = (cfg.runtime_dir / "uploads").resolve()
+        db_root = (cfg.runtime_dir / "db").resolve()
+        if dest_path.is_relative_to(uploads_root) or dest_path.is_relative_to(db_root):
+            raise HTTPException(
+                status_code=400,
+                detail="アプリ内部の管理ディレクトリ（uploads / db）内には保存できません。別のフォルダを指定してください。",
+            )
+        if dest_path.exists() and dest_path.is_dir():
+            raise HTTPException(
+                status_code=400,
+                detail="指定されたパスはディレクトリです。ファイル名を指定してください。",
+            )
+
+        def _copy_atomically() -> int:
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_dest: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    dir=dest_path.parent,
+                    prefix=".paperbridge_save_",
+                    suffix=".tmp",
+                    delete=False,
+                ) as tmp_f:
+                    tmp_dest = Path(tmp_f.name)
+                shutil.copyfile(safe_path, tmp_dest)
+                os.replace(tmp_dest, dest_path)
+                tmp_dest = None
+            finally:
+                if tmp_dest is not None:
+                    tmp_dest.unlink(missing_ok=True)
+            return dest_path.stat().st_size
+
+        try:
+            written_size = await anyio.to_thread.run_sync(_copy_atomically)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"保存先への書き込みに失敗しました（別アプリで開かれているか書き込み権限がありません）: {exc}",
+            ) from exc
+
+        app.state.last_artifact_save_dir = dest_path.parent
+        return SaveArtifactAsResponse(
+            canceled=False,
+            saved_path=str(dest_path),
+            filename=dest_path.name,
+            byte_size=written_size,
+            sha256_hash=art.sha256_hash,
         )
 
     @app.post("/api/jobs/{job_id}/resume", response_model=Job)

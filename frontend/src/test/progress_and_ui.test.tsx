@@ -70,6 +70,8 @@ const mockApi = vi.hoisted(() => ({
   retranslateSpecificBlocks: vi.fn(),
   retypesetJob: vi.fn(),
   downloadArtifactFile: vi.fn(),
+  saveArtifactViaNativeDialog: vi.fn(),
+  saveArtifactWithPicker: vi.fn(),
   createGlossary: vi.fn(),
   updateGlossary: vi.fn(),
   deleteGlossary: vi.fn(),

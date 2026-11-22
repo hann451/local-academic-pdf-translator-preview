@@ -15,10 +15,13 @@ import {
 import { parseGlossaryInput } from "../utils/glossaryParser";
 import { validateManualEditClientSide } from "../utils/manualEditValidator";
 import {
+  ApiHttpError,
   downloadArtifactFile,
+  saveArtifactWithPicker,
   setApiBaseUrl,
   setInMemorySessionTokenForTest,
 } from "../api/client";
+import { buildSuggestedArtifactFilename } from "../utils/artifactFilename";
 import { PIPELINE_STAGES_13 } from "../types/api";
 
 describe("Page numbering & Page Range Validator (Section 5 & 11)", () => {
@@ -266,5 +269,179 @@ describe("Manual Edit Pre-save Validator & Security Helpers (Section 4 & 7)", ()
     createObjSpy.mockRestore();
     revokeObjSpy.mockRestore();
     expect(PIPELINE_STAGES_13).toHaveLength(13);
+  });
+
+  it("builds sanitized suggested artifact filenames cleanly", () => {
+    expect(
+      buildSuggestedArtifactFilename("paper_v1.pdf", "doc-1", "mono_ja_pdf")
+    ).toBe("paper_v1.ja.pdf");
+    expect(
+      buildSuggestedArtifactFilename("C:\\Users\\alice\\bad:name?.pdf", "doc-1", "dual_bilingual_pdf")
+    ).toBe("bad_name_.dual.pdf");
+    expect(
+      buildSuggestedArtifactFilename(null, "doc-fallback", "validation_report_json")
+    ).toBe("doc-fallback.report.json");
+  });
+
+  it("saves artifacts via showSaveFilePicker, aborts cleanly on cancel, and falls back to native dialog or blob download", async () => {
+    setApiBaseUrl("");
+    setInMemorySessionTokenForTest("unit-test-token");
+    const winObj = window as unknown as { showSaveFilePicker?: unknown };
+
+    try {
+      // 1. Tier 1: File System Access API success (verifies WebIDL `this === window` binding)
+      const writtenChunks: unknown[] = [];
+      let closed = false;
+      const pickerSpy = vi.fn(async function (this: unknown, _options?: unknown) {
+        if (this !== window) {
+          throw new TypeError("Illegal invocation");
+        }
+        return {
+          name: "custom_output.ja.pdf",
+          createWritable: async () => ({
+            write: async (data: unknown) => {
+              writtenChunks.push(data);
+            },
+            close: async () => {
+              closed = true;
+            },
+          }),
+        };
+      });
+      winObj.showSaveFilePicker = pickerSpy;
+
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+        new Response(new Uint8Array([0x25, 0x50, 0x44, 0x46]), {
+          status: 200,
+          headers: {
+            "Content-Type": "application/pdf",
+            "Content-Disposition": "attachment; filename*=UTF-8''paper.ja.pdf",
+          },
+        })
+      );
+
+      const t1 = await saveArtifactWithPicker("job-1", "mono_ja_pdf", "paper.ja.pdf");
+      expect(pickerSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: "paperbridge-artifact-save",
+          suggestedName: "paper.ja.pdf",
+          startIn: "downloads",
+        })
+      );
+      expect(fetchSpy).toHaveBeenCalledWith(
+        "/api/jobs/job-1/artifacts/mono_ja_pdf/download",
+        expect.objectContaining({
+          method: "GET",
+          headers: { "X-PaperBridge-Token": "unit-test-token" },
+        })
+      );
+      expect(writtenChunks).toHaveLength(1);
+      expect(closed).toBe(true);
+      expect(t1).toEqual({
+        canceled: false,
+        filename: "custom_output.ja.pdf",
+        savedPath: null,
+        byteSize: 4,
+        method: "file_picker",
+        revokedUrl: false,
+      });
+
+      // 2. Tier 1: AbortError stops immediately without calling fetch or native dialog
+      fetchSpy.mockClear();
+      winObj.showSaveFilePicker = vi
+        .fn()
+        .mockRejectedValue(new DOMException("User aborted", "AbortError"));
+      const t1Cancel = await saveArtifactWithPicker("job-1", "mono_ja_pdf", "paper.ja.pdf");
+      expect(t1Cancel.canceled).toBe(true);
+      expect(t1Cancel.method).toBe("file_picker");
+      expect(fetchSpy).not.toHaveBeenCalled();
+
+      // 3. Tier 1 SecurityError falls back to Tier 2 native dialog
+      winObj.showSaveFilePicker = vi
+        .fn()
+        .mockRejectedValue(new DOMException("Blocked by policy", "SecurityError"));
+      fetchSpy.mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            canceled: false,
+            saved_path: "D:\\Papers\\paper.ja.pdf",
+            filename: "paper.ja.pdf",
+            byte_size: 4096,
+            sha256_hash: "abc",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        )
+      );
+      const t2FromSec = await saveArtifactWithPicker("job-1", "mono_ja_pdf", "paper.ja.pdf");
+      expect(fetchSpy).toHaveBeenCalledWith(
+        "/api/jobs/job-1/artifacts/mono_ja_pdf/save-as",
+        expect.objectContaining({ method: "POST" })
+      );
+      expect(t2FromSec).toEqual({
+        canceled: false,
+        filename: "paper.ja.pdf",
+        savedPath: "D:\\Papers\\paper.ja.pdf",
+        byteSize: 4096,
+        method: "native_dialog",
+        revokedUrl: false,
+      });
+
+      // 4. Tier 2 native dialog cancel when showSaveFilePicker is absent
+      delete winObj.showSaveFilePicker;
+      fetchSpy.mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            canceled: true,
+            saved_path: null,
+            filename: null,
+            byte_size: 0,
+            sha256_hash: null,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        )
+      );
+      const t2Cancel = await saveArtifactWithPicker("job-1", "mono_ja_pdf", "paper.ja.pdf");
+      expect(t2Cancel.canceled).toBe(true);
+      expect(t2Cancel.method).toBe("native_dialog");
+
+      // 5. Tier 2 HTTP 501 falls back to Tier 3 Blob download
+      const createObjSpy = vi
+        .spyOn(URL, "createObjectURL")
+        .mockReturnValue("blob:http://127.0.0.1:5173/fallback-blob");
+      const revokeObjSpy = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+      fetchSpy
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ detail: "Not implemented" }), {
+            status: 501,
+            headers: { "Content-Type": "application/json" },
+          })
+        )
+        .mockResolvedValueOnce(
+          new Response(new Uint8Array([0x25, 0x50, 0x44, 0x46]), {
+            status: 200,
+            headers: {
+              "Content-Type": "application/pdf",
+              "Content-Disposition": "attachment; filename*=UTF-8''paper.ja.pdf",
+            },
+          })
+        );
+      const t3 = await saveArtifactWithPicker("job-1", "mono_ja_pdf", "paper.ja.pdf");
+      expect(t3).toEqual({
+        canceled: false,
+        filename: "paper.ja.pdf",
+        savedPath: null,
+        byteSize: 4,
+        method: "blob_download",
+        revokedUrl: true,
+      });
+      expect(revokeObjSpy).toHaveBeenCalledWith("blob:http://127.0.0.1:5173/fallback-blob");
+      expect(ApiHttpError).toBeDefined();
+
+      createObjSpy.mockRestore();
+      revokeObjSpy.mockRestore();
+      fetchSpy.mockRestore();
+    } finally {
+      delete winObj.showSaveFilePicker;
+    }
   });
 });

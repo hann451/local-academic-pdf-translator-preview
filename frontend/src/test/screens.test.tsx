@@ -990,6 +990,109 @@ describe("Screen 3: 13-Stage Progress, Cancel Distinction, Manual Edit & Retypes
     ).toHaveTextContent("要再翻訳");
     expect(screen.getByTestId("retranslate-block-btn")).toBeDisabled();
   });
+
+  it("allows choosing artifact save location, shows native saved path / cancel feedback / error banner, and supports quick download", async () => {
+    const onDownloadArtifact = vi
+      .fn()
+      .mockResolvedValueOnce({
+        canceled: false,
+        filename: "attention_math.ja.pdf",
+        savedPath: "D:\\Research\\attention_math.ja.pdf",
+        byteSize: 135000,
+        method: "native_dialog",
+        revokedUrl: false,
+      })
+      .mockResolvedValueOnce({
+        canceled: true,
+        filename: "attention_math.ja.pdf",
+        savedPath: null,
+        byteSize: 0,
+        method: "file_picker",
+        revokedUrl: false,
+      })
+      .mockRejectedValueOnce(new Error("保存先への書き込みに失敗しました"))
+      .mockResolvedValueOnce({
+        canceled: false,
+        filename: "attention_math.ja.pdf",
+        savedPath: null,
+        byteSize: 135000,
+        method: "blob_download",
+        revokedUrl: true,
+      });
+
+    render(
+      <Screen3ProgressReview
+        document={SAMPLE_DOC}
+        originalPdfBytes={null}
+        translatedPdfBytes={null}
+        job={{ ...sampleJob, state: "completed", cancel_requested: false }}
+        blocks={SAMPLE_BLOCKS}
+        issues={[]}
+        artifacts={sampleArtifacts}
+        isCanceling={false}
+        isResuming={false}
+        isRetypesetting={false}
+        isRetranslatingBlock={false}
+        retypesetMessage={null}
+        retypesetError={null}
+        onCancelJob={vi.fn()}
+        onResumeJob={vi.fn()}
+        onSaveManualEdit={vi.fn()}
+        onRetranslateBlock={vi.fn()}
+        onRetypesetJob={vi.fn()}
+        onDownloadArtifact={onDownloadArtifact}
+      />
+    );
+
+    const saveAsBtn = screen.getByTestId("download-artifact-mono_ja_pdf");
+    const quickBtn = screen.getByTestId("quick-download-artifact-mono_ja_pdf");
+    expect(saveAsBtn).toHaveTextContent("保存先を選んで保存");
+    expect(quickBtn).toHaveTextContent("既定フォルダへダウンロード");
+
+    // 1. Save with chosen location (native_dialog)
+    fireEvent.click(saveAsBtn);
+    await waitFor(() => {
+      expect(screen.getByTestId("download-feedback-banner")).toHaveTextContent(
+        "D:\\Research\\attention_math.ja.pdf に保存しました"
+      );
+    });
+    expect(onDownloadArtifact).toHaveBeenNthCalledWith(
+      1,
+      "mono_ja_pdf",
+      "attention_math.ja.pdf",
+      { chooseLocation: true }
+    );
+
+    // 2. Canceled save
+    fireEvent.click(saveAsBtn);
+    await waitFor(() => {
+      expect(screen.getByTestId("download-feedback-banner")).toHaveTextContent(
+        "キャンセルしました"
+      );
+    });
+
+    // 3. Error banner
+    fireEvent.click(saveAsBtn);
+    await waitFor(() => {
+      expect(screen.getByTestId("download-error-banner")).toHaveTextContent(
+        "保存先への書き込みに失敗しました"
+      );
+    });
+
+    // 4. Quick download to default browser folder
+    fireEvent.click(quickBtn);
+    await waitFor(() => {
+      expect(screen.getByTestId("download-feedback-banner")).toHaveTextContent(
+        "既定ダウンロードフォルダへ保存しました"
+      );
+    });
+    expect(onDownloadArtifact).toHaveBeenNthCalledWith(
+      4,
+      "mono_ja_pdf",
+      "attention_math.ja.pdf",
+      { chooseLocation: false }
+    );
+  });
 });
 
 describe("Screen 4: Glossary CRUD, TSV Import Preview & Dynamic Diagnostics (Section 8 & 9)", () => {

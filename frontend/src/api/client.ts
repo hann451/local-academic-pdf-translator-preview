@@ -9,6 +9,7 @@
  */
 
 import type {
+  ArtifactSaveResult,
   ArtifactType,
   AuthSessionResponse,
   Block,
@@ -31,6 +32,7 @@ import type {
   RegisteredModel,
   RegisterLocalModelRequest,
   RetypesetJobResponse,
+  SaveArtifactAsResponse,
   StartModelDownloadRequest,
   SystemDiagnostics,
   SystemUpdateApplyResponse,
@@ -525,15 +527,38 @@ export async function fetchJobArtifacts(jobId: string): Promise<ExportArtifact[]
   );
 }
 
-/**
- * Download an artifact using authenticated fetch + temporary Blob URL,
- * revoking the Blob URL immediately after triggering the download (Section 4 & 7).
- */
-export async function downloadArtifactFile(
+interface SaveFilePickerAcceptType {
+  description?: string;
+  accept: Record<string, string[]>;
+}
+
+interface SaveFilePickerOptions {
+  id?: string;
+  suggestedName?: string;
+  startIn?: string;
+  types?: SaveFilePickerAcceptType[];
+}
+
+interface LocalFileSystemWritableFileStream {
+  write(data: Blob | BufferSource | string): Promise<void>;
+  close(): Promise<void>;
+  abort?(reason?: unknown): Promise<void>;
+}
+
+interface LocalFileSystemFileHandle {
+  name: string;
+  createWritable(): Promise<LocalFileSystemWritableFileStream>;
+}
+
+type ShowSaveFilePickerFn = (
+  options?: SaveFilePickerOptions
+) => Promise<LocalFileSystemFileHandle>;
+
+async function fetchArtifactBlobWithFilename(
   jobId: string,
   artifactType: ArtifactType,
   fallbackFilename: string
-): Promise<{ filename: string; byteSize: number; revokedUrl: boolean }> {
+): Promise<{ blob: Blob; filename: string }> {
   const token = await ensureSessionToken();
   const resp = await fetch(
     `${apiBaseUrl}/api/jobs/${encodeURIComponent(jobId)}/artifacts/${encodeURIComponent(
@@ -560,6 +585,23 @@ export async function downloadArtifactFile(
   }
 
   const blob = await resp.blob();
+  return { blob, filename };
+}
+
+/**
+ * Download an artifact using authenticated fetch + temporary Blob URL,
+ * revoking the Blob URL immediately after triggering the download (Section 4 & 7).
+ */
+export async function downloadArtifactFile(
+  jobId: string,
+  artifactType: ArtifactType,
+  fallbackFilename: string
+): Promise<{ filename: string; byteSize: number; revokedUrl: boolean }> {
+  const { blob, filename } = await fetchArtifactBlobWithFilename(
+    jobId,
+    artifactType,
+    fallbackFilename
+  );
   const blobUrl = URL.createObjectURL(blob);
   let revokedUrl = false;
   try {
@@ -576,6 +618,133 @@ export async function downloadArtifactFile(
   }
 
   return { filename, byteSize: blob.size, revokedUrl };
+}
+
+export async function saveArtifactViaNativeDialog(
+  jobId: string,
+  artifactType: ArtifactType
+): Promise<SaveArtifactAsResponse> {
+  return apiRequest<SaveArtifactAsResponse>(
+    `/api/jobs/${encodeURIComponent(jobId)}/artifacts/${encodeURIComponent(
+      artifactType
+    )}/save-as`,
+    {
+      method: "POST",
+    }
+  );
+}
+
+/**
+ * Save an artifact letting the user choose the destination folder and filename:
+ * 1. Browser File System Access API (`window.showSaveFilePicker`) opened synchronously on click.
+ * 2. Fallback to backend native Windows `SaveFileDialog` (`POST .../save-as`).
+ * 3. Last-resort fallback to authenticated Blob download when native dialog is unsupported (501/405).
+ */
+export async function saveArtifactWithPicker(
+  jobId: string,
+  artifactType: ArtifactType,
+  suggestedFilename: string
+): Promise<ArtifactSaveResult> {
+  const picker =
+    typeof window !== "undefined"
+      ? (window as unknown as { showSaveFilePicker?: ShowSaveFilePickerFn })
+          .showSaveFilePicker
+      : undefined;
+
+  if (typeof picker === "function") {
+    const types: SaveFilePickerAcceptType[] =
+      artifactType === "validation_report_json"
+        ? [{ description: "JSON レポート", accept: { "application/json": [".json"] } }]
+        : [{ description: "PDF 文書", accept: { "application/pdf": [".pdf"] } }];
+
+    let handle: LocalFileSystemFileHandle | null = null;
+    try {
+      try {
+        handle = await picker.call(window, {
+          id: "paperbridge-artifact-save",
+          suggestedName: suggestedFilename,
+          startIn: "downloads",
+          types,
+        });
+      } catch (err) {
+        if (err instanceof TypeError) {
+          handle = await picker.call(window, {
+            suggestedName: suggestedFilename,
+            types,
+          });
+        } else {
+          throw err;
+        }
+      }
+    } catch (err) {
+      if ((err as { name?: string } | null)?.name === "AbortError") {
+        return {
+          canceled: true,
+          filename: suggestedFilename,
+          savedPath: null,
+          byteSize: 0,
+          method: "file_picker",
+          revokedUrl: false,
+        };
+      }
+      // SecurityError / NotAllowedError / unsupported environment -> fall back to native dialog
+      handle = null;
+    }
+
+    if (handle) {
+      const { blob, filename } = await fetchArtifactBlobWithFilename(
+        jobId,
+        artifactType,
+        suggestedFilename
+      );
+      const writable = await handle.createWritable();
+      try {
+        await writable.write(blob);
+        await writable.close();
+      } catch (writeErr) {
+        try {
+          await writable.abort?.(writeErr);
+        } catch {
+          // ignore abort error
+        }
+        throw writeErr;
+      }
+      return {
+        canceled: false,
+        filename: handle.name || filename,
+        savedPath: null,
+        byteSize: blob.size,
+        method: "file_picker",
+        revokedUrl: false,
+      };
+    }
+  }
+
+  try {
+    const res = await saveArtifactViaNativeDialog(jobId, artifactType);
+    return {
+      canceled: res.canceled,
+      filename: res.filename || suggestedFilename,
+      savedPath: res.saved_path ?? null,
+      byteSize: res.byte_size,
+      method: "native_dialog",
+      revokedUrl: false,
+    };
+  } catch (err) {
+    if (!(err instanceof ApiHttpError) || (err.status !== 501 && err.status !== 405)) {
+      throw err;
+    }
+  }
+
+  const dl = await downloadArtifactFile(jobId, artifactType, suggestedFilename);
+  return {
+    canceled: false,
+    filename: dl.filename,
+    savedPath: null,
+    byteSize: dl.byteSize,
+    method: "blob_download",
+    revokedUrl: dl.revokedUrl,
+  };
 }
 
 // --- Glossaries ---

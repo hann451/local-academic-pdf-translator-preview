@@ -35,6 +35,7 @@ import {
   previewBlockSplit,
   registerLocalModel,
   restartLlamaServerForActiveModel,
+  saveArtifactWithPicker,
   selectActiveModel,
   startModelDownload,
   updateBlockProtection,
@@ -55,6 +56,7 @@ import { Screen2ProtectionEditor } from "./components/Screen2ProtectionEditor";
 import { Screen3ProgressReview } from "./components/Screen3ProgressReview";
 import { Screen4GlossaryDiagnostics } from "./components/Screen4GlossaryDiagnostics";
 import type {
+  ArtifactSaveResult,
   ArtifactType,
   Block,
   BlockSplitPreviewResult,
@@ -806,10 +808,22 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
 
   const handleDownloadArtifact = async (
     artifactType: ArtifactType,
-    fallbackName: string
-  ) => {
+    fallbackName: string,
+    options?: { chooseLocation?: boolean }
+  ): Promise<ArtifactSaveResult | void> => {
     if (!currentJob) return;
-    await downloadArtifactFile(currentJob.id, artifactType, fallbackName);
+    if (options?.chooseLocation === false) {
+      const dl = await downloadArtifactFile(currentJob.id, artifactType, fallbackName);
+      return {
+        canceled: false,
+        filename: dl.filename,
+        savedPath: null,
+        byteSize: dl.byteSize,
+        method: "blob_download",
+        revokedUrl: dl.revokedUrl,
+      };
+    }
+    return saveArtifactWithPicker(currentJob.id, artifactType, fallbackName);
   };
 
   // --- Screen 4 & Model Management Handlers ---

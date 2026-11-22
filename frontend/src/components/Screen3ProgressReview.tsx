@@ -5,6 +5,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import {
   PIPELINE_STAGES_13,
+  type ArtifactSaveResult,
   type ArtifactType,
   type Block,
   type Document,
@@ -13,6 +14,7 @@ import {
   type JobState,
   type ValidationIssue,
 } from "../types/api";
+import { buildSuggestedArtifactFilename } from "../utils/artifactFilename";
 import { backendToViewportBbox } from "../utils/coordinates";
 import { validateManualEditClientSide } from "../utils/manualEditValidator";
 import { displayPageToIndex0 } from "../utils/pageRange";
@@ -41,7 +43,11 @@ export interface Screen3Props {
   ) => Promise<Block>;
   onRetranslateBlock: (blockId: string) => Promise<void>;
   onRetypesetJob: (allowValidationWarnings: boolean) => Promise<void>;
-  onDownloadArtifact: (artifactType: ArtifactType, fallbackName: string) => Promise<void>;
+  onDownloadArtifact: (
+    artifactType: ArtifactType,
+    fallbackName: string,
+    options?: { chooseLocation?: boolean }
+  ) => Promise<ArtifactSaveResult | void>;
   onDirtyStateChange?: (isDirty: boolean) => void;
 }
 
@@ -232,6 +238,8 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
   const [isSavingBlock, setIsSavingBlock] = useState<boolean>(false);
   const [strictRetypesetGate, setStrictRetypesetGate] = useState<boolean>(false);
   const [downloadFeedback, setDownloadFeedback] = useState<string | null>(null);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [downloadingKey, setDownloadingKey] = useState<string | null>(null);
   const isJobRunning = [
     "created",
     "preflight",
@@ -753,7 +761,7 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
               成果物ダウンロード ＆ PDF再組版
             </h3>
             <div style={{ fontSize: "12px", color: "#475569" }}>
-              手動修正後、LLM呼び出し0回でPDFのみを高速に更新します。
+              手動修正後、LLM呼び出し0回でPDFのみを高速に更新します。「保存先を選んで保存」から任意のフォルダ・ファイル名を指定して保存できます。
             </div>
           </div>
 
@@ -822,6 +830,16 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
             {downloadFeedback}
           </div>
         )}
+        {downloadError && (
+          <div
+            role="alert"
+            data-testid="download-error-banner"
+            className="alert alert-error"
+            style={{ marginTop: "10px", fontSize: "12px" }}
+          >
+            <strong>成果物保存エラー:</strong> {downloadError}
+          </div>
+        )}
 
         {/* Artifact Download Buttons */}
         <div
@@ -840,6 +858,59 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
                 roundtrip_pdf: "🔁 非翻訳ラウンドトリップPDF",
                 validation_report_json: "📊 検証レポートJSON",
               };
+              const suggestedName = buildSuggestedArtifactFilename(
+                document.original_filename,
+                document.id,
+                art.artifact_type
+              );
+              const chooseKey = `${art.artifact_type}:choose`;
+              const quickKey = `${art.artifact_type}:quick`;
+              const isBusyAny = downloadingKey !== null;
+
+              const handleArtifactSave = async (chooseLocation: boolean) => {
+                setDownloadingKey(chooseLocation ? chooseKey : quickKey);
+                setDownloadFeedback(null);
+                setDownloadError(null);
+                try {
+                  const res = await onDownloadArtifact(
+                    art.artifact_type,
+                    suggestedName,
+                    { chooseLocation }
+                  );
+                  if (!res) {
+                    setDownloadFeedback(
+                      chooseLocation
+                        ? `${suggestedName} の保存処理を実行しました。`
+                        : `${suggestedName} をブラウザの既定ダウンロードフォルダへ保存しました（一時Blob URLを解放済み）。`
+                    );
+                    return;
+                  }
+                  if (res.canceled) {
+                    setDownloadFeedback(
+                      `${res.filename || suggestedName} の保存をキャンセルしました。`
+                    );
+                    return;
+                  }
+                  if (res.method === "native_dialog") {
+                    setDownloadFeedback(
+                      `${res.savedPath ?? res.filename} に保存しました（${res.byteSize.toLocaleString()} bytes）。`
+                    );
+                  } else if (res.method === "file_picker") {
+                    setDownloadFeedback(
+                      `選択した保存先に「${res.filename}」を保存しました（${res.byteSize.toLocaleString()} bytes）。`
+                    );
+                  } else {
+                    setDownloadFeedback(
+                      `${res.filename} をブラウザの既定ダウンロードフォルダへ保存しました（一時Blob URLを解放済み）。`
+                    );
+                  }
+                } catch (err) {
+                  setDownloadError(err instanceof Error ? err.message : String(err));
+                } finally {
+                  setDownloadingKey(null);
+                }
+              };
+
               return (
                 <div
                   key={art.id}
@@ -865,22 +936,30 @@ export const Screen3ProgressReview: React.FC<Screen3Props> = ({
                     SHA-256: {art.sha256_hash.slice(0, 16)}... ({art.file_size_bytes.toLocaleString()}{" "}
                     bytes)
                   </div>
-                  <button
-                    type="button"
-                    className="btn btn-secondary"
-                    data-testid={`download-artifact-${art.artifact_type}`}
-                    onClick={async () => {
-                      await onDownloadArtifact(
-                        art.artifact_type,
-                        `${document.id}.${art.artifact_type}`
-                      );
-                      setDownloadFeedback(
-                        `${art.artifact_type} を認証付き取得でダウンロードし、一時Blob URLを解放しました。`
-                      );
-                    }}
-                  >
-                    ⬇ 認証付きダウンロード
-                  </button>
+                  <div className="artifact-card-actions">
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      data-testid={`download-artifact-${art.artifact_type}`}
+                      disabled={isBusyAny}
+                      onClick={() => void handleArtifactSave(true)}
+                    >
+                      {downloadingKey === chooseKey
+                        ? "保存先を選択中..."
+                        : "💾 保存先を選んで保存"}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-compact"
+                      data-testid={`quick-download-artifact-${art.artifact_type}`}
+                      disabled={isBusyAny}
+                      onClick={() => void handleArtifactSave(false)}
+                    >
+                      {downloadingKey === quickKey
+                        ? "ダウンロード中..."
+                        : "⬇ 既定フォルダへダウンロード"}
+                    </button>
+                  </div>
                 </div>
               );
             })
