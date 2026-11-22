@@ -753,3 +753,170 @@ class SystemDiagnostics(BaseModel):
     model_server_match_message: str | None = None
     model_server_mismatch: bool = False
     app_version: str | None = None
+
+
+class FormulaClusterCandidate(BaseModel):
+    """Image-detected display formula cluster candidate on a page."""
+
+    bbox: list[float] = Field(..., description="[x0, y0, x1, y1] in pt")
+    height_pt: float
+    column_index: int = Field(default=0, ge=0)
+    height_ratio_to_median: float
+
+
+class FormulaBlockCountMetrics(BaseModel):
+    """Metric 1: Consistency between image-detected tall formula clusters and extracted formula blocks."""
+
+    dpi: int = 150
+    median_line_height_pt: float = 0.0
+    height_ratio_threshold: float = 1.45
+    image_formula_cluster_count: int = 0
+    extracted_formula_block_count: int = 0
+    count_diff: int = 0
+    needs_visual_review: bool = False
+    image_clusters: list[FormulaClusterCandidate] = Field(default_factory=list)
+    extracted_formula_block_ids: list[str] = Field(default_factory=list)
+    excluded_heading_clusters: int = 0
+    excluded_non_formula_regions: int = 0
+
+
+class NumericPreservationBreakdown(BaseModel):
+    """Multiplicity-aware numeric and unit token comparison breakdown."""
+
+    source_token_count: int = 0
+    target_token_count: int = 0
+    matched_token_count: int = 0
+    preservation_ratio: float = 1.0
+    missing_tokens: list[str] = Field(default_factory=list)
+    extra_tokens: list[str] = Field(default_factory=list)
+
+
+class NumericPreservationMetrics(BaseModel):
+    """Metric 2: Preservation of comma-grouped numbers, decimals, and unit-attached numeric tokens."""
+
+    source_token_count: int = 0
+    target_token_count: int = 0
+    matched_token_count: int = 0
+    preservation_ratio: float = 1.0
+    missing_tokens: list[str] = Field(default_factory=list)
+    extra_tokens: list[str] = Field(default_factory=list)
+    page_extraction: NumericPreservationBreakdown
+    body_blocks_masking: NumericPreservationBreakdown
+    body_blocks_output: NumericPreservationBreakdown | None = None
+    page_output: NumericPreservationBreakdown | None = None
+    needs_visual_review: bool = False
+
+
+class ColumnOrderInversion(BaseModel):
+    """Detected reading-order column regression (e.g. col 1 -> col 0)."""
+
+    prev_block_id: str
+    curr_block_id: str
+    prev_col: int
+    curr_col: int
+    bbox: list[float]
+
+
+class ColumnOrderMonotonicityMetrics(BaseModel):
+    """Metric 3: Monotonicity of reading order across detected page columns."""
+
+    detected_column_count: int = Field(default=1, ge=1)
+    is_monotonic: bool = True
+    inversion_count: int = 0
+    inversions: list[ColumnOrderInversion] = Field(default_factory=list)
+    evaluated_block_count: int = 0
+    excluded_full_width_count: int = 0
+    column_centers_pt: list[float] = Field(default_factory=list)
+    column_sequence: list[int] = Field(default_factory=list)
+
+
+class ProtectedBlockMisalignment(BaseModel):
+    """Coordinate drift or missing placement for an untranslated protected block."""
+
+    block_id: str
+    target: Literal["mono", "dual", "provided"]
+    orig_bbox: list[float]
+    output_bbox: list[float] | None = None
+    dx: float = 0.0
+    dy: float = 0.0
+    dw: float = 0.0
+    dh: float = 0.0
+    iou: float = 0.0
+    reason: str = ""
+
+
+class ProtectedOverlapPair(BaseModel):
+    """Overlap detected between a protected block and an adjacent translated body block."""
+
+    protected_block_id: str
+    neighbor_block_id: str
+    relation: Literal["above", "below"]
+    target: Literal["mono", "dual", "provided"]
+    overlap_area_pt2: float
+    vertical_overlap_pt: float
+    protected_bbox: list[float]
+    neighbor_bbox: list[float]
+
+
+class ProtectedOrderInversion(BaseModel):
+    """Vertical order inversion between a protected block and its adjacent body block."""
+
+    protected_block_id: str
+    neighbor_block_id: str
+    expected_relation: Literal["above", "below"]
+    target: Literal["mono", "dual", "provided"]
+    actual_gap_pt: float
+    protected_bbox: list[float]
+    neighbor_bbox: list[float]
+
+
+class ProtectedAbnormalGap(BaseModel):
+    """Excessive vertical gap between a protected block and an adjacent body block."""
+
+    protected_block_id: str
+    neighbor_block_id: str
+    relation: Literal["above", "below"]
+    target: Literal["mono", "dual", "provided"]
+    orig_gap_pt: float
+    output_gap_pt: float
+    gap_delta_pt: float
+    protected_bbox: list[float]
+    neighbor_bbox: list[float]
+
+
+class ProtectedBlockAlignmentMetrics(BaseModel):
+    """Metric 4: Coordinate stability and adjacent body alignment of untranslated protected blocks."""
+
+    checked_protected_blocks: int = 0
+    misaligned_blocks: list[ProtectedBlockMisalignment] = Field(default_factory=list)
+    overlapping_pairs: list[ProtectedOverlapPair] = Field(default_factory=list)
+    order_inversions: list[ProtectedOrderInversion] = Field(default_factory=list)
+    abnormal_gaps: list[ProtectedAbnormalGap] = Field(default_factory=list)
+    all_aligned: bool = True
+    checked_targets: list[str] = Field(default_factory=list)
+
+
+class PageLayoutRegressionMetrics(BaseModel):
+    """Aggregated 4-metric regression report for a single page."""
+
+    page_index: int = Field(..., ge=0)
+    display_page_number: int = Field(..., ge=1)
+    formula_block_count: FormulaBlockCountMetrics
+    numeric_preservation: NumericPreservationMetrics
+    column_order: ColumnOrderMonotonicityMetrics
+    protected_alignment: ProtectedBlockAlignmentMetrics | None = None
+    needs_visual_review: bool = False
+    review_reasons: list[str] = Field(default_factory=list)
+
+
+class LayoutRegressionReport(BaseModel):
+    """Document-level summary of the 4 mechanical layout/math regression metrics."""
+
+    schema_version: str = "1.0"
+    document_id: str | None = None
+    original_filename: str | None = None
+    total_pages_evaluated: int = 0
+    flagged_pages: list[int] = Field(default_factory=list)
+    flagged_page_indices: list[int] = Field(default_factory=list)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    pages: list[PageLayoutRegressionMetrics] = Field(default_factory=list)
