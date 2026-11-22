@@ -107,6 +107,8 @@ export interface AppProps {
   runJobsInBackground?: boolean;
 }
 
+export const UPDATE_RECONNECT_TIMEOUT_SEC = 180;
+
 export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
   const [activeScreen, setActiveScreen] = useState<ScreenId>("screen1");
   const [pendingNavScreen, setPendingNavScreen] = useState<ScreenId | null>(null);
@@ -172,6 +174,10 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
   const [isApplyingUpdate, setIsApplyingUpdate] = useState<boolean>(false);
   const [updateApplyingMessage, setUpdateApplyingMessage] = useState<string | null>(null);
   const [updateError, setUpdateError] = useState<string | null>(null);
+  const [updateLogPath, setUpdateLogPath] = useState<string | null>(null);
+  const [updateElapsedSeconds, setUpdateElapsedSeconds] = useState<number>(0);
+  const [updateReconnectTimedOut, setUpdateReconnectTimedOut] = useState<boolean>(false);
+  const [updateReconnectNonce, setUpdateReconnectNonce] = useState<number>(0);
 
   const syncJobConfigWithOverview = useCallback((overview: ModelsOverviewResponse) => {
     const active = overview.active_model;
@@ -937,9 +943,13 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
   const handleApplySystemUpdate = async (): Promise<SystemUpdateApplyResponse> => {
     setUpdateError(null);
     setIsApplyingUpdate(true);
+    setUpdateLogPath(null);
+    setUpdateElapsedSeconds(0);
+    setUpdateReconnectTimedOut(false);
     setUpdateApplyingMessage("アップデートを要求しています...");
     try {
       const res = await applySystemUpdate();
+      setUpdateLogPath(res.log_path ?? null);
       setUpdateApplyingMessage(
         res.message || "アップデートを適用して再起動しています。しばらくお待ちください..."
       );
@@ -947,6 +957,9 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
     } catch (err) {
       setIsApplyingUpdate(false);
       setUpdateApplyingMessage(null);
+      setUpdateLogPath(null);
+      setUpdateElapsedSeconds(0);
+      setUpdateReconnectTimedOut(false);
       const msg =
         err instanceof ApiHttpError && err.status === 409
           ? `実行中の処理があるため更新できません (409 Conflict): ${err.detail}`
@@ -958,11 +971,36 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
     }
   };
 
-  // While updating, poll session endpoint after brief grace period to reload once restarted
+  const handleRetryUpdateReconnect = (): void => {
+    setUpdateElapsedSeconds(0);
+    setUpdateReconnectTimedOut(false);
+    setUpdateReconnectNonce((prev) => prev + 1);
+  };
+
+  const handleDismissUpdateOverlay = (): void => {
+    setIsApplyingUpdate(false);
+    setUpdateReconnectTimedOut(false);
+    setUpdateApplyingMessage(null);
+    setUpdateElapsedSeconds(0);
+  };
+
+  // While updating, poll session endpoint after brief grace period to reload once restarted,
+  // tracking elapsed time and stopping with recovery controls on timeout.
   useEffect(() => {
-    if (!isApplyingUpdate) return;
+    if (!isApplyingUpdate || updateReconnectTimedOut) return;
     let cancelled = false;
     let pollTimer: number | null = null;
+    const elapsedTimer = window.setInterval(() => {
+      if (cancelled) return;
+      setUpdateElapsedSeconds((prev) => {
+        const next = prev + 1;
+        if (next >= UPDATE_RECONNECT_TIMEOUT_SEC) {
+          setUpdateReconnectTimedOut(true);
+        }
+        return next;
+      });
+    }, 1000);
+
     const startTimer = window.setTimeout(() => {
       pollTimer = window.setInterval(async () => {
         if (cancelled) return;
@@ -979,12 +1017,13 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
 
     return () => {
       cancelled = true;
+      window.clearInterval(elapsedTimer);
       window.clearTimeout(startTimer);
       if (pollTimer !== null) {
         window.clearInterval(pollTimer);
       }
     };
-  }, [isApplyingUpdate]);
+  }, [isApplyingUpdate, updateReconnectTimedOut, updateReconnectNonce]);
 
   return (
     <div data-testid="paperbridge-app">
@@ -1211,6 +1250,11 @@ export const App: React.FC<AppProps> = ({ runJobsInBackground = true }) => {
             isApplyingUpdate={isApplyingUpdate}
             updateApplyingMessage={updateApplyingMessage}
             updateError={updateError}
+            updateLogPath={updateLogPath}
+            updateElapsedSeconds={updateElapsedSeconds}
+            updateReconnectTimedOut={updateReconnectTimedOut}
+            onRetryUpdateReconnect={handleRetryUpdateReconnect}
+            onDismissUpdateOverlay={handleDismissUpdateOverlay}
             onCheckUpdate={handleCheckSystemUpdate}
             onApplyUpdate={handleApplySystemUpdate}
           />

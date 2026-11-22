@@ -58,8 +58,20 @@ export interface Screen4Props {
   isApplyingUpdate?: boolean;
   updateApplyingMessage?: string | null;
   updateError?: string | null;
+  updateLogPath?: string | null;
+  updateElapsedSeconds?: number;
+  updateReconnectTimedOut?: boolean;
+  onRetryUpdateReconnect?: () => void;
+  onDismissUpdateOverlay?: () => void;
   onCheckUpdate?: () => Promise<SystemUpdateCheckResponse | void>;
   onApplyUpdate?: () => Promise<SystemUpdateApplyResponse | void>;
+}
+
+function formatElapsedMmSs(totalSeconds: number): string {
+  const safe = Math.max(0, Math.floor(totalSeconds));
+  const mins = Math.floor(safe / 60);
+  const secs = safe % 60;
+  return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
 }
 
 export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
@@ -92,6 +104,11 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
   isApplyingUpdate = false,
   updateApplyingMessage = null,
   updateError = null,
+  updateLogPath = null,
+  updateElapsedSeconds = 0,
+  updateReconnectTimedOut = false,
+  onRetryUpdateReconnect,
+  onDismissUpdateOverlay,
   onCheckUpdate,
   onApplyUpdate,
 }) => {
@@ -485,20 +502,115 @@ export const Screen4GlossaryDiagnostics: React.FC<Screen4Props> = ({
           data-testid="system-update-loading-overlay"
           role="status"
           aria-live="assertive"
-          aria-busy="true"
+          aria-busy={!updateReconnectTimedOut}
         >
           <div className="loading-card">
-            <div className="loading-spinner" aria-hidden="true" />
-            <h3 style={{ margin: "12px 0 8px 0", fontSize: "17px" }}>
-              ソフトウェアを更新して再起動しています...
-            </h3>
-            <p style={{ margin: "0 0 6px 0", fontSize: "13px", color: "#334155" }}>
-              {updateApplyingMessage ||
-                "最新版の取得・適用とサーバーの再起動を行っています。この画面のまましばらくお待ちください。"}
-            </p>
-            <p style={{ margin: 0, fontSize: "12px", color: "#64748b" }}>
-              再起動が完了すると自動的に再接続・再読み込みを試行します。
-            </p>
+            {updateReconnectTimedOut ? (
+              <div data-testid="system-update-timeout-panel">
+                <div
+                  className="alert alert-warning"
+                  style={{ textAlign: "left", marginBottom: "14px" }}
+                >
+                  <strong>
+                    再接続がタイムアウトしました（
+                    {updateElapsedSeconds > 0 ? updateElapsedSeconds : 180}秒経過）
+                  </strong>
+                  <p style={{ margin: "6px 0 0 0", fontSize: "12px", lineHeight: 1.5 }}>
+                    アップデート処理に失敗したか、ネットワーク取得等に想定以上の時間がかかっています。
+                    デスクトップ上の「アップデート進捗」ウィンドウ、および下記のログファイルをご確認ください。
+                  </p>
+                </div>
+                <div
+                  style={{
+                    fontSize: "11px",
+                    color: "#334155",
+                    backgroundColor: "#f8fafc",
+                    border: "1px solid #cbd5e1",
+                    borderRadius: "6px",
+                    padding: "8px 10px",
+                    marginBottom: "14px",
+                    textAlign: "left",
+                    wordBreak: "break-all",
+                  }}
+                >
+                  ログファイル:{" "}
+                  <code data-testid="system-update-log-path">
+                    {updateLogPath || "%LOCALAPPDATA%\\PaperBridgeLocal\\logs\\updater.log"}
+                  </code>
+                </div>
+                <div style={{ display: "flex", justifyContent: "center", gap: "8px", flexWrap: "wrap" }}>
+                  {onRetryUpdateReconnect && (
+                    <button
+                      type="button"
+                      className="btn btn-primary"
+                      data-testid="update-retry-reconnect-btn"
+                      onClick={onRetryUpdateReconnect}
+                    >
+                      再接続を再試行
+                    </button>
+                  )}
+                  {onDismissUpdateOverlay && (
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      data-testid="update-dismiss-overlay-btn"
+                      onClick={onDismissUpdateOverlay}
+                    >
+                      この画面を閉じる
+                    </button>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <>
+                <div className="loading-spinner" aria-hidden="true" />
+                <h3 style={{ margin: "12px 0 8px 0", fontSize: "17px" }}>
+                  ソフトウェアを更新して再起動しています...
+                </h3>
+                <p style={{ margin: "0 0 6px 0", fontSize: "13px", color: "#334155" }}>
+                  {updateApplyingMessage ||
+                    "最新版の取得・適用とサーバーの再起動を行っています。この画面のまましばらくお待ちください。"}
+                </p>
+                <div
+                  className="update-progress-track"
+                  aria-hidden="true"
+                  data-testid="system-update-progress-bar"
+                >
+                  <div
+                    className="update-progress-fill"
+                    style={{
+                      width: `${Math.min(
+                        95,
+                        Math.max(5, Math.round((updateElapsedSeconds / 60) * 90))
+                      )}%`,
+                    }}
+                  />
+                </div>
+                <div
+                  data-testid="system-update-elapsed"
+                  style={{ fontSize: "12px", fontWeight: 600, color: "#1e40af", marginBottom: "6px" }}
+                >
+                  経過時間: {formatElapsedMmSs(updateElapsedSeconds)}
+                </div>
+                <p style={{ margin: "0 0 6px 0", fontSize: "12px", color: "#475569" }}>
+                  デスクトップの別ウィンドウに詳細なアップデート進捗（%）を表示しています。
+                  更新と再起動が完了すると自動的に再接続します。
+                </p>
+                {updateLogPath && (
+                  <p
+                    data-testid="system-update-log-path"
+                    style={{
+                      margin: 0,
+                      fontSize: "11px",
+                      color: "#64748b",
+                      wordBreak: "break-all",
+                    }}
+                  >
+                    ログ: <code>{updateLogPath}</code>
+                  </p>
+                )}
+              </>
+            )}
           </div>
         </div>
       )}

@@ -17,6 +17,10 @@ Add-Type -AssemblyName System.Drawing
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptDir
 . (Join-Path $ScriptDir "model_registry_common.ps1")
+$ProgressCommonScript = Join-Path $ScriptDir "progress_window_common.ps1"
+if (Test-Path -LiteralPath $ProgressCommonScript) {
+    . $ProgressCommonScript
+}
 $FrontendDistIndex = Join-Path $ProjectRoot "frontend\dist\index.html"
 $VenvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 $VulkanServerExe = Join-Path $ProjectRoot "tools\llama.cpp\b12167-vulkan-x64\llama-server.exe"
@@ -49,6 +53,10 @@ $LogsDir = Join-Path $UserDataDir "logs"
 $LauncherLogPath = Join-Path $LogsDir "launcher.log"
 $EdgeProfileDir = Join-Path $UserDataDir "edge_profile"
 $UpdateSignalPath = Join-Path $UserDataDir ".update_in_progress"
+$StartupProgressPath = Join-Path $UserDataDir "startup_progress.json"
+$script:ShowStartupUi = (-not $NoBrowser) -and (-not $ConsoleDiagnostic)
+$script:StartupProgressHandle = $null
+$script:LastStartupPercent = 0
 
 foreach ($d in @($UserDataDir, $LogsDir, $EdgeProfileDir)) {
     if (-not (Test-Path -LiteralPath $d)) {
@@ -72,8 +80,80 @@ function Write-LaunchLog {
     }
 }
 
+function Start-StartupSplashIfEnabled {
+    param(
+        [int]$Percent = 5,
+        [string]$Message = "起動環境を準備しています...",
+        [string]$Detail = "しばらくお待ちください"
+    )
+    if (-not $script:ShowStartupUi) { return }
+    if ($script:StartupProgressHandle -and $script:StartupProgressHandle.IsActive) { return }
+    if (Get-Command Start-PaperBridgeProgressWindow -ErrorAction SilentlyContinue) {
+        $script:StartupProgressHandle = Start-PaperBridgeProgressWindow `
+            -Title "PaperBridge Local - 起動中" `
+            -HeaderText "PaperBridge Local を起動しています" `
+            -InitialMessage $Message `
+            -InitialDetail $Detail `
+            -InitialPercent $Percent `
+            -LogPath $LauncherLogPath
+    }
+}
+
+function Close-StartupSplashSafe {
+    if ($script:StartupProgressHandle -and (Get-Command Close-PaperBridgeProgressWindow -ErrorAction SilentlyContinue)) {
+        Close-PaperBridgeProgressWindow -Handle $script:StartupProgressHandle
+    }
+    $script:StartupProgressHandle = $null
+}
+
+function Report-StartupProgress {
+    param(
+        [int]$Percent,
+        [string]$Stage,
+        [string]$Message,
+        [string]$Detail = "",
+        [string]$Status = "starting",
+        [string]$ErrorMessage = ""
+    )
+    $clamped = [Math]::Max(0, [Math]::Min(100, $Percent))
+    $script:LastStartupPercent = $clamped
+    if (Get-Command Write-PaperBridgeProgressFile -ErrorAction SilentlyContinue) {
+        Write-PaperBridgeProgressFile `
+            -FilePath $StartupProgressPath `
+            -Percent $clamped `
+            -Stage $Stage `
+            -Status $Status `
+            -Message $Message `
+            -Detail $Detail `
+            -ErrorMessage $ErrorMessage `
+            -LogPath $LauncherLogPath
+    }
+    if ($script:StartupProgressHandle -and $script:StartupProgressHandle.IsActive -and (Get-Command Update-PaperBridgeProgressWindow -ErrorAction SilentlyContinue)) {
+        Update-PaperBridgeProgressWindow `
+            -Handle $script:StartupProgressHandle `
+            -Percent $clamped `
+            -Message $Message `
+            -Detail $Detail `
+            -Status $Status
+    }
+}
+
 function Show-UserError {
-    param([string]$Title, [string]$Message)
+    param(
+        [string]$Title,
+        [string]$Message,
+        [switch]$SkipProgressWrite = $false
+    )
+    Close-StartupSplashSafe
+    if (-not $SkipProgressWrite) {
+        Report-StartupProgress `
+            -Percent $script:LastStartupPercent `
+            -Stage "failed" `
+            -Message $Title `
+            -Detail $Message `
+            -Status "failed" `
+            -ErrorMessage $Message
+    }
     Write-LaunchLog "$($Title): $Message" "ERROR"
     if (-not $NoBrowser) {
         [System.Windows.Forms.MessageBox]::Show($Message, $Title, [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
@@ -338,7 +418,11 @@ function Sync-TrackedLlamaFromStateFile {
 }
 
 function Stop-TrackedServer {
-    param([hashtable]$ServerInfo, [int]$GracefulTimeoutMs = 5000)
+    param(
+        [hashtable]$ServerInfo,
+        [int]$GracefulTimeoutMs = 5000,
+        [switch]$NoProcessTreeKill = $false
+    )
     if (-not $ServerInfo) { return }
     $procId = $ServerInfo.Pid
     $label = $ServerInfo.Label
@@ -393,8 +477,13 @@ function Stop-TrackedServer {
     try {
         $recheck = [System.Diagnostics.Process]::GetProcessById($procId)
         if (-not $recheck.HasExited -and ([Math]::Abs(($recheck.StartTime - $ServerInfo.StartTime).TotalSeconds) -le 2)) {
-            Write-LaunchLog "フォールバック強制終了を実行 [$label]: taskkill /PID $procId /T /F" "WARN"
-            & taskkill.exe /PID $procId /T /F | Out-Null
+            if ($NoProcessTreeKill) {
+                Write-LaunchLog "フォールバック強制終了を実行（更新子プロセス保護・単体終了） [$label]: taskkill /PID $procId /F" "WARN"
+                & taskkill.exe /PID $procId /F | Out-Null
+            } else {
+                Write-LaunchLog "フォールバック強制終了を実行 [$label]: taskkill /PID $procId /T /F" "WARN"
+                & taskkill.exe /PID $procId /T /F | Out-Null
+            }
             $recheck.WaitForExit(3000) | Out-Null
         }
     } catch {
@@ -432,9 +521,11 @@ function Wait-EndpointOrCrash {
     param(
         [hashtable]$ServerInfo,
         [string]$HealthUrl,
-        [int]$TimeoutSeconds = 45
+        [int]$TimeoutSeconds = 45,
+        [scriptblock]$OnTick = $null
     )
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $tickSw = [System.Diagnostics.Stopwatch]::StartNew()
     while ($sw.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
         if ($ServerInfo.Process.HasExited) {
             $errTail = ""
@@ -445,6 +536,10 @@ function Wait-EndpointOrCrash {
         }
         if (Test-HttpEndpointReady -Url $HealthUrl) {
             return @{ Ready = $true; Exited = $false; ExitCode = $null; ErrTail = "" }
+        }
+        if ($OnTick -and $tickSw.ElapsedMilliseconds -ge 350) {
+            try { & $OnTick $sw.Elapsed.TotalSeconds } catch {}
+            $tickSw.Restart()
         }
         Start-Sleep -Milliseconds 350
     }
@@ -494,14 +589,18 @@ function Get-RunningProfileEdgeProcesses {
 function Open-AppWindowAndWait {
     param(
         [string]$AppUrl,
-        [hashtable]$BackendServerInfo = $null
+        [hashtable]$BackendServerInfo = $null,
+        [scriptblock]$OnWindowLaunched = $null
     )
     $edgeExe = Find-EdgeExecutable
     if ($edgeExe) {
         $edgeArgs = "--user-data-dir=`"$EdgeProfileDir`" --app=`"$AppUrl`" --start-maximized --no-first-run --no-default-browser-check"
         Write-LaunchLog "専用ウィンドウ起動: `"$edgeExe`" $edgeArgs"
         $edgeProc = Start-Process -FilePath $edgeExe -ArgumentList $edgeArgs -PassThru
-        Start-Sleep -Milliseconds 1200
+        Start-Sleep -Milliseconds 900
+        if ($OnWindowLaunched) {
+            try { & $OnWindowLaunched } catch {}
+        }
 
         while ($true) {
             if ((Test-Path -LiteralPath $UpdateSignalPath) -and ($null -ne $BackendServerInfo) -and $BackendServerInfo.Process -and $BackendServerInfo.Process.HasExited) {
@@ -523,6 +622,9 @@ function Open-AppWindowAndWait {
     } else {
         Write-LaunchLog "Microsoft Edge が見つからないため、既定ブラウザで開きます: $AppUrl" "WARN"
         Start-Process $AppUrl
+        if ($OnWindowLaunched) {
+            try { & $OnWindowLaunched } catch {}
+        }
         [System.Windows.Forms.MessageBox]::Show("ブラウザで PaperBridge Local を開きました ($AppUrl)。`n`n利用を終えてサーバーを停止するときは「OK」を押してください。", "PaperBridge Local 実行中", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
     }
 }
@@ -552,7 +654,23 @@ if (-not $createdNew) {
         $mutex.Dispose()
         exit 0
     }
-    Show-UserError -Title "多重起動の防止" -Message "PaperBridge Local は既にこのユーザーデータ領域 ($UserDataDir) で起動中、または起動・終了処理の途中です。"
+    $handledStartingNotice = $false
+    if (-not $NoBrowser -and (Test-Path -LiteralPath $StartupProgressPath)) {
+        try {
+            $sp = [System.IO.File]::ReadAllText($StartupProgressPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+            if ($sp -and ($sp.status -eq "starting") -and $sp.updated_at) {
+                $ageSec = ([DateTime]::UtcNow - [DateTime]::Parse([string]$sp.updated_at).ToUniversalTime()).TotalSeconds
+                if ($ageSec -lt 90) {
+                    Write-LaunchLog "起動中インスタンスへの重複クリックを検知しました ($($sp.percent)%: $($sp.message))。"
+                    [System.Windows.Forms.MessageBox]::Show("PaperBridge Local は現在起動中です（$($sp.percent)%：$($sp.message)）。`n`n起動完了までそのままお待ちください。完了すると自動的にアプリ画面が開きます。", "PaperBridge Local - 起動中です", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+                    $handledStartingNotice = $true
+                }
+            }
+        } catch {}
+    }
+    if (-not $handledStartingNotice) {
+        Show-UserError -Title "多重起動の防止" -Message "PaperBridge Local は既にこのユーザーデータ領域 ($UserDataDir) で起動中、または起動・終了処理の途中です。" -SkipProgressWrite
+    }
     $mutex.Dispose()
     exit 1
 }
@@ -573,7 +691,28 @@ $savedEnv = @{
 try {
     Write-LaunchLog "=== PaperBridge Local 起動開始 (ProjectRoot=$ProjectRoot, UserDataDir=$UserDataDir, UseCpuInference=$UseCpuInference) ==="
 
+    # Clear orphaned update marker only when no active apply_update.ps1 process is running
+    if (Test-Path -LiteralPath $UpdateSignalPath) {
+        $activeUpdaterCount = 0
+        try {
+            $psProcs = Get-CimInstance -ClassName Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue
+            foreach ($up in $psProcs) {
+                if ($up.CommandLine -and ($up.CommandLine.IndexOf("apply_update.ps1", [System.StringComparison]::OrdinalIgnoreCase) -ge 0)) {
+                    $activeUpdaterCount++
+                }
+            }
+        } catch {}
+        if ($activeUpdaterCount -eq 0) {
+            Write-LaunchLog "前回のアップデート未完了シグナル ($UpdateSignalPath) が残存していましたが、実行中のアップデーターが無いため自動解除します。" "WARN"
+            Remove-Item -LiteralPath $UpdateSignalPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Start-StartupSplashIfEnabled -Percent 5 -Message "起動環境を準備しています..." -Detail "初期化中（完了すると自動でアプリ画面が開きます）"
+    Report-StartupProgress -Percent 5 -Stage "init" -Message "起動環境を準備しています..." -Detail "実行構成を確認中"
+
     # 1. Verify setup completion
+    Report-StartupProgress -Percent 12 -Stage "check_env" -Message "実行環境と必須ツールを確認しています..." -Detail ".venv / frontend / llama.cpp を確認中"
     $missingItems = @()
     if (-not (Test-Path -LiteralPath $VenvPython)) { $missingItems += ".venv (Python実行環境)" }
     if (-not (Test-Path -LiteralPath $FrontendDistIndex)) { $missingItems += "frontend\dist (ビルド済みUI)" }
@@ -584,6 +723,7 @@ try {
         $missingText = $missingItems -join ", "
         Write-LaunchLog "初回セットアップ未完了項目を検出: $missingText" "WARN"
         if (-not $NoBrowser) {
+            Close-StartupSplashSafe
             $ans = [System.Windows.Forms.MessageBox]::Show("初回セットアップが完了していません（不足: $missingText）。`n`n初回自動セットアップを開きますか？", "PaperBridge Local - 初回セットアップが必要です", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
             if ($ans -eq [System.Windows.Forms.DialogResult]::Yes) {
                 $setupScript = Join-Path $ScriptDir "setup_wizard.ps1"
@@ -592,6 +732,7 @@ try {
                     Write-LaunchLog "呼び出した初回セットアップが終了コード $($pSetup.ExitCode) で終了したため起動を中止します。"
                     exit 1
                 }
+                Start-StartupSplashIfEnabled -Percent 16 -Message "環境構築が完了しました。起動を続行します..." -Detail "モデル設定を確認しています"
             } else {
                 exit 1
             }
@@ -601,10 +742,12 @@ try {
     }
 
     # 2. Verify Active Model from Registry (with automatic legacy 2B migration)
+    Report-StartupProgress -Percent 18 -Stage "verify_model" -Message "翻訳モデルを確認・検証しています..." -Detail "登録済みモデルと GGUF 形式を検査中"
     $launchModel = Resolve-PaperBridgeActiveModelForLaunch -UserDataDir $UserDataDir -ProjectRoot $ProjectRoot
     if ($launchModel.Status -ne "Ready") {
         Write-LaunchLog "有効なアクティブモデルが見つかりません (Status=$($launchModel.Status), Reason=$($launchModel.Reason))" "WARN"
         if (-not $NoBrowser) {
+            Close-StartupSplashSafe
             $modelSetupScript = Join-Path $ScriptDir "model_setup.ps1"
             $setupArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$modelSetupScript`"", "-UserDataDir", "`"$UserDataDir`"")
             if ($launchModel.Entry -and $launchModel.Entry.catalog_model_id) {
@@ -617,6 +760,7 @@ try {
                 Show-UserError -Title "翻訳モデル未設定" -Message "有効な翻訳モデルが設定・検証されなかったため起動を中止します。$detailReason"
                 exit 1
             }
+            Start-StartupSplashIfEnabled -Percent 34 -Message "翻訳モデルの確認が完了しました" -Detail "起動処理を続行しています"
         } else {
             throw "有効な翻訳モデルが見つかりません (Status=$($launchModel.Status)): $($launchModel.Reason)"
         }
@@ -625,8 +769,10 @@ try {
     $resolvedCatalogModel = $launchModel.CatalogModel
     $resolvedDisplayName = [string]$launchModel.Entry.display_name
     Write-LaunchLog "使用モデル確定: $resolvedDisplayName (RegId=$($launchModel.Entry.registration_id), Path=$resolvedModelPath)"
+    Report-StartupProgress -Percent 34 -Stage "model_ready" -Message "翻訳モデルの確認が完了しました" -Detail $resolvedDisplayName
 
     # 3. Check Port Availability (Never kill external unknown processes)
+    Report-StartupProgress -Percent 38 -Stage "check_ports" -Message "ローカルポートを確認しています..." -Detail "推論ポート $LlamaPort / アプリポート $BackendPort"
     if (Test-PortInUse -Port $LlamaPort) {
         Show-UserError -Title "ポート競合エラー" -Message "推論サーバー用ポート $LlamaPort は既に他のプロセスが使用中です。競合するプログラムを終了してから再試行してください。"
         exit 1
@@ -643,15 +789,21 @@ try {
     $activeModeLabel = ""
 
     if (-not $UseCpuInference -and (Test-Path -LiteralPath $VulkanServerExe)) {
+        Report-StartupProgress -Percent 42 -Stage "starting_llama" -Message "推論サーバー (Vulkan GPU) を起動しています..." -Detail "$resolvedDisplayName を読み込み中"
         $vulkanArgs = Get-PaperBridgeLlamaLaunchArgs -ModelPath $resolvedModelPath -CatalogModel $resolvedCatalogModel -LlamaPort $LlamaPort
         $llamaServer = Start-TrackedServer -Label "llama-server (Vulkan)" -ExePath $VulkanServerExe -ArgList $vulkanArgs -WorkingDir (Split-Path -Parent $VulkanServerExe) -OutLog $llamaOut -ErrLog $llamaErr
-        $waitLlama = Wait-EndpointOrCrash -ServerInfo $llamaServer -HealthUrl $llamaHealthUrl -TimeoutSeconds 45
+        $waitLlama = Wait-EndpointOrCrash -ServerInfo $llamaServer -HealthUrl $llamaHealthUrl -TimeoutSeconds 45 -OnTick {
+            param([double]$sec)
+            $pct = [Math]::Min(68, 44 + [int][Math]::Floor($sec * 2.2))
+            Report-StartupProgress -Percent $pct -Stage "waiting_llama" -Message "推論サーバーの準備を待機しています..." -Detail ("$resolvedDisplayName を読み込み中... ({0:N0}秒経過)" -f $sec)
+        }
         if (-not $waitLlama.Ready) {
             Write-LaunchLog "Vulkan 推論サーバーの起動に失敗しました (Exited=$($waitLlama.Exited), Code=$($waitLlama.ExitCode))。ログ末尾:`n$($waitLlama.ErrTail)" "WARN"
             Stop-TrackedServer -ServerInfo $llamaServer
             $llamaServer = $null
             if (Test-Path -LiteralPath $CpuServerExe) {
                 Write-LaunchLog "CPU専用推論バイナリ (b12167-cpu-x64, -ngl 0) へ自動フォールバックします..." "WARN"
+                Report-StartupProgress -Percent 48 -Stage "starting_llama_cpu" -Message "CPU モードへ切り替えて再起動しています..." -Detail "GPU 起動に非対応のため CPU 版推論サーバーを使用します"
             } else {
                 Show-UserError -Title "推論サーバー起動エラー" -Message "Vulkan 推論サーバーを起動できず、CPU用バイナリも見つかりませんでした。`n`nログ: $llamaErr"
                 exit 1
@@ -666,9 +818,14 @@ try {
             Show-UserError -Title "推論サーバー起動エラー" -Message "CPU推論バイナリが見つかりません: $CpuServerExe"
             exit 1
         }
+        Report-StartupProgress -Percent 50 -Stage "starting_llama_cpu" -Message "推論サーバー (CPU 専用) を起動しています..." -Detail "$resolvedDisplayName を読み込み中"
         $cpuArgs = Get-PaperBridgeLlamaLaunchArgs -ModelPath $resolvedModelPath -CatalogModel $resolvedCatalogModel -LlamaPort $LlamaPort -UseCpu
         $llamaServer = Start-TrackedServer -Label "llama-server (CPU)" -ExePath $CpuServerExe -ArgList $cpuArgs -WorkingDir (Split-Path -Parent $CpuServerExe) -OutLog $llamaOut -ErrLog $llamaErr
-        $waitCpu = Wait-EndpointOrCrash -ServerInfo $llamaServer -HealthUrl $llamaHealthUrl -TimeoutSeconds 60
+        $waitCpu = Wait-EndpointOrCrash -ServerInfo $llamaServer -HealthUrl $llamaHealthUrl -TimeoutSeconds 60 -OnTick {
+            param([double]$sec)
+            $pct = [Math]::Min(68, 52 + [int][Math]::Floor($sec * 1.5))
+            Report-StartupProgress -Percent $pct -Stage "waiting_llama_cpu" -Message "推論サーバー (CPU) の準備を待機しています..." -Detail ("$resolvedDisplayName を読み込み中... ({0:N0}秒経過)" -f $sec)
+        }
         if (-not $waitCpu.Ready) {
             Show-UserError -Title "推論サーバー起動エラー" -Message "CPU 推論サーバーが起動しませんでした。`n`nログ末尾:`n$($waitCpu.ErrTail)`n`n詳細: $llamaErr"
             exit 1
@@ -676,6 +833,7 @@ try {
         $activeModeLabel = "CPU専用 (b12167-cpu-x64, -ngl 0)"
     }
     Write-LaunchLog "推論サーバー準備完了: $activeModeLabel"
+    Report-StartupProgress -Percent 72 -Stage "llama_ready" -Message "推論サーバーの準備が完了しました" -Detail $activeModeLabel
     try {
         $aliasForState = if ($resolvedCatalogModel -and $resolvedCatalogModel.launch_settings -and $resolvedCatalogModel.launch_settings.alias) { [string]$resolvedCatalogModel.launch_settings.alias } else { "plamo-3-translate" }
         $modeForState = if ($activeModeLabel -like "CPU*") { "cpu" } else { "vulkan" }
@@ -706,19 +864,26 @@ try {
     $backendOut = Join-Path $LogsDir "backend.out.log"
     $backendErr = Join-Path $LogsDir "backend.err.log"
     $backendArgs = @("-m", "uvicorn", "backend.api.app:app", "--host", "127.0.0.1", "--port", "$BackendPort")
+    Report-StartupProgress -Percent 76 -Stage "starting_backend" -Message "バックエンドサーバーを起動しています..." -Detail "FastAPI サーバーを起動中 (ポート $BackendPort)"
     $backendServer = Start-TrackedServer -Label "backend (uvicorn)" -ExePath $VenvPython -ArgList $backendArgs -WorkingDir $ProjectRoot -OutLog $backendOut -ErrLog $backendErr
 
     $backendHealthUrl = "http://127.0.0.1:$($BackendPort)/api/auth/session"
-    $waitBackend = Wait-EndpointOrCrash -ServerInfo $backendServer -HealthUrl $backendHealthUrl -TimeoutSeconds 45
+    $waitBackend = Wait-EndpointOrCrash -ServerInfo $backendServer -HealthUrl $backendHealthUrl -TimeoutSeconds 45 -OnTick {
+        param([double]$sec)
+        $pct = [Math]::Min(92, 78 + [int][Math]::Floor($sec * 3.0))
+        Report-StartupProgress -Percent $pct -Stage "waiting_backend" -Message "Web UI とデータベースを初期化しています..." -Detail ("バックエンド起動待機中... ({0:N0}秒経過)" -f $sec)
+    }
     if (-not $waitBackend.Ready) {
         Show-UserError -Title "バックエンド起動エラー" -Message "バックエンドサーバーが起動しませんでした。`n`nログ末尾:`n$($waitBackend.ErrTail)`n`n詳細: $backendErr"
         exit 1
     }
     Write-LaunchLog "バックエンド準備完了: http://127.0.0.1:$BackendPort/ ($activeModeLabel)"
+    Report-StartupProgress -Percent 95 -Stage "opening_window" -Message "アプリ画面を開いています..." -Detail "専用ブラウザウィンドウを起動しています"
 
     # 6. Interactive UI Loop with Active Job Guard
     $appUrl = "http://127.0.0.1:$($BackendPort)/"
     if ($NoBrowser) {
+        Report-StartupProgress -Percent 100 -Stage "ready" -Status "ready" -Message "起動が完了しました (NoBrowser)" -Detail "$resolvedDisplayName ($activeModeLabel)"
         Write-LaunchLog "NoBrowser モードで準備完了しました。"
         Write-Output "READY_BACKEND_URL=$appUrl"
         Write-Output "READY_LLAMA_URL=http://127.0.0.1:$LlamaPort"
@@ -753,8 +918,18 @@ try {
         }
     } else {
         $checkJobsScript = Join-Path $ScriptDir "check_active_jobs.py"
+        $firstInteractiveLaunch = $true
         while ($true) {
-            Open-AppWindowAndWait -AppUrl $appUrl -BackendServerInfo $backendServer
+            if ($firstInteractiveLaunch) {
+                $firstInteractiveLaunch = $false
+                Open-AppWindowAndWait -AppUrl $appUrl -BackendServerInfo $backendServer -OnWindowLaunched {
+                    Report-StartupProgress -Percent 100 -Stage "ready" -Status "ready" -Message "起動が完了しました！" -Detail "$resolvedDisplayName ($activeModeLabel)"
+                    Start-Sleep -Milliseconds 450
+                    Close-StartupSplashSafe
+                }
+            } else {
+                Open-AppWindowAndWait -AppUrl $appUrl -BackendServerInfo $backendServer
+            }
 
             if (Test-Path -LiteralPath $UpdateSignalPath) {
                 Write-LaunchLog "ソフトウェア更新中のため未完了ジョブ確認をスキップして終了します。"
@@ -795,8 +970,10 @@ try {
     }
     exit 0
 } finally {
+    Close-StartupSplashSafe
     Write-LaunchLog "終了処理を開始します..."
-    try { Stop-TrackedServer -ServerInfo $backendServer -GracefulTimeoutMs 6000 } catch { Write-LaunchLog "バックエンド終了中に例外: $($_.Exception.Message)" "WARN" }
+    $skipBackendTree = (Test-Path -LiteralPath $UpdateSignalPath)
+    try { Stop-TrackedServer -ServerInfo $backendServer -GracefulTimeoutMs 6000 -NoProcessTreeKill:$skipBackendTree } catch { Write-LaunchLog "バックエンド終了中に例外: $($_.Exception.Message)" "WARN" }
     try {
         $llamaServer = Sync-TrackedLlamaFromStateFile -CurrentServer $llamaServer -Port $LlamaPort -OutLog $llamaOut -ErrLog $llamaErr
         Stop-TrackedServer -ServerInfo $llamaServer -GracefulTimeoutMs 6000
